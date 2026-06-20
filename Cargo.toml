@@ -1,20 +1,19 @@
 [package]
-name = "wterm"
+name = "beer"
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.95"
+rust-version = "1.95.0"
 description = "A fast, software-rendered, Wayland-native terminal emulator"
 license = "EUPL-1.2"
 readme = true
-default-run = "wterm"
 
 [dependencies]
 anyhow = "1.0.102"
+pound = "0.1.6"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [lints.rust]
-rust_2018_idioms = { level = "warn", priority = -1 }
 unsafe_op_in_unsafe_fn = "deny"
 missing_debug_implementations = "warn"
 

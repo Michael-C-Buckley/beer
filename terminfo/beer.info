@@ -1,0 +1,7 @@
+# beer terminfo entry. Inherits xterm-256color; only the deltas live here.
+#
+# Compile with extended (user-defined) capabilities:
+#   tic -x -o "$out" terminfo/beer.info
+beer|beer-256color|beer terminal emulator,
+	Tc,
+	use=xterm-256color,
