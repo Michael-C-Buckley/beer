@@ -1,0 +1,26 @@
+[package]
+name = "wterm"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.95"
+description = "A fast, software-rendered, Wayland-native terminal emulator"
+license = "EUPL-1.2"
+readme = true
+default-run = "wterm"
+
+[dependencies]
+anyhow = "1.0.102"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[lints.rust]
+rust_2018_idioms = { level = "warn", priority = -1 }
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
