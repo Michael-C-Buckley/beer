@@ -124,8 +124,30 @@ impl Grid {
         }
     }
 
+    pub fn cols(&self) -> usize {
+        self.cols
+    }
+
     pub fn rows(&self) -> usize {
         self.rows
+    }
+
+    /// Resize the screen, clipping content (reflow comes later).
+    pub fn resize(&mut self, cols: usize, rows: usize) {
+        let cols = cols.max(1);
+        let rows = rows.max(1);
+        for line in &mut self.lines {
+            line.resize(cols, Cell::default());
+        }
+        self.lines.resize(rows, vec![Cell::default(); cols]);
+        self.cols = cols;
+        self.rows = rows;
+        self.top = 0;
+        self.bottom = rows - 1;
+        self.tabs = default_tabs(cols);
+        self.cursor.x = self.cursor.x.min(cols - 1);
+        self.cursor.y = self.cursor.y.min(rows - 1);
+        self.wrap_pending = false;
     }
 
     pub fn cursor(&self) -> (usize, usize) {
@@ -526,6 +548,7 @@ impl Grid {
     // --- inspection (logging + tests) ---
 
     /// The visible text of one row, trailing blanks trimmed.
+    #[cfg(test)]
     pub fn row_text(&self, y: usize) -> String {
         self.lines[y]
             .iter()
@@ -536,7 +559,6 @@ impl Grid {
             .to_string()
     }
 
-    #[cfg(test)]
     pub fn cell(&self, x: usize, y: usize) -> &Cell {
         &self.lines[y][x]
     }

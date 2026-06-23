@@ -1,7 +1,9 @@
 //! beer, a fast, software-rendered, Wayland-native terminal emulator.
 
+mod font;
 mod grid;
 mod pty;
+mod render;
 mod vt;
 mod wayland;
 

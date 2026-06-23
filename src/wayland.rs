@@ -11,7 +11,9 @@ use calloop::generic::Generic;
 use calloop::{EventLoop, Interest, Mode, PostAction};
 use calloop_wayland_source::WaylandSource;
 
+use crate::font::Fonts;
 use crate::pty::Pty;
+use crate::render::Renderer;
 use crate::vt::Term;
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
@@ -39,11 +41,9 @@ use wayland_client::{
 /// Default window size in pixels before the compositor suggests one.
 const DEFAULT_W: u32 = 800;
 const DEFAULT_H: u32 = 600;
-/// Background fill, 0xAARRGGBB. Foot-ish dark grey.
-const BG: u32 = 0xFF18_1818;
-/// Terminal size handed to the shell.
-const COLS: u16 = 80;
-const ROWS: u16 = 24;
+/// Primary font family and pixel size, resolved via fontconfig.
+const FONT_FAMILY: &str = "monospace";
+const FONT_SIZE_PX: u32 = 16;
 
 /// Run a single window until it is closed.
 pub fn run() -> anyhow::Result<()> {
@@ -73,8 +73,12 @@ pub fn run() -> anyhow::Result<()> {
     let pool = SlotPool::new(DEFAULT_W as usize * DEFAULT_H as usize * 4, &shm)
         .context("create shm slot pool")?;
 
-    let pty = Pty::spawn(COLS, ROWS).context("spawn shell on pty")?;
-    let term = Term::new(COLS as usize, ROWS as usize);
+    let fonts = Fonts::new(FONT_FAMILY, FONT_SIZE_PX).context("load font")?;
+    let renderer = Renderer::new(fonts);
+    let (cols, rows) = grid_size(renderer.metrics(), DEFAULT_W, DEFAULT_H);
+
+    let pty = Pty::spawn(cols, rows).context("spawn shell on pty")?;
+    let term = Term::new(cols as usize, rows as usize);
     let mut parser = vte::Parser::new();
 
     // Read child output off a clone of the master; the original stays in `pty`
@@ -117,10 +121,11 @@ pub fn run() -> anyhow::Result<()> {
         window,
         pty,
         term,
+        renderer,
         title: None,
         width: DEFAULT_W,
         height: DEFAULT_H,
-        configured: false,
+        dirty: false,
         exit: false,
     };
 
@@ -128,8 +133,19 @@ pub fn run() -> anyhow::Result<()> {
         event_loop
             .dispatch(Duration::from_millis(16), &mut app)
             .context("dispatch event loop")?;
+        if app.dirty {
+            app.draw();
+            app.dirty = false;
+        }
     }
     Ok(())
+}
+
+/// Columns and rows that fit a `width`×`height` px window at `metrics`.
+fn grid_size(metrics: crate::font::CellMetrics, width: u32, height: u32) -> (u16, u16) {
+    let cols = (width / metrics.width).max(1);
+    let rows = (height / metrics.height).max(1);
+    (cols as u16, rows as u16)
 }
 
 /// Write every byte to `fd`, retrying short writes and interrupts.
@@ -156,16 +172,18 @@ struct App {
     window: Window,
     pty: Pty,
     term: Term,
+    renderer: Renderer,
     /// Last title applied to the toplevel, to avoid redundant requests.
     title: Option<String>,
     width: u32,
     height: u32,
-    configured: bool,
+    /// The grid changed and the window needs repainting.
+    dirty: bool,
     exit: bool,
 }
 
 impl App {
-    /// After parsing child output: send any replies and sync the title.
+    /// After parsing child output: send any replies, sync the title, repaint.
     fn after_feed(&mut self) {
         let reply = self.term.take_response();
         if !reply.is_empty()
@@ -174,17 +192,24 @@ impl App {
             tracing::warn!("write to pty: {err}");
         }
 
-        if tracing::enabled!(tracing::Level::TRACE) {
-            let grid = self.term.grid();
-            for y in 0..grid.rows() {
-                tracing::trace!("{y:2}|{}", grid.row_text(y));
-            }
-        }
-
         if self.term.title() != self.title.as_deref() {
             self.title = self.term.title().map(str::to_owned);
             self.window
                 .set_title(self.title.clone().unwrap_or_default());
+        }
+        self.dirty = true;
+    }
+
+    /// Recompute the grid size for the current window and tell the grid and the
+    /// PTY about it if it changed.
+    fn resize_grid(&mut self) {
+        let (cols, rows) = grid_size(self.renderer.metrics(), self.width, self.height);
+        if (cols as usize, rows as usize) == (self.term.grid().cols(), self.term.grid().rows()) {
+            return;
+        }
+        self.term.resize(cols as usize, rows as usize);
+        if let Err(err) = self.pty.resize(cols, rows) {
+            tracing::warn!("resize pty: {err}");
         }
     }
 
@@ -197,7 +222,7 @@ impl App {
         self.exit = true;
     }
 
-    /// Fill the surface with the background colour and present it.
+    /// Render the grid into a fresh buffer and present it.
     fn draw(&mut self) {
         let (w, h) = (self.width, self.height);
         let stride = w as i32 * 4;
@@ -214,10 +239,8 @@ impl App {
                 }
             };
 
-        let bytes = BG.to_le_bytes();
-        for px in canvas.chunks_exact_mut(4) {
-            px.copy_from_slice(&bytes);
-        }
+        self.renderer
+            .render(self.term.grid(), canvas, w as usize, h as usize);
 
         let surface = self.window.wl_surface();
         if let Err(err) = buffer.attach_to(surface) {
@@ -286,7 +309,7 @@ impl WindowHandler for App {
             self.width = w.get();
             self.height = h.get();
         }
-        self.configured = true;
+        self.resize_grid();
         self.draw();
     }
 }

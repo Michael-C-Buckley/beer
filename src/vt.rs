@@ -40,6 +40,10 @@ impl Term {
         &self.grid
     }
 
+    pub fn resize(&mut self, cols: usize, rows: usize) {
+        self.grid.resize(cols, rows);
+    }
+
     pub fn title(&self) -> Option<&str> {
         self.title.as_deref()
     }

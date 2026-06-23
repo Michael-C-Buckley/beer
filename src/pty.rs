@@ -73,6 +73,11 @@ impl Pty {
         &self.master
     }
 
+    /// Inform the kernel (and thus the child) of a new terminal size.
+    pub fn resize(&self, cols: u16, rows: u16) -> anyhow::Result<()> {
+        set_winsize(&self.master, cols, rows)
+    }
+
     /// Reap the child if it has exited.
     pub fn wait(&mut self) -> io::Result<ExitStatus> {
         self.child.wait()
