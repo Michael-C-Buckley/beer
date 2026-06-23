@@ -1,5 +1,7 @@
 //! beer, a fast, software-rendered, Wayland-native terminal emulator.
 
+mod wayland;
+
 use std::process::ExitCode;
 
 use pound::Parse;
@@ -45,5 +47,5 @@ fn run(cli: Cli) -> anyhow::Result<()> {
     }
 
     tracing::info!("starting beer");
-    todo!("window mode")
+    wayland::run()
 }
