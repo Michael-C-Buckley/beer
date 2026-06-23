@@ -1,6 +1,8 @@
 //! beer, a fast, software-rendered, Wayland-native terminal emulator.
 
+mod grid;
 mod pty;
+mod vt;
 mod wayland;
 
 use std::process::ExitCode;
