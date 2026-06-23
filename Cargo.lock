@@ -25,6 +25,7 @@ dependencies = [
  "calloop",
  "calloop-wayland-source",
  "pound",
+ "rustix",
  "smithay-client-toolkit",
  "tracing",
  "tracing-subscriber",

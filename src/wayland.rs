@@ -6,8 +6,11 @@
 use std::time::Duration;
 
 use anyhow::Context;
-use calloop::EventLoop;
+use calloop::generic::Generic;
+use calloop::{EventLoop, Interest, Mode, PostAction};
 use calloop_wayland_source::WaylandSource;
+
+use crate::pty::Pty;
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
     delegate_compositor, delegate_output, delegate_registry, delegate_seat, delegate_shm,
@@ -36,6 +39,9 @@ const DEFAULT_W: u32 = 800;
 const DEFAULT_H: u32 = 600;
 /// Background fill, 0xAARRGGBB. Foot-ish dark grey.
 const BG: u32 = 0xFF18_1818;
+/// Terminal size handed to the shell until cell geometry drives it.
+const COLS: u16 = 80;
+const ROWS: u16 = 24;
 
 /// Run a single window until it is closed.
 pub fn run() -> anyhow::Result<()> {
@@ -65,6 +71,38 @@ pub fn run() -> anyhow::Result<()> {
     let pool = SlotPool::new(DEFAULT_W as usize * DEFAULT_H as usize * 4, &shm)
         .context("create shm slot pool")?;
 
+    let pty = Pty::spawn(COLS, ROWS).context("spawn shell on pty")?;
+
+    // Read child output off a clone of the master; the original stays in `pty`
+    // for writes and resizing.
+    let read_fd = pty.master().try_clone().context("clone pty master")?;
+    event_loop
+        .handle()
+        .insert_source(
+            Generic::new(read_fd, Interest::READ, Mode::Level),
+            |_, fd, app: &mut App| {
+                let mut buf = [0u8; 4096];
+                match rustix::io::read(&*fd, &mut buf) {
+                    Ok(0) => {
+                        app.child_exited();
+                        Ok(PostAction::Remove)
+                    }
+                    Ok(n) => {
+                        tracing::debug!("pty -> {n} bytes: {:02x?}", &buf[..n]);
+                        Ok(PostAction::Continue)
+                    }
+                    Err(rustix::io::Errno::INTR | rustix::io::Errno::AGAIN) => {
+                        Ok(PostAction::Continue)
+                    }
+                    Err(_) => {
+                        app.child_exited();
+                        Ok(PostAction::Remove)
+                    }
+                }
+            },
+        )
+        .map_err(|e| anyhow::anyhow!("register pty in event loop: {e}"))?;
+
     let mut app = App {
         registry_state: RegistryState::new(&globals),
         output_state: OutputState::new(&globals, &qh),
@@ -72,6 +110,7 @@ pub fn run() -> anyhow::Result<()> {
         shm,
         pool,
         window,
+        pty,
         width: DEFAULT_W,
         height: DEFAULT_H,
         configured: false,
@@ -95,6 +134,7 @@ struct App {
     shm: Shm,
     pool: SlotPool,
     window: Window,
+    pty: Pty,
     width: u32,
     height: u32,
     configured: bool,
@@ -102,6 +142,15 @@ struct App {
 }
 
 impl App {
+    /// The child shell has gone away; reap it and tear the window down.
+    fn child_exited(&mut self) {
+        match self.pty.wait() {
+            Ok(status) => tracing::info!("shell exited: {status}"),
+            Err(err) => tracing::warn!("reap shell: {err}"),
+        }
+        self.exit = true;
+    }
+
     /// Fill the surface with the background colour and present it.
     fn draw(&mut self) {
         let (w, h) = (self.width, self.height);
