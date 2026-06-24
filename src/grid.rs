@@ -61,6 +61,15 @@ pub enum Underline {
     Dashed,
 }
 
+/// Cursor shape (DECSCUSR).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum CursorShape {
+    #[default]
+    Block,
+    Underline,
+    Beam,
+}
+
 /// One grid cell: a character plus its rendering style.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Cell {
@@ -113,6 +122,10 @@ pub struct Grid {
     tabs: Vec<bool>,
     /// Saved primary screen while the alternate screen is active.
     alt_saved: Option<Vec<Vec<Cell>>>,
+    cursor_shape: CursorShape,
+    cursor_visible: bool,
+    /// Cursor colour from OSC 12; `None` follows the cell under the cursor.
+    cursor_color: Option<(u8, u8, u8)>,
 }
 
 fn default_tabs(cols: usize) -> Vec<bool> {
@@ -138,6 +151,9 @@ impl Grid {
             wrap_pending: false,
             tabs: default_tabs(cols),
             alt_saved: None,
+            cursor_shape: CursorShape::default(),
+            cursor_visible: true,
+            cursor_color: None,
         }
     }
 
@@ -208,6 +224,30 @@ impl Grid {
 
     pub fn alt_active(&self) -> bool {
         self.alt_saved.is_some()
+    }
+
+    pub fn set_cursor_shape(&mut self, shape: CursorShape) {
+        self.cursor_shape = shape;
+    }
+
+    pub fn cursor_shape(&self) -> CursorShape {
+        self.cursor_shape
+    }
+
+    pub fn set_cursor_visible(&mut self, visible: bool) {
+        self.cursor_visible = visible;
+    }
+
+    pub fn cursor_visible(&self) -> bool {
+        self.cursor_visible
+    }
+
+    pub fn set_cursor_color(&mut self, color: Option<(u8, u8, u8)>) {
+        self.cursor_color = color;
+    }
+
+    pub fn cursor_color(&self) -> Option<(u8, u8, u8)> {
+        self.cursor_color
     }
 
     // --- printing ---

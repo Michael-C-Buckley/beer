@@ -4,7 +4,7 @@ use std::io::Write as _;
 
 use vte::{Params, Perform};
 
-use crate::grid::{Color, Flags, Grid, Underline};
+use crate::grid::{Color, CursorShape, Flags, Grid, Underline};
 
 /// G0/G1 character set designation.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -24,6 +24,31 @@ enum DaLevel {
 /// DECRQM mode-state code: 1 = set, 2 = reset.
 fn set_reset(on: bool) -> u8 {
     if on { 1 } else { 2 }
+}
+
+/// Parse an X11 colour spec from an OSC string: `rgb:rr/gg/bb` (1-4 hex
+/// digits per channel) or `#rrggbb`.
+fn parse_color(spec: &[u8]) -> Option<(u8, u8, u8)> {
+    let spec = std::str::from_utf8(spec).ok()?;
+    if let Some(rest) = spec.strip_prefix("rgb:") {
+        let mut it = rest.split('/');
+        let chan = |s: &str| -> Option<u8> {
+            // Normalize an n-hex-digit fraction to 8 bits (X11 rule).
+            let v = u32::from_str_radix(s, 16).ok()?;
+            let max = (1u32 << (4 * s.len() as u32)) - 1;
+            Some((v * 255 / max) as u8)
+        };
+        let r = chan(it.next()?)?;
+        let g = chan(it.next()?)?;
+        let b = chan(it.next()?)?;
+        return Some((r, g, b));
+    }
+    let hex = spec.strip_prefix('#')?;
+    if hex.len() == 6 {
+        let byte = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).ok();
+        return Some((byte(0)?, byte(2)?, byte(4)?));
+    }
+    None
 }
 
 /// Map an SGR 4 param (`4` or `4:x`) to an underline style.
@@ -108,6 +133,7 @@ impl Term {
                     }
                 }
                 (false, 4) => self.grid.set_insert(on),
+                (true, 25) => self.grid.set_cursor_visible(on),
                 // App-cursor/bracketed-paste/mouse/sync modes affect input and
                 // rendering, which arrive with the keyboard and renderer.
                 _ => tracing::trace!("unhandled mode {code} private={private} on={on}"),
@@ -400,6 +426,13 @@ impl Perform for Term {
                 _ => DaLevel::Primary,
             }),
             'q' if intermediates.first() == Some(&b'>') => self.report_version(),
+            'q' if intermediates.first() == Some(&b' ') => {
+                self.grid.set_cursor_shape(match raw(params, 0) {
+                    3 | 4 => CursorShape::Underline,
+                    5 | 6 => CursorShape::Beam,
+                    _ => CursorShape::Block,
+                });
+            }
             'p' if intermediates.contains(&b'$') => self.report_mode(params, private),
             'n' => self.device_status(params),
             's' => self.grid.save_cursor(),
@@ -445,6 +478,12 @@ impl Perform for Term {
                     self.title = Some(String::from_utf8_lossy(text).into_owned());
                 }
             }
+            // OSC 12: set cursor colour; OSC 112: reset to default.
+            Some(&n) if n == b"12" => {
+                self.grid
+                    .set_cursor_color(params.get(1).and_then(|s| parse_color(s)));
+            }
+            Some(&n) if n == b"112" => self.grid.set_cursor_color(None),
             _ => {}
         }
     }
@@ -527,6 +566,57 @@ mod tests {
         // 4:0 turns the underline back off.
         feed(&mut t, b"\x1b[4:0mY");
         assert_eq!(t.grid().cell(1, 0).underline, Underline::None);
+    }
+
+    #[test]
+    fn decscusr_and_cursor_visibility() {
+        let mut t = Term::new(20, 1);
+        feed(&mut t, b"\x1b[4 q");
+        assert_eq!(t.grid().cursor_shape(), CursorShape::Underline);
+        feed(&mut t, b"\x1b[6 q");
+        assert_eq!(t.grid().cursor_shape(), CursorShape::Beam);
+        feed(&mut t, b"\x1b[0 q");
+        assert_eq!(t.grid().cursor_shape(), CursorShape::Block);
+
+        feed(&mut t, b"\x1b[?25l");
+        assert!(!t.grid().cursor_visible());
+        feed(&mut t, b"\x1b[?25h");
+        assert!(t.grid().cursor_visible());
+    }
+
+    #[test]
+    fn osc12_sets_and_resets_cursor_color() {
+        let mut t = Term::new(20, 1);
+        feed(&mut t, b"\x1b]12;#ff0000\x07");
+        assert_eq!(t.grid().cursor_color(), Some((255, 0, 0)));
+        feed(&mut t, b"\x1b]12;rgb:00/80/ff\x07");
+        assert_eq!(t.grid().cursor_color(), Some((0, 0x80, 0xff)));
+        feed(&mut t, b"\x1b]112\x07");
+        assert_eq!(t.grid().cursor_color(), None);
+    }
+
+    #[test]
+    fn decscusr_and_cursor_color() {
+        use crate::grid::CursorShape;
+        let mut t = Term::new(20, 1);
+        feed(&mut t, b"\x1b[5 q"); // blinking bar
+        assert_eq!(t.grid().cursor_shape(), CursorShape::Beam);
+        feed(&mut t, b"\x1b[4 q"); // steady underline
+        assert_eq!(t.grid().cursor_shape(), CursorShape::Underline);
+        feed(&mut t, b"\x1b]12;#ff3030\x07");
+        assert_eq!(t.grid().cursor_color(), Some((0xff, 0x30, 0x30)));
+        feed(&mut t, b"\x1b]112\x07");
+        assert_eq!(t.grid().cursor_color(), None);
+        feed(&mut t, b"\x1b[?25l"); // hide cursor
+        assert!(!t.grid().cursor_visible());
+    }
+
+    #[test]
+    fn parse_color_forms() {
+        assert_eq!(parse_color(b"rgb:ff/00/80"), Some((255, 0, 128)));
+        assert_eq!(parse_color(b"rgb:ffff/0000/8080"), Some((255, 0, 128)));
+        assert_eq!(parse_color(b"#ff0080"), Some((255, 0, 128)));
+        assert_eq!(parse_color(b"nonsense"), None);
     }
 
     #[test]

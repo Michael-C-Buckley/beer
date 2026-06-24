@@ -128,6 +128,7 @@ pub fn run() -> anyhow::Result<ExitCode> {
         width: DEFAULT_W,
         height: DEFAULT_H,
         dirty: false,
+        focused: true,
         exit: false,
         exit_code: ExitCode::SUCCESS,
     };
@@ -182,6 +183,8 @@ struct App {
     height: u32,
     /// The grid changed and the window needs repainting.
     dirty: bool,
+    /// Whether the toplevel currently has keyboard focus (drives the cursor).
+    focused: bool,
     exit: bool,
     /// Exit code to return, taken from the shell when it exits.
     exit_code: ExitCode,
@@ -252,8 +255,13 @@ impl App {
                 }
             };
 
-        self.renderer
-            .render(self.term.grid(), canvas, w as usize, h as usize);
+        self.renderer.render(
+            self.term.grid(),
+            canvas,
+            w as usize,
+            h as usize,
+            self.focused,
+        );
 
         let surface = self.window.wl_surface();
         if let Err(err) = buffer.attach_to(surface) {
@@ -322,6 +330,7 @@ impl WindowHandler for App {
             self.width = w.get();
             self.height = h.get();
         }
+        self.focused = configure.is_activated();
         self.resize_grid();
         self.draw();
     }

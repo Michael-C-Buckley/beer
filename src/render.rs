@@ -6,7 +6,7 @@
 //! neighbouring cell's background fill.
 
 use crate::font::{CellMetrics, Fonts, GlyphData, Style};
-use crate::grid::{Cell, Color, Flags, Grid, Underline};
+use crate::grid::{Cell, Color, CursorShape, Flags, Grid, Underline};
 
 /// Foreground/background used for `Color::Default`.
 const DEFAULT_FG: Rgb = Rgb(0xc5, 0xc8, 0xc6);
@@ -94,9 +94,16 @@ impl Renderer {
         self.fonts.metrics()
     }
 
-    /// Compose `grid` into `pixels` (BGRA, `width`×`height` px). The cursor cell
-    /// is drawn reversed.
-    pub fn render(&mut self, grid: &Grid, pixels: &mut [u8], width: usize, height: usize) {
+    /// Compose `grid` into `pixels` (BGRA, `width`×`height` px). `focused`
+    /// selects a solid or hollow cursor.
+    pub fn render(
+        &mut self,
+        grid: &Grid,
+        pixels: &mut [u8],
+        width: usize,
+        height: usize,
+        focused: bool,
+    ) {
         let mut canvas = Canvas {
             pixels,
             width,
@@ -105,11 +112,10 @@ impl Renderer {
         canvas.fill_rect(0, 0, width as u32, height as u32, DEFAULT_BG);
 
         let m = self.fonts.metrics();
-        let cursor = grid.cursor();
 
         for y in 0..grid.rows() {
             for x in 0..grid.cols() {
-                let (_, bg) = cell_colors(grid.cell(x, y), (x, y) == cursor);
+                let (_, bg) = cell_colors(grid.cell(x, y));
                 let (px, py) = (x as i32 * m.width as i32, y as i32 * m.height as i32);
                 canvas.fill_rect(px, py, m.width, m.height, bg);
             }
@@ -121,18 +127,14 @@ impl Renderer {
                 if cell.flags.contains(Flags::WIDE_CONT) {
                     continue;
                 }
-                let (fg, _) = cell_colors(cell, (x, y) == cursor);
+                let (fg, _) = cell_colors(cell);
                 let origin_x = x as i32 * m.width as i32;
                 let cell_top = y as i32 * m.height as i32;
                 if cell.c != ' ' {
-                    let style = Style {
-                        bold: cell.flags.contains(Flags::BOLD),
-                        italic: cell.flags.contains(Flags::ITALIC),
-                    };
                     self.draw_glyph(
                         &mut canvas,
                         cell.c,
-                        style,
+                        cell_style(cell),
                         origin_x,
                         cell_top + m.ascent as i32,
                         fg,
@@ -140,6 +142,54 @@ impl Renderer {
                 }
                 draw_decorations(&mut canvas, cell, origin_x, cell_top, m, fg);
             }
+        }
+
+        self.draw_cursor(&mut canvas, grid, m, focused);
+    }
+
+    /// Draw the cursor: a solid block/underline/beam when focused, a hollow
+    /// outline when not.
+    fn draw_cursor(&mut self, canvas: &mut Canvas, grid: &Grid, m: CellMetrics, focused: bool) {
+        if !grid.cursor_visible() {
+            return;
+        }
+        let (cx, cy) = grid.cursor();
+        let x0 = cx as i32 * m.width as i32;
+        let top = cy as i32 * m.height as i32;
+        let color = grid
+            .cursor_color()
+            .map_or(DEFAULT_FG, |(r, g, b)| Rgb(r, g, b));
+
+        if !focused {
+            let right = x0 + m.width as i32 - 1;
+            let bottom = top + m.height as i32 - 1;
+            canvas.hline(x0, top, m.width, color);
+            canvas.hline(x0, bottom, m.width, color);
+            canvas.fill_rect(x0, top, 1, m.height, color);
+            canvas.fill_rect(right, top, 1, m.height, color);
+            return;
+        }
+
+        match grid.cursor_shape() {
+            CursorShape::Block => {
+                canvas.fill_rect(x0, top, m.width, m.height, color);
+                let cell = grid.cell(cx, cy);
+                if cell.c != ' ' && !cell.flags.contains(Flags::WIDE_CONT) {
+                    let (_, bg) = cell_colors(cell);
+                    self.draw_glyph(
+                        canvas,
+                        cell.c,
+                        cell_style(cell),
+                        x0,
+                        top + m.ascent as i32,
+                        bg,
+                    );
+                }
+            }
+            CursorShape::Underline => {
+                canvas.fill_rect(x0, top + m.height as i32 - 2, m.width, 2, color);
+            }
+            CursorShape::Beam => canvas.fill_rect(x0, top, 2, m.height, color),
         }
     }
 
@@ -188,13 +238,20 @@ impl Renderer {
     }
 }
 
+fn cell_style(cell: &Cell) -> Style {
+    Style {
+        bold: cell.flags.contains(Flags::BOLD),
+        italic: cell.flags.contains(Flags::ITALIC),
+    }
+}
+
 /// Resolve a cell's (foreground, background) RGB, applying reverse video,
 /// bold-as-bright, dim, and hidden.
-fn cell_colors(cell: &Cell, cursor: bool) -> (Rgb, Rgb) {
+fn cell_colors(cell: &Cell) -> (Rgb, Rgb) {
     let bold = cell.flags.contains(Flags::BOLD);
     let mut fg = resolve(cell.fg, DEFAULT_FG, bold);
     let mut bg = resolve(cell.bg, DEFAULT_BG, false);
-    if cell.flags.contains(Flags::REVERSE) ^ cursor {
+    if cell.flags.contains(Flags::REVERSE) {
         std::mem::swap(&mut fg, &mut bg);
     }
     if cell.flags.contains(Flags::DIM) {
