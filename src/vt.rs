@@ -73,6 +73,8 @@ pub struct Term {
     g0: Charset,
     g1: Charset,
     shift_out: bool,
+    /// Accumulated payload of an in-progress `DCS + q` (XTGETTCAP) query.
+    xtgettcap: Option<Vec<u8>>,
 }
 
 impl Term {
@@ -85,6 +87,31 @@ impl Term {
             g0: Charset::Ascii,
             g1: Charset::Ascii,
             shift_out: false,
+            xtgettcap: None,
+        }
+    }
+
+    /// Answer an XTGETTCAP query: for each hex-encoded capability name, reply
+    /// with `DCS 1 + r name=value ST` if known, else `DCS 0 + r name ST`.
+    fn answer_xtgettcap(&mut self, payload: &[u8]) {
+        for name_hex in payload.split(|&b| b == b';') {
+            let value = decode_hex(name_hex).and_then(|name| cap_value(&name));
+            match value {
+                Some(value) => {
+                    self.response.extend_from_slice(b"\x1bP1+r");
+                    self.response.extend_from_slice(name_hex);
+                    self.response.push(b'=');
+                    for byte in value.bytes() {
+                        let _ = write!(self.response, "{byte:02x}");
+                    }
+                    self.response.extend_from_slice(b"\x1b\\");
+                }
+                None => {
+                    self.response.extend_from_slice(b"\x1bP0+r");
+                    self.response.extend_from_slice(name_hex);
+                    self.response.extend_from_slice(b"\x1b\\");
+                }
+            }
         }
     }
 
@@ -489,9 +516,45 @@ impl Perform for Term {
         }
     }
 
-    fn hook(&mut self, _: &Params, _: &[u8], _: bool, _: char) {}
-    fn put(&mut self, _: u8) {}
-    fn unhook(&mut self) {}
+    fn hook(&mut self, _: &Params, intermediates: &[u8], _: bool, action: char) {
+        // XTGETTCAP arrives as `DCS + q <names> ST`.
+        if action == 'q' && intermediates == [b'+'] {
+            self.xtgettcap = Some(Vec::new());
+        }
+    }
+
+    fn put(&mut self, byte: u8) {
+        if let Some(buf) = self.xtgettcap.as_mut() {
+            buf.push(byte);
+        }
+    }
+
+    fn unhook(&mut self) {
+        if let Some(payload) = self.xtgettcap.take() {
+            self.answer_xtgettcap(&payload);
+        }
+    }
+}
+
+/// Look up a terminfo capability beer reports via XTGETTCAP.
+fn cap_value(name: &[u8]) -> Option<&'static str> {
+    match name {
+        b"TN" => Some("beer"),
+        b"Co" | b"colors" => Some("256"),
+        b"RGB" => Some("8/8/8"),
+        _ => None,
+    }
+}
+
+/// Decode an even-length lowercase/uppercase hex string into bytes.
+fn decode_hex(s: &[u8]) -> Option<Vec<u8>> {
+    if s.is_empty() || !s.len().is_multiple_of(2) {
+        return None;
+    }
+    let nibble = |b: u8| (b as char).to_digit(16).map(|d| d as u8);
+    s.chunks_exact(2)
+        .map(|pair| Some((nibble(pair[0])? << 4) | nibble(pair[1])?))
+        .collect()
 }
 
 #[cfg(test)]
@@ -618,6 +681,15 @@ mod tests {
         assert_eq!(parse_color(b"rgb:ffff/0000/8080"), Some((255, 0, 128)));
         assert_eq!(parse_color(b"#ff0080"), Some((255, 0, 128)));
         assert_eq!(parse_color(b"nonsense"), None);
+    }
+
+    #[test]
+    fn xtgettcap_known_and_unknown() {
+        let mut t = Term::new(20, 1);
+        feed(&mut t, b"\x1bP+q544e\x1b\\"); // "TN"
+        assert_eq!(t.take_response(), b"\x1bP1+r544e=62656572\x1b\\"); // = "beer"
+        feed(&mut t, b"\x1bP+q6162\x1b\\"); // "ab", unknown
+        assert_eq!(t.take_response(), b"\x1bP0+r6162\x1b\\");
     }
 
     #[test]
