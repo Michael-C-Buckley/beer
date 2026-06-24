@@ -4,6 +4,8 @@
 //! event loop, so the PTY master fd and timers share one loop.
 
 use std::os::fd::OwnedFd;
+use std::os::unix::process::ExitStatusExt;
+use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -45,8 +47,8 @@ const DEFAULT_H: u32 = 600;
 const FONT_FAMILY: &str = "monospace";
 const FONT_SIZE_PX: u32 = 16;
 
-/// Run a single window until it is closed.
-pub fn run() -> anyhow::Result<()> {
+/// Run a single window until it is closed, returning the shell's exit code.
+pub fn run() -> anyhow::Result<ExitCode> {
     let conn = Connection::connect_to_env().context("connect to Wayland compositor")?;
     let (globals, event_queue) =
         registry_queue_init(&conn).context("initialize Wayland registry")?;
@@ -127,6 +129,7 @@ pub fn run() -> anyhow::Result<()> {
         height: DEFAULT_H,
         dirty: false,
         exit: false,
+        exit_code: ExitCode::SUCCESS,
     };
 
     while !app.exit {
@@ -138,7 +141,7 @@ pub fn run() -> anyhow::Result<()> {
             app.dirty = false;
         }
     }
-    Ok(())
+    Ok(app.exit_code)
 }
 
 /// Columns and rows that fit a `width`×`height` px window at `metrics`.
@@ -180,6 +183,8 @@ struct App {
     /// The grid changed and the window needs repainting.
     dirty: bool,
     exit: bool,
+    /// Exit code to return, taken from the shell when it exits.
+    exit_code: ExitCode,
 }
 
 impl App {
@@ -213,10 +218,18 @@ impl App {
         }
     }
 
-    /// The child shell has gone away; reap it and tear the window down.
+    /// The child shell has gone away; reap it, capture its code, and tear the
+    /// window down.
     fn child_exited(&mut self) {
         match self.pty.wait() {
-            Ok(status) => tracing::info!("shell exited: {status}"),
+            Ok(status) => {
+                tracing::info!("shell exited: {status}");
+                // Mirror the shell's status: its code, or 128+signal if killed.
+                let code = status
+                    .code()
+                    .unwrap_or_else(|| 128 + status.signal().unwrap_or(0));
+                self.exit_code = ExitCode::from(code as u8);
+            }
             Err(err) => tracing::warn!("reap shell: {err}"),
         }
         self.exit = true;

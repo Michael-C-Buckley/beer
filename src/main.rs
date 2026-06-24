@@ -23,7 +23,7 @@ struct Cli {
 fn main() -> ExitCode {
     init_logging();
     match run(Cli::parse()) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(err) => {
             tracing::error!("{err:#}");
             eprintln!("beer: {err:#}");
@@ -45,10 +45,9 @@ fn init_logging() {
         .init();
 }
 
-fn run(cli: Cli) -> anyhow::Result<()> {
+fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     if cli.server {
-        tracing::info!("starting beer server");
-        todo!("server mode")
+        anyhow::bail!("server mode is not implemented yet");
     }
 
     tracing::info!("starting beer");
