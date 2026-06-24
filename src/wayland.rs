@@ -6,7 +6,6 @@
 use std::os::fd::OwnedFd;
 use std::os::unix::process::ExitStatusExt;
 use std::process::ExitCode;
-use std::time::Duration;
 
 use anyhow::Context;
 use calloop::generic::Generic;
@@ -105,9 +104,11 @@ pub fn run() -> anyhow::Result<ExitCode> {
         exit_code: ExitCode::SUCCESS,
     };
 
+    // Block until an event (PTY output, input, configure) arrives - every
+    // repaint is driven by one, so there is nothing to do on a timer.
     while !app.exit {
         event_loop
-            .dispatch(Duration::from_millis(16), &mut app)
+            .dispatch(None, &mut app)
             .context("dispatch event loop")?;
         if app.dirty {
             app.draw();

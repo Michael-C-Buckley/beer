@@ -12,7 +12,7 @@ use crate::grid::{Cell, Color, CursorShape, Flags, Grid, Underline};
 const DEFAULT_FG: Rgb = Rgb(0xc5, 0xc8, 0xc6);
 const DEFAULT_BG: Rgb = Rgb(0x18, 0x18, 0x18);
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct Rgb(u8, u8, u8);
 
 /// A mutable view over a BGRA pixel buffer.
@@ -30,15 +30,29 @@ impl Canvas<'_> {
         Some((y as usize * self.width + x as usize) * 4)
     }
 
+    /// Fill the whole buffer with one colour (fast path, no per-pixel bounds
+    /// checks).
+    fn clear(&mut self, c: Rgb) {
+        let bytes = [c.2, c.1, c.0, 0xff];
+        for px in self.pixels.chunks_exact_mut(4) {
+            px.copy_from_slice(&bytes);
+        }
+    }
+
     fn fill_rect(&mut self, x0: i32, y0: i32, w: u32, h: u32, c: Rgb) {
-        for dy in 0..h as i32 {
-            for dx in 0..w as i32 {
-                if let Some(i) = self.index(x0 + dx, y0 + dy) {
-                    self.pixels[i] = c.2;
-                    self.pixels[i + 1] = c.1;
-                    self.pixels[i + 2] = c.0;
-                    self.pixels[i + 3] = 0xff;
-                }
+        let x_start = x0.max(0) as usize;
+        let x_end = ((x0 + w as i32).max(0) as usize).min(self.width);
+        let y_start = y0.max(0) as usize;
+        let y_end = ((y0 + h as i32).max(0) as usize).min(self.height);
+        if x_start >= x_end {
+            return;
+        }
+        let bytes = [c.2, c.1, c.0, 0xff];
+        for y in y_start..y_end {
+            let row =
+                &mut self.pixels[(y * self.width + x_start) * 4..(y * self.width + x_end) * 4];
+            for px in row.chunks_exact_mut(4) {
+                px.copy_from_slice(&bytes);
             }
         }
     }
@@ -109,15 +123,19 @@ impl Renderer {
             width,
             height,
         };
-        canvas.fill_rect(0, 0, width as u32, height as u32, DEFAULT_BG);
+        canvas.clear(DEFAULT_BG);
 
         let m = self.fonts.metrics();
 
+        // Cell backgrounds: only paint cells that differ from the cleared
+        // default - most of a screen is default background.
         for y in 0..grid.rows() {
             for x in 0..grid.cols() {
                 let (_, bg) = cell_colors(grid.cell(x, y));
-                let (px, py) = (x as i32 * m.width as i32, y as i32 * m.height as i32);
-                canvas.fill_rect(px, py, m.width, m.height, bg);
+                if bg != DEFAULT_BG {
+                    let (px, py) = (x as i32 * m.width as i32, y as i32 * m.height as i32);
+                    canvas.fill_rect(px, py, m.width, m.height, bg);
+                }
             }
         }
 
