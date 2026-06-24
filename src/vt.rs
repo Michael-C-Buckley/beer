@@ -13,11 +13,25 @@ enum Charset {
     DecSpecial,
 }
 
+/// Which device-attributes query is being answered.
+#[derive(Clone, Copy, Debug)]
+enum DaLevel {
+    Primary,
+    Secondary,
+    Tertiary,
+}
+
+/// DECRQM mode-state code: 1 = set, 2 = reset.
+fn set_reset(on: bool) -> u8 {
+    if on { 1 } else { 2 }
+}
+
 /// The terminal model: a grid plus the escape-sequence state around it.
 #[derive(Debug)]
 pub struct Term {
     grid: Grid,
     title: Option<String>,
+    title_stack: Vec<Option<String>>,
     response: Vec<u8>,
     g0: Charset,
     g1: Charset,
@@ -29,6 +43,7 @@ impl Term {
         Self {
             grid: Grid::new(cols, rows),
             title: None,
+            title_stack: Vec::new(),
             response: Vec::new(),
             g0: Charset::Ascii,
             g1: Charset::Ascii,
@@ -141,14 +156,23 @@ impl Term {
         }
     }
 
-    fn device_attrs(&mut self, secondary: bool) {
-        // Claim a VT220 with ANSI colour (62;22) for DA1, and a generic
-        // firmware level for DA2.
-        if secondary {
-            self.response.extend_from_slice(b"\x1b[>0;276;0c");
-        } else {
-            self.response.extend_from_slice(b"\x1b[?62;22c");
+    /// Device attributes. DA1 claims a VT220 with ANSI colour; DA2 a generic
+    /// firmware level; DA3 a (zero) unit ID.
+    fn device_attrs(&mut self, level: DaLevel) {
+        match level {
+            DaLevel::Primary => self.response.extend_from_slice(b"\x1b[?62;22c"),
+            DaLevel::Secondary => self.response.extend_from_slice(b"\x1b[>0;276;0c"),
+            DaLevel::Tertiary => self.response.extend_from_slice(b"\x1bP!|00000000\x1b\\"),
         }
+    }
+
+    /// XTVERSION (`CSI > q`): report the terminal name and version.
+    fn report_version(&mut self) {
+        let _ = write!(
+            self.response,
+            "\x1bP>|beer({})\x1b\\",
+            env!("CARGO_PKG_VERSION")
+        );
     }
 
     fn device_status(&mut self, params: &Params) {
@@ -157,6 +181,34 @@ impl Term {
             Some(6) => {
                 let (x, y) = self.grid.cursor();
                 let _ = write!(self.response, "\x1b[{};{}R", y + 1, x + 1);
+            }
+            _ => {}
+        }
+    }
+
+    /// DECRQM (`CSI [?] Ps $ p`): report whether a mode is set (1), reset (2),
+    /// or unrecognized (0). Only the modes we actually track are reported.
+    fn report_mode(&mut self, params: &Params, private: bool) {
+        let code = raw(params, 0);
+        let state = match (private, code) {
+            (true, 6) => set_reset(self.grid.origin()),
+            (true, 7) => set_reset(self.grid.autowrap()),
+            (true, 47 | 1047 | 1049) => set_reset(self.grid.alt_active()),
+            (false, 4) => set_reset(self.grid.insert()),
+            _ => 0,
+        };
+        let prefix = if private { "?" } else { "" };
+        let _ = write!(self.response, "\x1b[{prefix}{code};{state}$y");
+    }
+
+    /// Title stack (`CSI 22/23 ; Ps t`): push or pop the window title.
+    fn title_stack_op(&mut self, params: &Params) {
+        match raw(params, 0) {
+            22 => self.title_stack.push(self.title.clone()),
+            23 => {
+                if let Some(title) = self.title_stack.pop() {
+                    self.title = title;
+                }
             }
             _ => {}
         }
@@ -291,7 +343,6 @@ impl Perform for Term {
 
     fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], _ignore: bool, action: char) {
         let private = intermediates.first() == Some(&b'?');
-        let secondary = intermediates.first() == Some(&b'>');
         match action {
             'A' => self.grid.cursor_up(n(params, 0, 1)),
             'B' | 'e' => self.grid.cursor_down(n(params, 0, 1)),
@@ -328,10 +379,17 @@ impl Perform for Term {
             }
             'h' => self.set_mode(params, private, true),
             'l' => self.set_mode(params, private, false),
-            'c' => self.device_attrs(secondary),
+            'c' => self.device_attrs(match intermediates.first() {
+                Some(b'>') => DaLevel::Secondary,
+                Some(b'=') => DaLevel::Tertiary,
+                _ => DaLevel::Primary,
+            }),
+            'q' if intermediates.first() == Some(&b'>') => self.report_version(),
+            'p' if intermediates.contains(&b'$') => self.report_mode(params, private),
             'n' => self.device_status(params),
             's' => self.grid.save_cursor(),
             'u' => self.grid.restore_cursor(),
+            't' => self.title_stack_op(params),
             'g' => match raw(params, 0) {
                 3 => self.grid.clear_all_tabs(),
                 _ => self.grid.clear_tab(),
@@ -410,6 +468,48 @@ mod tests {
         feed(&mut t, b"one\r\ntwo");
         assert_eq!(t.grid().row_text(0), "one");
         assert_eq!(t.grid().row_text(1), "two");
+    }
+
+    #[test]
+    fn device_attributes_levels() {
+        let mut t = Term::new(20, 4);
+        feed(&mut t, b"\x1b[c");
+        assert_eq!(t.take_response(), b"\x1b[?62;22c");
+        feed(&mut t, b"\x1b[>c");
+        assert_eq!(t.take_response(), b"\x1b[>0;276;0c");
+        feed(&mut t, b"\x1b[=c");
+        assert_eq!(t.take_response(), b"\x1bP!|00000000\x1b\\");
+    }
+
+    #[test]
+    fn xtversion_reports_name() {
+        let mut t = Term::new(20, 4);
+        feed(&mut t, b"\x1b[>q");
+        let resp = t.take_response();
+        assert!(resp.starts_with(b"\x1bP>|beer("));
+        assert!(resp.ends_with(b")\x1b\\"));
+    }
+
+    #[test]
+    fn decrqm_reports_known_modes() {
+        let mut t = Term::new(20, 4);
+        feed(&mut t, b"\x1b[?7$p"); // autowrap, on by default
+        assert_eq!(t.take_response(), b"\x1b[?7;1$y");
+        feed(&mut t, b"\x1b[?7l\x1b[?7$p"); // turn it off, re-query
+        assert_eq!(t.take_response(), b"\x1b[?7;2$y");
+        feed(&mut t, b"\x1b[?9999$p"); // unknown mode
+        assert_eq!(t.take_response(), b"\x1b[?9999;0$y");
+    }
+
+    #[test]
+    fn title_stack_push_pop() {
+        let mut t = Term::new(20, 4);
+        feed(&mut t, b"\x1b]0;first\x07");
+        feed(&mut t, b"\x1b[22t"); // push "first"
+        feed(&mut t, b"\x1b]0;second\x07");
+        assert_eq!(t.title(), Some("second"));
+        feed(&mut t, b"\x1b[23t"); // pop -> "first"
+        assert_eq!(t.title(), Some("first"));
     }
 
     #[test]

@@ -177,6 +177,22 @@ impl Grid {
         self.insert = on;
     }
 
+    pub fn autowrap(&self) -> bool {
+        self.autowrap
+    }
+
+    pub fn origin(&self) -> bool {
+        self.origin
+    }
+
+    pub fn insert(&self) -> bool {
+        self.insert
+    }
+
+    pub fn alt_active(&self) -> bool {
+        self.alt_saved.is_some()
+    }
+
     // --- printing ---
 
     /// Place a printable character at the cursor, honouring width and autowrap.
