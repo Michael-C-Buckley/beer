@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use calloop::generic::Generic;
-use calloop::{EventLoop, Interest, Mode, PostAction};
+use calloop::{EventLoop, Interest, LoopHandle, Mode, PostAction};
 use calloop_wayland_source::WaylandSource;
 
 use crate::font::Fonts;
@@ -77,42 +77,6 @@ pub fn run() -> anyhow::Result<ExitCode> {
 
     let fonts = Fonts::new(FONT_FAMILY, FONT_SIZE_PX).context("load font")?;
     let renderer = Renderer::new(fonts);
-    let (cols, rows) = grid_size(renderer.metrics(), DEFAULT_W, DEFAULT_H);
-
-    let pty = Pty::spawn(cols, rows).context("spawn shell on pty")?;
-    let term = Term::new(cols as usize, rows as usize);
-    let mut parser = vte::Parser::new();
-
-    // Read child output off a clone of the master; the original stays in `pty`
-    // for writing input back.
-    let read_fd = pty.master().try_clone().context("clone pty master")?;
-    event_loop
-        .handle()
-        .insert_source(
-            Generic::new(read_fd, Interest::READ, Mode::Level),
-            move |_, fd, app: &mut App| {
-                let mut buf = [0u8; 4096];
-                match rustix::io::read(&*fd, &mut buf) {
-                    Ok(0) => {
-                        app.child_exited();
-                        Ok(PostAction::Remove)
-                    }
-                    Ok(n) => {
-                        parser.advance(&mut app.term, &buf[..n]);
-                        app.after_feed();
-                        Ok(PostAction::Continue)
-                    }
-                    Err(rustix::io::Errno::INTR | rustix::io::Errno::AGAIN) => {
-                        Ok(PostAction::Continue)
-                    }
-                    Err(_) => {
-                        app.child_exited();
-                        Ok(PostAction::Remove)
-                    }
-                }
-            },
-        )
-        .map_err(|e| anyhow::anyhow!("register pty in event loop: {e}"))?;
 
     let mut app = App {
         registry_state: RegistryState::new(&globals),
@@ -121,9 +85,12 @@ pub fn run() -> anyhow::Result<ExitCode> {
         shm,
         pool,
         window,
-        pty,
-        term,
         renderer,
+        loop_handle: event_loop.handle(),
+        // The PTY is spawned on the first configure, once the real window size
+        // is known, so the shell starts at the final size and is not hit by a
+        // startup SIGWINCH storm that makes it reprint its prompt.
+        session: None,
         title: None,
         width: DEFAULT_W,
         height: DEFAULT_H,
@@ -165,6 +132,14 @@ fn write_all(fd: &OwnedFd, mut buf: &[u8]) -> rustix::io::Result<()> {
     Ok(())
 }
 
+/// The per-window terminal: the PTY and the parsed screen behind it. Created on
+/// the first configure, once the real size is known.
+#[derive(Debug)]
+struct Session {
+    pty: Pty,
+    term: Term,
+}
+
 /// Window + Wayland client state shared across all protocol handlers.
 #[derive(Debug)]
 struct App {
@@ -174,9 +149,10 @@ struct App {
     shm: Shm,
     pool: SlotPool,
     window: Window,
-    pty: Pty,
-    term: Term,
     renderer: Renderer,
+    loop_handle: LoopHandle<'static, App>,
+    /// `None` until the first configure spawns the shell.
+    session: Option<Session>,
     /// Last title applied to the toplevel, to avoid redundant requests.
     title: Option<String>,
     width: u32,
@@ -191,17 +167,79 @@ struct App {
 }
 
 impl App {
+    /// Spawn the shell at the current window size and start reading its output.
+    fn spawn_session(&mut self) {
+        let (cols, rows) = grid_size(self.renderer.metrics(), self.width, self.height);
+        let pty = match Pty::spawn(cols, rows) {
+            Ok(pty) => pty,
+            Err(err) => {
+                tracing::error!("spawn shell: {err:#}");
+                self.exit = true;
+                return;
+            }
+        };
+        let read_fd = match pty.master().try_clone() {
+            Ok(fd) => fd,
+            Err(err) => {
+                tracing::error!("clone pty master: {err}");
+                self.exit = true;
+                return;
+            }
+        };
+
+        let mut parser = vte::Parser::new();
+        let source = Generic::new(read_fd, Interest::READ, Mode::Level);
+        let registered = self
+            .loop_handle
+            .insert_source(source, move |_, fd, app: &mut App| {
+                let mut buf = [0u8; 4096];
+                let n = match rustix::io::read(&*fd, &mut buf) {
+                    Ok(0) => {
+                        app.child_exited();
+                        return Ok(PostAction::Remove);
+                    }
+                    Ok(n) => n,
+                    Err(rustix::io::Errno::INTR | rustix::io::Errno::AGAIN) => {
+                        return Ok(PostAction::Continue);
+                    }
+                    Err(_) => {
+                        app.child_exited();
+                        return Ok(PostAction::Remove);
+                    }
+                };
+                if let Some(session) = app.session.as_mut() {
+                    parser.advance(&mut session.term, &buf[..n]);
+                }
+                app.after_feed();
+                Ok(PostAction::Continue)
+            });
+        if let Err(err) = registered {
+            tracing::error!("register pty in event loop: {err}");
+            self.exit = true;
+            return;
+        }
+
+        self.session = Some(Session {
+            pty,
+            term: Term::new(cols as usize, rows as usize),
+        });
+    }
+
     /// After parsing child output: send any replies, sync the title, repaint.
     fn after_feed(&mut self) {
-        let reply = self.term.take_response();
+        let Some(session) = self.session.as_mut() else {
+            return;
+        };
+        let reply = session.term.take_response();
         if !reply.is_empty()
-            && let Err(err) = write_all(self.pty.master(), &reply)
+            && let Err(err) = write_all(session.pty.master(), &reply)
         {
             tracing::warn!("write to pty: {err}");
         }
 
-        if self.term.title() != self.title.as_deref() {
-            self.title = self.term.title().map(str::to_owned);
+        let new_title = session.term.title().map(str::to_owned);
+        if new_title.as_deref() != self.title.as_deref() {
+            self.title = new_title;
             self.window
                 .set_title(self.title.clone().unwrap_or_default());
         }
@@ -212,11 +250,16 @@ impl App {
     /// PTY about it if it changed.
     fn resize_grid(&mut self) {
         let (cols, rows) = grid_size(self.renderer.metrics(), self.width, self.height);
-        if (cols as usize, rows as usize) == (self.term.grid().cols(), self.term.grid().rows()) {
+        let Some(session) = self.session.as_mut() else {
+            return;
+        };
+        if (cols as usize, rows as usize)
+            == (session.term.grid().cols(), session.term.grid().rows())
+        {
             return;
         }
-        self.term.resize(cols as usize, rows as usize);
-        if let Err(err) = self.pty.resize(cols, rows) {
+        session.term.resize(cols as usize, rows as usize);
+        if let Err(err) = session.pty.resize(cols, rows) {
             tracing::warn!("resize pty: {err}");
         }
     }
@@ -224,22 +267,27 @@ impl App {
     /// The child shell has gone away; reap it, capture its code, and tear the
     /// window down.
     fn child_exited(&mut self) {
-        match self.pty.wait() {
-            Ok(status) => {
-                tracing::info!("shell exited: {status}");
-                // Mirror the shell's status: its code, or 128+signal if killed.
-                let code = status
-                    .code()
-                    .unwrap_or_else(|| 128 + status.signal().unwrap_or(0));
-                self.exit_code = ExitCode::from(code as u8);
+        if let Some(session) = self.session.as_mut() {
+            match session.pty.wait() {
+                Ok(status) => {
+                    tracing::info!("shell exited: {status}");
+                    // Mirror the shell's status: its code, or 128+signal if killed.
+                    let code = status
+                        .code()
+                        .unwrap_or_else(|| 128 + status.signal().unwrap_or(0));
+                    self.exit_code = ExitCode::from(code as u8);
+                }
+                Err(err) => tracing::warn!("reap shell: {err}"),
             }
-            Err(err) => tracing::warn!("reap shell: {err}"),
         }
         self.exit = true;
     }
 
     /// Render the grid into a fresh buffer and present it.
     fn draw(&mut self) {
+        let Some(session) = self.session.as_ref() else {
+            return;
+        };
         let (w, h) = (self.width, self.height);
         let stride = w as i32 * 4;
 
@@ -256,7 +304,7 @@ impl App {
             };
 
         self.renderer.render(
-            self.term.grid(),
+            session.term.grid(),
             canvas,
             w as usize,
             h as usize,
@@ -331,7 +379,11 @@ impl WindowHandler for App {
             self.height = h.get();
         }
         self.focused = configure.is_activated();
-        self.resize_grid();
+        if self.session.is_none() {
+            self.spawn_session();
+        } else {
+            self.resize_grid();
+        }
         self.draw();
     }
 }
