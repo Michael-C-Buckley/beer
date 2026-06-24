@@ -8,6 +8,7 @@
   taplo,
   cargo-deny,
   pkg-config,
+  ncurses,
   wayland,
   wayland-protocols,
   wayland-scanner,
@@ -17,7 +18,7 @@
   harfbuzz,
 }:
 mkShell {
-  name = "rust";
+  name = "beer-dev";
 
   strictDeps = true;
   nativeBuildInputs = [
@@ -25,19 +26,11 @@ mkShell {
     rustc
     clippy
     rustfmt
-    rustc
-    cargo
-
-    # Tools
-    rustfmt
-    clippy
-    cargo
     taplo
-
-    # LSP
     rust-analyzer
     cargo-deny
     pkg-config
+    ncurses # tic, to compile the terminfo entry
   ];
 
   buildInputs = [
@@ -49,4 +42,14 @@ mkShell {
     fontconfig
     harfbuzz
   ];
+
+  # Compile the beer terminfo into a project-local database and put it ahead of
+  # the system one, so TERM=beer resolves inside the shell (and for the shell
+  # beer spawns, which inherits this env). The trailing ':' keeps the system
+  # database on the search path.
+  shellHook = ''
+    if tic -x -o "$PWD/.terminfo" terminfo/beer.info 2>/dev/null; then
+      export TERMINFO_DIRS="$PWD/.terminfo:"
+    fi
+  '';
 }
