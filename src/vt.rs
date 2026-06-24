@@ -133,6 +133,7 @@ impl Term {
                     }
                 }
                 (false, 4) => self.grid.set_insert(on),
+                (true, 1) => self.grid.set_app_cursor(on),
                 (true, 25) => self.grid.set_cursor_visible(on),
                 // App-cursor/bracketed-paste/mouse/sync modes affect input and
                 // rendering, which arrive with the keyboard and renderer.

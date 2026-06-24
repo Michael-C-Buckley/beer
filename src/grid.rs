@@ -124,6 +124,8 @@ pub struct Grid {
     alt_saved: Option<Vec<Vec<Cell>>>,
     cursor_shape: CursorShape,
     cursor_visible: bool,
+    /// Application cursor-keys mode (DECCKM): arrows send SS3 instead of CSI.
+    app_cursor: bool,
     /// Cursor colour from OSC 12; `None` follows the cell under the cursor.
     cursor_color: Option<(u8, u8, u8)>,
 }
@@ -154,6 +156,7 @@ impl Grid {
             cursor_shape: CursorShape::default(),
             cursor_visible: true,
             cursor_color: None,
+            app_cursor: false,
         }
     }
 
@@ -248,6 +251,14 @@ impl Grid {
 
     pub fn cursor_color(&self) -> Option<(u8, u8, u8)> {
         self.cursor_color
+    }
+
+    pub fn set_app_cursor(&mut self, on: bool) {
+        self.app_cursor = on;
+    }
+
+    pub fn app_cursor(&self) -> bool {
+        self.app_cursor
     }
 
     // --- printing ---

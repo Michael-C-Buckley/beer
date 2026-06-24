@@ -19,12 +19,15 @@ use crate::render::Renderer;
 use crate::vt::Term;
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
-    delegate_compositor, delegate_output, delegate_registry, delegate_seat, delegate_shm,
-    delegate_xdg_shell, delegate_xdg_window,
+    delegate_compositor, delegate_keyboard, delegate_output, delegate_registry, delegate_seat,
+    delegate_shm, delegate_xdg_shell, delegate_xdg_window,
     output::{OutputHandler, OutputState},
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
-    seat::{Capability, SeatHandler, SeatState},
+    seat::{
+        Capability, SeatHandler, SeatState,
+        keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers, RawModifiers, RepeatInfo},
+    },
     shell::{
         WaylandSurface,
         xdg::{
@@ -37,7 +40,7 @@ use smithay_client_toolkit::{
 use wayland_client::{
     Connection, QueueHandle,
     globals::registry_queue_init,
-    protocol::{wl_output, wl_seat, wl_shm, wl_surface},
+    protocol::{wl_keyboard, wl_output, wl_seat, wl_shm, wl_surface},
 };
 
 /// Default window size in pixels before the compositor suggests one.
@@ -87,6 +90,8 @@ pub fn run() -> anyhow::Result<ExitCode> {
         window,
         renderer,
         loop_handle: event_loop.handle(),
+        keyboard: None,
+        modifiers: Modifiers::default(),
         // The PTY is spawned on the first configure, once the real window size
         // is known, so the shell starts at the final size and is not hit by a
         // startup SIGWINCH storm that makes it reprint its prompt.
@@ -151,6 +156,8 @@ struct App {
     window: Window,
     renderer: Renderer,
     loop_handle: LoopHandle<'static, App>,
+    keyboard: Option<wl_keyboard::WlKeyboard>,
+    modifiers: Modifiers,
     /// `None` until the first configure spawns the shell.
     session: Option<Session>,
     /// Last title applied to the toplevel, to avoid redundant requests.
@@ -223,6 +230,20 @@ impl App {
             pty,
             term: Term::new(cols as usize, rows as usize),
         });
+    }
+
+    /// Encode a key event and write it to the shell.
+    fn send_key(&self, event: &KeyEvent) {
+        let app_cursor = self
+            .session
+            .as_ref()
+            .is_some_and(|s| s.term.grid().app_cursor());
+        if let Some(bytes) = crate::input::encode(event, self.modifiers, app_cursor)
+            && let Some(session) = self.session.as_ref()
+            && let Err(err) = write_all(session.pty.master(), &bytes)
+        {
+            tracing::warn!("write key to pty: {err}");
+        }
     }
 
     /// After parsing child output: send any replies, sync the title, repaint.
@@ -404,10 +425,16 @@ impl SeatHandler for App {
     fn new_capability(
         &mut self,
         _: &Connection,
-        _: &QueueHandle<Self>,
-        _: wl_seat::WlSeat,
-        _: Capability,
+        qh: &QueueHandle<Self>,
+        seat: wl_seat::WlSeat,
+        capability: Capability,
     ) {
+        if capability == Capability::Keyboard && self.keyboard.is_none() {
+            match self.seat_state.get_keyboard(qh, &seat, None) {
+                Ok(keyboard) => self.keyboard = Some(keyboard),
+                Err(err) => tracing::warn!("get keyboard: {err}"),
+            }
+        }
     }
 
     fn remove_capability(
@@ -415,11 +442,98 @@ impl SeatHandler for App {
         _: &Connection,
         _: &QueueHandle<Self>,
         _: wl_seat::WlSeat,
-        _: Capability,
+        capability: Capability,
     ) {
+        if capability == Capability::Keyboard
+            && let Some(keyboard) = self.keyboard.take()
+        {
+            keyboard.release();
+        }
     }
 
     fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
+}
+
+impl KeyboardHandler for App {
+    fn enter(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: &wl_surface::WlSurface,
+        _: u32,
+        _: &[u32],
+        _: &[Keysym],
+    ) {
+        self.focused = true;
+        self.dirty = true;
+    }
+
+    fn leave(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: &wl_surface::WlSurface,
+        _: u32,
+    ) {
+        self.focused = false;
+        self.dirty = true;
+    }
+
+    fn press_key(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: u32,
+        event: KeyEvent,
+    ) {
+        self.send_key(&event);
+    }
+
+    fn repeat_key(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: u32,
+        event: KeyEvent,
+    ) {
+        self.send_key(&event);
+    }
+
+    fn release_key(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: u32,
+        _: KeyEvent,
+    ) {
+    }
+
+    fn update_modifiers(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: u32,
+        modifiers: Modifiers,
+        _: RawModifiers,
+        _: u32,
+    ) {
+        self.modifiers = modifiers;
+    }
+
+    fn update_repeat_info(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: RepeatInfo,
+    ) {
+    }
 }
 
 impl OutputHandler for App {
@@ -445,6 +559,7 @@ delegate_compositor!(App);
 delegate_output!(App);
 delegate_shm!(App);
 delegate_seat!(App);
+delegate_keyboard!(App);
 delegate_xdg_shell!(App);
 delegate_xdg_window!(App);
 delegate_registry!(App);
