@@ -4,18 +4,24 @@
 //! FreeType rasterizes each glyph to an 8-bit coverage mask or, for colour
 //! fonts, a pre-multiplied BGRA bitmap. Layout is fixed-cell, so a glyph's own
 //! advance is never consulted - only the [`CellMetrics`] taken from the primary
-//! face. All C interop is handled by the `freetype` and `fontconfig` safe
-//! wrappers, so this module contains no `unsafe`.
+//! face. C interop goes through the `freetype`/`fontconfig` safe wrappers; the
+//! sole `unsafe` is reading a face's fixed-strike array (see `nearest_strike`).
 
 use std::collections::HashMap;
 use std::fmt;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 use fontconfig::{CharSet, Fontconfig, Pattern};
 use freetype::bitmap::PixelMode;
-use freetype::face::LoadFlag;
-use freetype::{Face, Library};
+use freetype::face::{LoadFlag, StyleFlag};
+use freetype::{Face, Library, Matrix, Vector};
+use lru::LruCache;
 use thiserror::Error;
+
+/// Upper bound on cached glyphs; the working set of a terminal is far smaller,
+/// but this caps memory under adversarial all-of-Unicode output.
+const GLYPH_CACHE_CAP: usize = 4096;
 
 #[derive(Debug, Error)]
 pub enum FontError {
@@ -99,7 +105,7 @@ pub struct Fonts {
     styled: [Option<usize>; 4],
     /// Fallback faces resolved by coverage, deduplicated by file path.
     fallbacks: HashMap<PathBuf, usize>,
-    cache: HashMap<(char, usize), Glyph>,
+    cache: LruCache<(char, usize), Glyph>,
 }
 
 impl fmt::Debug for Fonts {
@@ -132,7 +138,7 @@ impl Fonts {
             faces: vec![regular],
             styled: [Some(0), None, None, None],
             fallbacks: HashMap::new(),
-            cache: HashMap::new(),
+            cache: LruCache::new(NonZeroUsize::new(GLYPH_CACHE_CAP).expect("cap is nonzero")),
         })
     }
 
@@ -144,12 +150,18 @@ impl Fonts {
     /// it on first use.
     pub fn glyph(&mut self, c: char, style: Style) -> Result<&Glyph, FontError> {
         let key = (c, style.index());
-        if !self.cache.contains_key(&key) {
-            let face = self.face_for(c, style)?;
-            let glyph = rasterize(&self.faces[face], c)?;
-            self.cache.insert(key, glyph);
+        if self.cache.get(&key).is_none() {
+            let idx = self.face_for(c, style)?;
+            let face = &self.faces[idx];
+            // Synthesize bold/italic only when the resolved face lacks the real
+            // variant (most monospace families ship both).
+            let flags = face.style_flags();
+            let synth_bold = style.bold && !flags.contains(StyleFlag::BOLD);
+            let synth_italic = style.italic && !flags.contains(StyleFlag::ITALIC);
+            let glyph = rasterize(face, c, synth_bold, synth_italic)?;
+            self.cache.put(key, glyph);
         }
-        Ok(&self.cache[&key])
+        Ok(self.cache.get(&key).expect("glyph was just inserted"))
     }
 
     /// Pick the face that should render `c`: the requested style if it has the
@@ -294,8 +306,23 @@ fn cell_metrics(face: &Face, family: &str) -> Result<CellMetrics, FontError> {
     })
 }
 
-fn rasterize(face: &Face, c: char) -> Result<Glyph, FontError> {
-    face.load_char(c as usize, LoadFlag::RENDER | LoadFlag::COLOR)?;
+fn rasterize(
+    face: &Face,
+    c: char,
+    synth_bold: bool,
+    synth_italic: bool,
+) -> Result<Glyph, FontError> {
+    // A shear transform fakes italics on a face that has no real oblique. It is
+    // applied to the outline at load time, so reset it immediately after.
+    if synth_italic {
+        face.set_transform(&mut shear_matrix(), &mut Vector { x: 0, y: 0 });
+    }
+    let result = face.load_char(c as usize, LoadFlag::RENDER | LoadFlag::COLOR);
+    if synth_italic {
+        face.set_transform(&mut identity_matrix(), &mut Vector { x: 0, y: 0 });
+    }
+    result?;
+
     let slot = face.glyph();
     let bitmap = slot.bitmap();
     let width = bitmap.width().max(0) as usize;
@@ -303,12 +330,17 @@ fn rasterize(face: &Face, c: char) -> Result<Glyph, FontError> {
     let pitch = bitmap.pitch();
     let src = bitmap.buffer();
 
-    let data = match bitmap.pixel_mode()? {
+    let mut data = match bitmap.pixel_mode()? {
         PixelMode::Gray => GlyphData::Mask(pack_rows(src, width, pitch, height)),
         PixelMode::Bgra => GlyphData::Color(pack_rows(src, width * 4, pitch, height)),
         PixelMode::Mono => GlyphData::Mask(expand_mono(src, width, pitch, height)),
         _ => GlyphData::Mask(vec![0; width * height]),
     };
+    // Fake bold by widening coverage one pixel to the right (colour glyphs are
+    // left alone - there is no such thing as a bold emoji).
+    if synth_bold && let GlyphData::Mask(mask) = &mut data {
+        embolden(mask, width, height);
+    }
 
     Ok(Glyph {
         left: slot.bitmap_left(),
@@ -317,6 +349,35 @@ fn rasterize(face: &Face, c: char) -> Result<Glyph, FontError> {
         height: height as u32,
         data,
     })
+}
+
+fn shear_matrix() -> Matrix {
+    // ~0.2 horizontal shear in 16.16 fixed point.
+    Matrix {
+        xx: 0x1_0000,
+        xy: 0x3333,
+        yx: 0,
+        yy: 0x1_0000,
+    }
+}
+
+fn identity_matrix() -> Matrix {
+    Matrix {
+        xx: 0x1_0000,
+        xy: 0,
+        yx: 0,
+        yy: 0x1_0000,
+    }
+}
+
+/// Widen each row's coverage by one pixel (synthetic bold).
+fn embolden(mask: &mut [u8], width: usize, height: usize) {
+    for y in 0..height {
+        let row = &mut mask[y * width..y * width + width];
+        for x in (1..width).rev() {
+            row[x] = row[x].max(row[x - 1]);
+        }
+    }
 }
 
 /// Copy `height` rows of `row_bytes` each out of FreeType's padded buffer,
@@ -383,6 +444,15 @@ mod tests {
         let mut f = fonts();
         // Space resolves without error; it simply carries no ink.
         f.glyph(' ', Style::default()).expect("rasterize space");
+    }
+
+    #[test]
+    fn embolden_widens_coverage() {
+        // 3x2 mask, one lit pixel per row at x=1.
+        let mut mask = vec![0, 255, 0, 0, 200, 0];
+        embolden(&mut mask, 3, 2);
+        // Each lit pixel bleeds one column to the right; the left edge is unchanged.
+        assert_eq!(mask, vec![0, 255, 255, 0, 200, 200]);
     }
 
     #[test]
