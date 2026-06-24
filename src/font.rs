@@ -213,9 +213,7 @@ impl Fonts {
         }
         let index = matched.face_index().unwrap_or(0) as isize;
         let face = self.library.new_face(&path, index)?;
-        // Bitmap-strike-only fonts reject an arbitrary pixel size; skip them
-        // rather than guess a strike.
-        if face.set_pixel_sizes(0, self.size_px).is_err() {
+        if size_face(&face, self.size_px).is_err() {
             return Ok(None);
         }
         self.faces.push(face);
@@ -240,8 +238,41 @@ fn resolve_face(
         .find(family, Some(style.fontconfig_style()))
         .map_err(|_| FontError::NoFamily(family.to_owned()))?;
     let face = library.new_face(&font.path, font.index.unwrap_or(0) as isize)?;
-    face.set_pixel_sizes(0, size_px)?;
+    size_face(&face, size_px)?;
     Ok(face)
+}
+
+/// Set a face to `size_px`. Scalable faces size directly; bitmap-strike faces
+/// (e.g. colour-emoji fonts) cannot, so select the nearest available strike and
+/// let the renderer scale its glyphs into the cell.
+fn size_face(face: &Face, size_px: u32) -> Result<(), FontError> {
+    match face.set_pixel_sizes(0, size_px) {
+        Ok(()) => Ok(()),
+        Err(_) if face.has_fixed_sizes() => {
+            face.select_size(nearest_strike(face, size_px))?;
+            Ok(())
+        }
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// Index of the fixed strike whose pixel height is closest to `target`.
+fn nearest_strike(face: &Face, target: u32) -> i32 {
+    let rec = face.raw();
+    let target = i32::try_from(target).unwrap_or(i32::MAX);
+    let mut best = 0;
+    let mut best_delta = i32::MAX;
+    for i in 0..rec.num_fixed_sizes {
+        // SAFETY: `available_sizes` points to `num_fixed_sizes` valid
+        // `FT_Bitmap_Size` entries for the face's lifetime; `i` is in range.
+        let height = i32::from(unsafe { (*rec.available_sizes.offset(i as isize)).height });
+        let delta = (height - target).abs();
+        if delta < best_delta {
+            best = i;
+            best_delta = delta;
+        }
+    }
+    best
 }
 
 fn cell_metrics(face: &Face, family: &str) -> Result<CellMetrics, FontError> {

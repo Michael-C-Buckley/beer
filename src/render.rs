@@ -154,7 +154,7 @@ impl Renderer {
                         cell.c,
                         cell_style(cell),
                         origin_x,
-                        cell_top + m.ascent as i32,
+                        cell_top,
                         fg,
                     );
                 }
@@ -194,14 +194,7 @@ impl Renderer {
                 let cell = grid.cell(cx, cy);
                 if cell.c != ' ' && !cell.flags.contains(Flags::WIDE_CONT) {
                     let (_, bg) = cell_colors(cell);
-                    self.draw_glyph(
-                        canvas,
-                        cell.c,
-                        cell_style(cell),
-                        x0,
-                        top + m.ascent as i32,
-                        bg,
-                    );
+                    self.draw_glyph(canvas, cell.c, cell_style(cell), x0, top, bg);
                 }
             }
             CursorShape::Underline => {
@@ -217,9 +210,10 @@ impl Renderer {
         c: char,
         style: Style,
         origin_x: i32,
-        baseline: i32,
+        cell_top: i32,
         fg: Rgb,
     ) {
+        let m = self.fonts.metrics();
         let glyph = match self.fonts.glyph(c, style) {
             Ok(glyph) => glyph,
             Err(err) => {
@@ -227,31 +221,39 @@ impl Renderer {
                 return;
             }
         };
-        let (left, top, w, h) = (
-            glyph.left,
-            glyph.top,
-            glyph.width as i32,
-            glyph.height as i32,
-        );
+        let (gw, gh) = (glyph.width as i32, glyph.height as i32);
         match &glyph.data {
             GlyphData::Mask(mask) => {
-                for gy in 0..h {
-                    for gx in 0..w {
-                        let a = mask[(gy * w + gx) as usize];
+                let baseline = cell_top + m.ascent as i32;
+                for gy in 0..gh {
+                    for gx in 0..gw {
+                        let a = mask[(gy * gw + gx) as usize];
                         if a != 0 {
-                            canvas.blend(origin_x + left + gx, baseline - top + gy, fg, a);
+                            canvas.blend(
+                                origin_x + glyph.left + gx,
+                                baseline - glyph.top + gy,
+                                fg,
+                                a,
+                            );
                         }
                     }
                 }
             }
-            GlyphData::Color(bgra) => {
-                for gy in 0..h {
-                    for gx in 0..w {
-                        let i = ((gy * w + gx) * 4) as usize;
-                        canvas.over(origin_x + left + gx, baseline - top + gy, &bgra[i..i + 4]);
+            // Colour glyphs (emoji) come from a fixed strike at native size;
+            // scale them to the line height with nearest-neighbour sampling.
+            GlyphData::Color(bgra) if gh > 0 => {
+                let scale = m.height as f32 / gh as f32;
+                let target_w = (gw as f32 * scale) as i32;
+                for ty in 0..m.height as i32 {
+                    let sy = ((ty as f32 / scale) as i32).min(gh - 1);
+                    for tx in 0..target_w {
+                        let sx = ((tx as f32 / scale) as i32).min(gw - 1);
+                        let i = ((sy * gw + sx) * 4) as usize;
+                        canvas.over(origin_x + tx, cell_top + ty, &bgra[i..i + 4]);
                     }
                 }
             }
+            GlyphData::Color(_) => {}
         }
     }
 }
