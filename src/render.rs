@@ -11,6 +11,8 @@ use crate::grid::{Cell, Color, CursorShape, Flags, Grid, Underline};
 /// Foreground/background used for `Color::Default`.
 const DEFAULT_FG: Rgb = Rgb(0xc5, 0xc8, 0xc6);
 const DEFAULT_BG: Rgb = Rgb(0x18, 0x18, 0x18);
+/// Background painted behind selected cells.
+const SELECTION_BG: Rgb = Rgb(0x44, 0x47, 0x5a);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Rgb(u8, u8, u8);
@@ -132,8 +134,13 @@ impl Renderer {
         // default - most of a screen is default background. Rows come through
         // the scrollback viewport and may be shorter than `cols` after a resize.
         for y in 0..grid.rows() {
+            let abs = grid.view_to_abs(y);
             for (x, cell) in grid.view_row(y).iter().take(cols).enumerate() {
-                let (_, bg) = cell_colors(cell);
+                let bg = if grid.is_selected(abs, x) {
+                    SELECTION_BG
+                } else {
+                    cell_colors(cell).1
+                };
                 if bg != DEFAULT_BG {
                     let (px, py) = (x as i32 * m.width as i32, y as i32 * m.height as i32);
                     canvas.fill_rect(px, py, m.width, m.height, bg);

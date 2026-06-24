@@ -106,6 +106,14 @@ struct Cursor {
     y: usize,
 }
 
+/// A point in the combined scrollback+live coordinate space: `row` indexes
+/// scrollback lines first (oldest at 0), then the live screen.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Point {
+    pub row: usize,
+    pub col: usize,
+}
+
 /// The active screen plus cursor, scroll region, and current pen.
 #[derive(Debug)]
 pub struct Grid {
@@ -137,6 +145,10 @@ pub struct Grid {
     app_cursor: bool,
     /// Cursor colour from OSC 12; `None` follows the cell under the cursor.
     cursor_color: Option<(u8, u8, u8)>,
+    /// Active mouse selection as (anchor, head) in absolute coordinates.
+    selection: Option<(Point, Point)>,
+    /// Bracketed paste mode (DECSET 2004): wrap pasted text in `ESC[200~`/`201~`.
+    bracketed_paste: bool,
 }
 
 fn default_tabs(cols: usize) -> Vec<bool> {
@@ -168,6 +180,8 @@ impl Grid {
             cursor_visible: true,
             cursor_color: None,
             app_cursor: false,
+            selection: None,
+            bracketed_paste: false,
         }
     }
 
@@ -496,8 +510,13 @@ impl Grid {
                 let line = std::mem::replace(&mut self.lines[y], vec![Cell::default(); self.cols]);
                 self.scrollback.push_back(line);
             }
+            let mut evicted = 0;
             while self.scrollback.len() > SCROLLBACK_CAP {
                 self.scrollback.pop_front();
+                evicted += 1;
+            }
+            if evicted > 0 {
+                self.shift_selection(evicted);
             }
             // Keep a scrolled-back viewport anchored to the same content.
             if self.view_offset > 0 {
@@ -697,6 +716,145 @@ impl Grid {
         }
     }
 
+    // --- selection ---
+
+    /// The absolute row currently shown at viewport row `y`.
+    pub fn view_to_abs(&self, y: usize) -> usize {
+        self.scrollback.len() - self.view_offset + y
+    }
+
+    /// Cells of an absolute row (scrollback first, then the live screen).
+    fn abs_row(&self, row: usize) -> &[Cell] {
+        if row < self.scrollback.len() {
+            &self.scrollback[row]
+        } else {
+            &self.lines[row - self.scrollback.len()]
+        }
+    }
+
+    /// Slide an active selection up by `n` rows after scrollback eviction,
+    /// dropping it if either endpoint scrolled off the top.
+    fn shift_selection(&mut self, n: usize) {
+        if let Some((a, b)) = self.selection {
+            if a.row < n || b.row < n {
+                self.selection = None;
+            } else {
+                self.selection = Some((
+                    Point {
+                        row: a.row - n,
+                        ..a
+                    },
+                    Point {
+                        row: b.row - n,
+                        ..b
+                    },
+                ));
+            }
+        }
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selection = None;
+    }
+
+    /// Begin a selection at an absolute point (drag anchor).
+    pub fn start_selection(&mut self, row: usize, col: usize) {
+        let p = Point { row, col };
+        self.selection = Some((p, p));
+    }
+
+    /// Move the selection head (drag), keeping the anchor fixed.
+    pub fn extend_selection(&mut self, row: usize, col: usize) {
+        if let Some((_, head)) = self.selection.as_mut() {
+            *head = Point { row, col };
+        }
+    }
+
+    /// Select the whitespace-delimited word at an absolute point.
+    pub fn select_word(&mut self, row: usize, col: usize) {
+        let line = self.abs_row(row);
+        let word = |c: char| !c.is_whitespace();
+        if col >= line.len() || !word(line[col].c) {
+            self.start_selection(row, col);
+            return;
+        }
+        let mut lo = col;
+        while lo > 0 && word(line[lo - 1].c) {
+            lo -= 1;
+        }
+        let mut hi = col;
+        while hi + 1 < line.len() && word(line[hi + 1].c) {
+            hi += 1;
+        }
+        self.selection = Some((Point { row, col: lo }, Point { row, col: hi }));
+    }
+
+    /// Select the whole line at an absolute row.
+    pub fn select_line(&mut self, row: usize) {
+        let last = self.abs_row(row).len().saturating_sub(1);
+        self.selection = Some((Point { row, col: 0 }, Point { row, col: last }));
+    }
+
+    /// Normalized selection (start <= end in reading order), if any.
+    fn ordered_selection(&self) -> Option<(Point, Point)> {
+        self.selection.map(|(a, b)| {
+            if (a.row, a.col) <= (b.row, b.col) {
+                (a, b)
+            } else {
+                (b, a)
+            }
+        })
+    }
+
+    /// Whether the cell at an absolute `(row, col)` falls inside the selection.
+    pub fn is_selected(&self, row: usize, col: usize) -> bool {
+        let Some((start, end)) = self.ordered_selection() else {
+            return false;
+        };
+        if row < start.row || row > end.row {
+            return false;
+        }
+        let lo = if row == start.row { start.col } else { 0 };
+        let hi = if row == end.row { end.col } else { usize::MAX };
+        col >= lo && col <= hi
+    }
+
+    /// The selected text, with trailing blanks trimmed per line and rows joined
+    /// by newlines. `None` if there is no selection.
+    pub fn selection_text(&self) -> Option<String> {
+        let (start, end) = self.ordered_selection()?;
+        let mut out = String::new();
+        for row in start.row..=end.row {
+            let line = self.abs_row(row);
+            let lo = if row == start.row { start.col } else { 0 };
+            let hi = if row == end.row {
+                (end.col + 1).min(line.len())
+            } else {
+                line.len()
+            };
+            let text: String = line
+                .get(lo..hi)
+                .unwrap_or(&[])
+                .iter()
+                .filter(|c| !c.flags.contains(Flags::WIDE_CONT))
+                .map(|c| c.c)
+                .collect();
+            out.push_str(text.trim_end());
+            if row != end.row {
+                out.push('\n');
+            }
+        }
+        Some(out)
+    }
+
+    pub fn set_bracketed_paste(&mut self, on: bool) {
+        self.bracketed_paste = on;
+    }
+
+    pub fn bracketed_paste(&self) -> bool {
+        self.bracketed_paste
+    }
+
     // --- inspection (logging + tests) ---
 
     /// The visible text of one row, trailing blanks trimmed.
@@ -809,6 +967,36 @@ mod tests {
         assert_eq!(g.cell(0, 0).c, '世');
         assert!(g.cell(1, 0).flags.contains(Flags::WIDE_CONT));
         assert_eq!(g.cell(2, 0).c, 'x');
+    }
+
+    #[test]
+    fn selection_extracts_text_across_rows() {
+        let mut g = Grid::new(8, 2);
+        for c in "abcd".chars() {
+            g.print(c);
+        }
+        g.carriage_return();
+        g.line_feed();
+        for c in "efgh".chars() {
+            g.print(c);
+        }
+        // Select "cd" on row 0 through "ef" on row 1 (rows are live: abs 0,1).
+        g.start_selection(0, 2);
+        g.extend_selection(1, 1);
+        assert!(g.is_selected(0, 3));
+        assert!(g.is_selected(1, 0));
+        assert!(!g.is_selected(1, 2));
+        assert_eq!(g.selection_text().as_deref(), Some("cd\nef"));
+    }
+
+    #[test]
+    fn select_word_spans_one_word() {
+        let mut g = Grid::new(16, 1);
+        for c in "foo bar baz".chars() {
+            g.print(c);
+        }
+        g.select_word(0, 5); // inside "bar"
+        assert_eq!(g.selection_text().as_deref(), Some("bar"));
     }
 
     #[test]

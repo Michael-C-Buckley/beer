@@ -119,6 +119,10 @@ impl Term {
         &self.grid
     }
 
+    pub fn grid_mut(&mut self) -> &mut Grid {
+        &mut self.grid
+    }
+
     pub fn resize(&mut self, cols: usize, rows: usize) {
         self.grid.resize(cols, rows);
     }
@@ -175,6 +179,7 @@ impl Term {
                 (false, 4) => self.grid.set_insert(on),
                 (true, 1) => self.grid.set_app_cursor(on),
                 (true, 25) => self.grid.set_cursor_visible(on),
+                (true, 2004) => self.grid.set_bracketed_paste(on),
                 // App-cursor/bracketed-paste/mouse/sync modes affect input and
                 // rendering, which arrive with the keyboard and renderer.
                 _ => tracing::trace!("unhandled mode {code} private={private} on={on}"),
