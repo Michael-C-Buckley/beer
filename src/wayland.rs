@@ -431,7 +431,17 @@ impl SeatHandler for App {
         capability: Capability,
     ) {
         if capability == Capability::Keyboard && self.keyboard.is_none() {
-            match self.seat_state.get_keyboard(qh, &seat, None) {
+            // get_keyboard_with_repeat drives key repeat off a calloop timer and
+            // delivers each repeat through the callback.
+            let loop_handle = self.loop_handle.clone();
+            let keyboard = self.seat_state.get_keyboard_with_repeat(
+                qh,
+                &seat,
+                None,
+                loop_handle,
+                Box::new(|app: &mut App, _kbd, event| app.send_key(&event)),
+            );
+            match keyboard {
                 Ok(keyboard) => self.keyboard = Some(keyboard),
                 Err(err) => tracing::warn!("get keyboard: {err}"),
             }
@@ -499,9 +509,10 @@ impl KeyboardHandler for App {
         _: &QueueHandle<Self>,
         _: &wl_keyboard::WlKeyboard,
         _: u32,
-        event: KeyEvent,
+        _: KeyEvent,
     ) {
-        self.send_key(&event);
+        // Repeats are delivered through the get_keyboard_with_repeat callback;
+        // this non-calloop hook is unused.
     }
 
     fn release_key(
