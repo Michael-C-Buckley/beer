@@ -20,13 +20,13 @@ impl Flags {
     pub const BOLD: Self = Self(1 << 0);
     pub const DIM: Self = Self(1 << 1);
     pub const ITALIC: Self = Self(1 << 2);
-    pub const UNDERLINE: Self = Self(1 << 3);
     pub const BLINK: Self = Self(1 << 4);
     pub const REVERSE: Self = Self(1 << 5);
     pub const HIDDEN: Self = Self(1 << 6);
     pub const STRIKE: Self = Self(1 << 7);
     /// Trailing column of a double-width glyph; holds no character of its own.
     pub const WIDE_CONT: Self = Self(1 << 8);
+    pub const OVERLINE: Self = Self(1 << 9);
 
     pub const fn empty() -> Self {
         Self(0)
@@ -49,6 +49,18 @@ impl Flags {
     }
 }
 
+/// Underline style (SGR 4 / 4:x / 21).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Underline {
+    #[default]
+    None,
+    Single,
+    Double,
+    Curly,
+    Dotted,
+    Dashed,
+}
+
 /// One grid cell: a character plus its rendering style.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Cell {
@@ -56,6 +68,9 @@ pub struct Cell {
     pub fg: Color,
     pub bg: Color,
     pub flags: Flags,
+    pub underline: Underline,
+    /// Underline colour; `Default` means "follow the foreground".
+    pub underline_color: Color,
 }
 
 impl Default for Cell {
@@ -65,6 +80,8 @@ impl Default for Cell {
             fg: Color::Default,
             bg: Color::Default,
             flags: Flags::empty(),
+            underline: Underline::None,
+            underline_color: Color::Default,
         }
     }
 }
@@ -259,11 +276,10 @@ impl Grid {
     }
 
     fn pen_blank(&self) -> Cell {
+        // A space carrying only the current background (back-colour erase).
         Cell {
-            c: ' ',
-            fg: Color::Default,
             bg: self.pen.bg,
-            flags: Flags::empty(),
+            ..Cell::default()
         }
     }
 

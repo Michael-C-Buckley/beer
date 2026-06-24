@@ -4,7 +4,7 @@ use std::io::Write as _;
 
 use vte::{Params, Perform};
 
-use crate::grid::{Color, Flags, Grid};
+use crate::grid::{Color, Flags, Grid, Underline};
 
 /// G0/G1 character set designation.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -24,6 +24,18 @@ enum DaLevel {
 /// DECRQM mode-state code: 1 = set, 2 = reset.
 fn set_reset(on: bool) -> u8 {
     if on { 1 } else { 2 }
+}
+
+/// Map an SGR 4 param (`4` or `4:x`) to an underline style.
+fn underline_from(param: &[u16]) -> Underline {
+    match param.get(1).copied().unwrap_or(1) {
+        0 => Underline::None,
+        2 => Underline::Double,
+        3 => Underline::Curly,
+        4 => Underline::Dotted,
+        5 => Underline::Dashed,
+        _ => Underline::Single,
+    }
 }
 
 /// The terminal model: a grid plus the escape-sequence state around it.
@@ -120,14 +132,15 @@ impl Term {
                 1 => pen.flags.insert(Flags::BOLD),
                 2 => pen.flags.insert(Flags::DIM),
                 3 => pen.flags.insert(Flags::ITALIC),
-                4 => pen.flags.insert(Flags::UNDERLINE),
+                4 => pen.underline = underline_from(p),
                 5 | 6 => pen.flags.insert(Flags::BLINK),
                 7 => pen.flags.insert(Flags::REVERSE),
                 8 => pen.flags.insert(Flags::HIDDEN),
                 9 => pen.flags.insert(Flags::STRIKE),
-                21 | 22 => pen.flags.remove(Flags::BOLD.union(Flags::DIM)),
+                21 => pen.underline = Underline::Double,
+                22 => pen.flags.remove(Flags::BOLD.union(Flags::DIM)),
                 23 => pen.flags.remove(Flags::ITALIC),
-                24 => pen.flags.remove(Flags::UNDERLINE),
+                24 => pen.underline = Underline::None,
                 25 => pen.flags.remove(Flags::BLINK),
                 27 => pen.flags.remove(Flags::REVERSE),
                 28 => pen.flags.remove(Flags::HIDDEN),
@@ -136,20 +149,22 @@ impl Term {
                 39 => pen.fg = Color::Default,
                 40..=47 => pen.bg = Color::Indexed((code - 40) as u8),
                 49 => pen.bg = Color::Default,
+                53 => pen.flags.insert(Flags::OVERLINE),
+                55 => pen.flags.remove(Flags::OVERLINE),
                 90..=97 => pen.fg = Color::Indexed((code - 90 + 8) as u8),
                 100..=107 => pen.bg = Color::Indexed((code - 100 + 8) as u8),
-                38 | 48 => {
+                38 | 48 | 58 => {
                     let (color, consumed) = ext_color(&items, i);
                     if let Some(color) = color {
-                        if code == 38 {
-                            pen.fg = color;
-                        } else {
-                            pen.bg = color;
+                        match code {
+                            38 => pen.fg = color,
+                            48 => pen.bg = color,
+                            _ => pen.underline_color = color,
                         }
                     }
                     step = consumed;
                 }
-                // 58/59 (underline colour) and others: no storage yet.
+                59 => pen.underline_color = Color::Default,
                 _ => {}
             }
             i += step;
@@ -499,6 +514,19 @@ mod tests {
         assert_eq!(t.take_response(), b"\x1b[?7;2$y");
         feed(&mut t, b"\x1b[?9999$p"); // unknown mode
         assert_eq!(t.take_response(), b"\x1b[?9999;0$y");
+    }
+
+    #[test]
+    fn sgr_underline_styles_and_lines() {
+        let mut t = Term::new(20, 1);
+        feed(&mut t, b"\x1b[4:3;58;5;1;53mX");
+        let cell = t.grid().cell(0, 0);
+        assert_eq!(cell.underline, Underline::Curly);
+        assert_eq!(cell.underline_color, Color::Indexed(1));
+        assert!(cell.flags.contains(Flags::OVERLINE));
+        // 4:0 turns the underline back off.
+        feed(&mut t, b"\x1b[4:0mY");
+        assert_eq!(t.grid().cell(1, 0).underline, Underline::None);
     }
 
     #[test]

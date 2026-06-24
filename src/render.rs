@@ -6,7 +6,7 @@
 //! neighbouring cell's background fill.
 
 use crate::font::{CellMetrics, Fonts, GlyphData, Style};
-use crate::grid::{Color, Flags, Grid};
+use crate::grid::{Cell, Color, Flags, Grid, Underline};
 
 /// Foreground/background used for `Color::Default`.
 const DEFAULT_FG: Rgb = Rgb(0xc5, 0xc8, 0xc6);
@@ -52,6 +52,20 @@ impl Canvas<'_> {
         self.pixels[i + 1] = mix(fg.1, self.pixels[i + 1]);
         self.pixels[i + 2] = mix(fg.0, self.pixels[i + 2]);
         self.pixels[i + 3] = 0xff;
+    }
+
+    /// Set a single opaque pixel.
+    fn put(&mut self, x: i32, y: i32, c: Rgb) {
+        if let Some(i) = self.index(x, y) {
+            self.pixels[i] = c.2;
+            self.pixels[i + 1] = c.1;
+            self.pixels[i + 2] = c.0;
+            self.pixels[i + 3] = 0xff;
+        }
+    }
+
+    fn hline(&mut self, x0: i32, y: i32, w: u32, c: Rgb) {
+        self.fill_rect(x0, y, w, 1, c);
     }
 
     /// Composite one pre-multiplied BGRA source pixel over the destination.
@@ -104,17 +118,27 @@ impl Renderer {
         for y in 0..grid.rows() {
             for x in 0..grid.cols() {
                 let cell = grid.cell(x, y);
-                if cell.flags.contains(Flags::WIDE_CONT) || cell.c == ' ' {
+                if cell.flags.contains(Flags::WIDE_CONT) {
                     continue;
                 }
                 let (fg, _) = cell_colors(cell, (x, y) == cursor);
-                let style = Style {
-                    bold: cell.flags.contains(Flags::BOLD),
-                    italic: cell.flags.contains(Flags::ITALIC),
-                };
                 let origin_x = x as i32 * m.width as i32;
-                let baseline = y as i32 * m.height as i32 + m.ascent as i32;
-                self.draw_glyph(&mut canvas, cell.c, style, origin_x, baseline, fg);
+                let cell_top = y as i32 * m.height as i32;
+                if cell.c != ' ' {
+                    let style = Style {
+                        bold: cell.flags.contains(Flags::BOLD),
+                        italic: cell.flags.contains(Flags::ITALIC),
+                    };
+                    self.draw_glyph(
+                        &mut canvas,
+                        cell.c,
+                        style,
+                        origin_x,
+                        cell_top + m.ascent as i32,
+                        fg,
+                    );
+                }
+                draw_decorations(&mut canvas, cell, origin_x, cell_top, m, fg);
             }
         }
     }
@@ -165,18 +189,67 @@ impl Renderer {
 }
 
 /// Resolve a cell's (foreground, background) RGB, applying reverse video,
-/// bold-as-bright for the foreground, and hidden.
-fn cell_colors(cell: &crate::grid::Cell, cursor: bool) -> (Rgb, Rgb) {
+/// bold-as-bright, dim, and hidden.
+fn cell_colors(cell: &Cell, cursor: bool) -> (Rgb, Rgb) {
     let bold = cell.flags.contains(Flags::BOLD);
     let mut fg = resolve(cell.fg, DEFAULT_FG, bold);
     let mut bg = resolve(cell.bg, DEFAULT_BG, false);
     if cell.flags.contains(Flags::REVERSE) ^ cursor {
         std::mem::swap(&mut fg, &mut bg);
     }
+    if cell.flags.contains(Flags::DIM) {
+        fg = blend_rgb(fg, bg);
+    }
     if cell.flags.contains(Flags::HIDDEN) {
         fg = bg;
     }
     (fg, bg)
+}
+
+/// Mix `c` two-thirds of the way from `toward`, used for the dim attribute.
+fn blend_rgb(c: Rgb, toward: Rgb) -> Rgb {
+    let mix = |a: u8, b: u8| ((u32::from(a) * 2 + u32::from(b)) / 3) as u8;
+    Rgb(mix(c.0, toward.0), mix(c.1, toward.1), mix(c.2, toward.2))
+}
+
+/// Draw underline, strikethrough, and overline for one cell.
+fn draw_decorations(canvas: &mut Canvas, cell: &Cell, x0: i32, top: i32, m: CellMetrics, fg: Rgb) {
+    let w = m.width;
+    let baseline = top + m.ascent as i32;
+    let uy = (baseline + 1).min(top + m.height as i32 - 1);
+    let uc = resolve(cell.underline_color, fg, false);
+    match cell.underline {
+        Underline::None => {}
+        Underline::Single => canvas.hline(x0, uy, w, uc),
+        Underline::Double => {
+            canvas.hline(x0, uy, w, uc);
+            canvas.hline(x0, (uy - 2).max(top), w, uc);
+        }
+        Underline::Curly => {
+            for dx in 0..w as i32 {
+                let wobble = if (dx / 2) % 2 == 0 { 0 } else { 1 };
+                canvas.put(x0 + dx, uy - wobble, uc);
+            }
+        }
+        Underline::Dotted => {
+            for dx in (0..w as i32).step_by(2) {
+                canvas.put(x0 + dx, uy, uc);
+            }
+        }
+        Underline::Dashed => {
+            for dx in 0..w as i32 {
+                if (dx / 3) % 2 == 0 {
+                    canvas.put(x0 + dx, uy, uc);
+                }
+            }
+        }
+    }
+    if cell.flags.contains(Flags::OVERLINE) {
+        canvas.hline(x0, top, w, fg);
+    }
+    if cell.flags.contains(Flags::STRIKE) {
+        canvas.hline(x0, top + m.ascent as i32 * 2 / 3, w, fg);
+    }
 }
 
 fn resolve(color: Color, default: Rgb, bold: bool) -> Rgb {
