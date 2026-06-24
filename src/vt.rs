@@ -123,6 +123,19 @@ impl Term {
         self.grid.resize(cols, rows);
     }
 
+    pub fn scroll_view(&mut self, delta: isize) {
+        self.grid.scroll_view(delta);
+    }
+
+    pub fn scroll_to_bottom(&mut self) {
+        self.grid.scroll_to_bottom();
+    }
+
+    /// Lines per page, for page-scroll bindings.
+    pub fn page(&self) -> usize {
+        self.grid.page()
+    }
+
     pub fn title(&self) -> Option<&str> {
         self.title.as_deref()
     }

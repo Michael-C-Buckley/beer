@@ -126,12 +126,14 @@ impl Renderer {
         canvas.clear(DEFAULT_BG);
 
         let m = self.fonts.metrics();
+        let cols = grid.cols();
 
         // Cell backgrounds: only paint cells that differ from the cleared
-        // default - most of a screen is default background.
+        // default - most of a screen is default background. Rows come through
+        // the scrollback viewport and may be shorter than `cols` after a resize.
         for y in 0..grid.rows() {
-            for x in 0..grid.cols() {
-                let (_, bg) = cell_colors(grid.cell(x, y));
+            for (x, cell) in grid.view_row(y).iter().take(cols).enumerate() {
+                let (_, bg) = cell_colors(cell);
                 if bg != DEFAULT_BG {
                     let (px, py) = (x as i32 * m.width as i32, y as i32 * m.height as i32);
                     canvas.fill_rect(px, py, m.width, m.height, bg);
@@ -140,8 +142,7 @@ impl Renderer {
         }
 
         for y in 0..grid.rows() {
-            for x in 0..grid.cols() {
-                let cell = grid.cell(x, y);
+            for (x, cell) in grid.view_row(y).iter().take(cols).enumerate() {
                 if cell.flags.contains(Flags::WIDE_CONT) {
                     continue;
                 }
@@ -162,7 +163,10 @@ impl Renderer {
             }
         }
 
-        self.draw_cursor(&mut canvas, grid, m, focused);
+        // The cursor belongs to the live screen; hide it while scrolled back.
+        if grid.view_at_bottom() {
+            self.draw_cursor(&mut canvas, grid, m, focused);
+        }
     }
 
     /// Draw the cursor: a solid block/underline/beam when focused, a hollow

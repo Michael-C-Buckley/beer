@@ -18,14 +18,15 @@ use crate::render::Renderer;
 use crate::vt::Term;
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
-    delegate_compositor, delegate_keyboard, delegate_output, delegate_registry, delegate_seat,
-    delegate_shm, delegate_xdg_shell, delegate_xdg_window,
+    delegate_compositor, delegate_keyboard, delegate_output, delegate_pointer, delegate_registry,
+    delegate_seat, delegate_shm, delegate_xdg_shell, delegate_xdg_window,
     output::{OutputHandler, OutputState},
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
     seat::{
         Capability, SeatHandler, SeatState,
         keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers, RawModifiers, RepeatInfo},
+        pointer::{PointerEvent, PointerEventKind, PointerHandler},
     },
     shell::{
         WaylandSurface,
@@ -39,7 +40,7 @@ use smithay_client_toolkit::{
 use wayland_client::{
     Connection, QueueHandle,
     globals::registry_queue_init,
-    protocol::{wl_keyboard, wl_output, wl_seat, wl_shm, wl_surface},
+    protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
 };
 
 /// Default window size in pixels before the compositor suggests one.
@@ -90,6 +91,7 @@ pub fn run() -> anyhow::Result<ExitCode> {
         renderer,
         loop_handle: event_loop.handle(),
         keyboard: None,
+        pointer: None,
         modifiers: Modifiers::default(),
         // The PTY is spawned on the first configure, once the real window size
         // is known, so the shell starts at the final size and is not hit by a
@@ -158,6 +160,7 @@ struct App {
     renderer: Renderer,
     loop_handle: LoopHandle<'static, App>,
     keyboard: Option<wl_keyboard::WlKeyboard>,
+    pointer: Option<wl_pointer::WlPointer>,
     modifiers: Modifiers,
     /// `None` until the first configure spawns the shell.
     session: Option<Session>,
@@ -233,17 +236,36 @@ impl App {
         });
     }
 
-    /// Encode a key event and write it to the shell.
-    fn send_key(&self, event: &KeyEvent) {
+    /// Handle a key (initial press or repeat): Shift+PageUp/PageDown scroll the
+    /// viewport locally; anything else is encoded to the shell and snaps the
+    /// viewport back to the live screen.
+    fn handle_key(&mut self, event: &KeyEvent) {
+        if self.modifiers.shift && matches!(event.keysym, Keysym::Page_Up | Keysym::Page_Down) {
+            if let Some(session) = self.session.as_mut() {
+                let page = session.term.page() as isize;
+                let delta = if event.keysym == Keysym::Page_Up {
+                    page
+                } else {
+                    -page
+                };
+                session.term.scroll_view(delta);
+                self.dirty = true;
+            }
+            return;
+        }
+
         let app_cursor = self
             .session
             .as_ref()
             .is_some_and(|s| s.term.grid().app_cursor());
         if let Some(bytes) = crate::input::encode(event, self.modifiers, app_cursor)
-            && let Some(session) = self.session.as_ref()
-            && let Err(err) = write_all(session.pty.master(), &bytes)
+            && let Some(session) = self.session.as_mut()
         {
-            tracing::warn!("write key to pty: {err}");
+            session.term.scroll_to_bottom();
+            self.dirty = true;
+            if let Err(err) = write_all(session.pty.master(), &bytes) {
+                tracing::warn!("write key to pty: {err}");
+            }
         }
     }
 
@@ -439,11 +461,17 @@ impl SeatHandler for App {
                 &seat,
                 None,
                 loop_handle,
-                Box::new(|app: &mut App, _kbd, event| app.send_key(&event)),
+                Box::new(|app: &mut App, _kbd, event| app.handle_key(&event)),
             );
             match keyboard {
                 Ok(keyboard) => self.keyboard = Some(keyboard),
                 Err(err) => tracing::warn!("get keyboard: {err}"),
+            }
+        }
+        if capability == Capability::Pointer && self.pointer.is_none() {
+            match self.seat_state.get_pointer(qh, &seat) {
+                Ok(pointer) => self.pointer = Some(pointer),
+                Err(err) => tracing::warn!("get pointer: {err}"),
             }
         }
     }
@@ -455,10 +483,18 @@ impl SeatHandler for App {
         _: wl_seat::WlSeat,
         capability: Capability,
     ) {
-        if capability == Capability::Keyboard
-            && let Some(keyboard) = self.keyboard.take()
-        {
-            keyboard.release();
+        match capability {
+            Capability::Keyboard => {
+                if let Some(keyboard) = self.keyboard.take() {
+                    keyboard.release();
+                }
+            }
+            Capability::Pointer => {
+                if let Some(pointer) = self.pointer.take() {
+                    pointer.release();
+                }
+            }
+            _ => {}
         }
     }
 
@@ -500,7 +536,7 @@ impl KeyboardHandler for App {
         _: u32,
         event: KeyEvent,
     ) {
-        self.send_key(&event);
+        self.handle_key(&event);
     }
 
     fn repeat_key(
@@ -548,6 +584,45 @@ impl KeyboardHandler for App {
     }
 }
 
+impl PointerHandler for App {
+    fn pointer_frame(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_pointer::WlPointer,
+        events: &[PointerEvent],
+    ) {
+        let cell_h = f64::from(self.renderer.metrics().height);
+        for event in events {
+            let PointerEventKind::Axis { vertical, .. } = &event.kind else {
+                continue;
+            };
+            // Wheel notches arrive as value120 (÷120) or legacy discrete steps,
+            // ~3 lines each; touchpads send pixels, mapped per cell height.
+            let (raw, scale) = if vertical.value120 != 0 {
+                (f64::from(vertical.value120) / 120.0, 3.0)
+            } else if vertical.discrete != 0 {
+                (f64::from(vertical.discrete), 3.0)
+            } else if cell_h > 0.0 {
+                (vertical.absolute / cell_h, 1.0)
+            } else {
+                continue;
+            };
+            if raw == 0.0 {
+                continue;
+            }
+            // Positive axis = scroll down (toward live); we scroll the viewport
+            // the opposite way (negative offset delta).
+            let lines = (raw.abs() * scale).ceil().max(1.0) as isize;
+            let delta = if raw < 0.0 { lines } else { -lines };
+            if let Some(session) = self.session.as_mut() {
+                session.term.scroll_view(delta);
+                self.dirty = true;
+            }
+        }
+    }
+}
+
 impl OutputHandler for App {
     fn output_state(&mut self) -> &mut OutputState {
         &mut self.output_state
@@ -572,6 +647,7 @@ delegate_output!(App);
 delegate_shm!(App);
 delegate_seat!(App);
 delegate_keyboard!(App);
+delegate_pointer!(App);
 delegate_xdg_shell!(App);
 delegate_xdg_window!(App);
 delegate_registry!(App);

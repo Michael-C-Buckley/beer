@@ -1,7 +1,12 @@
 //! The terminal screen: a grid of styled cells, a cursor, and the editing
 //! operations the VT parser drives.
 
+use std::collections::VecDeque;
+
 use unicode_width::UnicodeWidthChar;
+
+/// Maximum scrollback lines retained for the main screen.
+const SCROLLBACK_CAP: usize = 10_000;
 
 /// A cell colour: terminal default, a palette index, or direct RGB.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -122,6 +127,10 @@ pub struct Grid {
     tabs: Vec<bool>,
     /// Saved primary screen while the alternate screen is active.
     alt_saved: Option<Vec<Vec<Cell>>>,
+    /// Lines that have scrolled off the top of the main screen, newest last.
+    scrollback: VecDeque<Vec<Cell>>,
+    /// How many lines the viewport is scrolled back from the live bottom.
+    view_offset: usize,
     cursor_shape: CursorShape,
     cursor_visible: bool,
     /// Application cursor-keys mode (DECCKM): arrows send SS3 instead of CSI.
@@ -153,6 +162,8 @@ impl Grid {
             wrap_pending: false,
             tabs: default_tabs(cols),
             alt_saved: None,
+            scrollback: VecDeque::new(),
+            view_offset: 0,
             cursor_shape: CursorShape::default(),
             cursor_visible: true,
             cursor_color: None,
@@ -184,6 +195,9 @@ impl Grid {
         self.cursor.x = self.cursor.x.min(cols - 1);
         self.cursor.y = self.cursor.y.min(rows - 1);
         self.wrap_pending = false;
+        // Scrollback lines keep their old width (no reflow); snap to the live
+        // screen so the viewport never indexes a stale-width line.
+        self.view_offset = 0;
     }
 
     pub fn cursor(&self) -> (usize, usize) {
@@ -475,6 +489,21 @@ impl Grid {
 
     pub fn scroll_up(&mut self, n: usize) {
         let n = n.min(self.bottom - self.top + 1);
+        // Lines leaving the top of the *whole* main screen become scrollback;
+        // a DECSTBM region scroll (top > 0) or the alt screen does not.
+        if self.top == 0 && self.alt_saved.is_none() {
+            for y in 0..n {
+                let line = std::mem::replace(&mut self.lines[y], vec![Cell::default(); self.cols]);
+                self.scrollback.push_back(line);
+            }
+            while self.scrollback.len() > SCROLLBACK_CAP {
+                self.scrollback.pop_front();
+            }
+            // Keep a scrolled-back viewport anchored to the same content.
+            if self.view_offset > 0 {
+                self.view_offset = (self.view_offset + n).min(self.scrollback.len());
+            }
+        }
         for y in self.top..=self.bottom {
             if y + n <= self.bottom {
                 self.lines.swap(y, y + n);
@@ -618,6 +647,7 @@ impl Grid {
         if self.alt_saved.is_some() {
             return;
         }
+        self.view_offset = 0;
         let blank = vec![vec![Cell::default(); self.cols]; self.rows];
         self.alt_saved = Some(std::mem::replace(&mut self.lines, blank));
     }
@@ -625,6 +655,45 @@ impl Grid {
     pub fn leave_alt_screen(&mut self) {
         if let Some(main) = self.alt_saved.take() {
             self.lines = main;
+        }
+    }
+
+    // --- scrollback viewport ---
+
+    /// Scroll the viewport by `delta` lines: positive = back into history,
+    /// negative = toward the live screen. No-op on the alternate screen.
+    pub fn scroll_view(&mut self, delta: isize) {
+        if self.alt_saved.is_some() {
+            return;
+        }
+        let max = self.scrollback.len() as isize;
+        self.view_offset = (self.view_offset as isize + delta).clamp(0, max) as usize;
+    }
+
+    pub fn scroll_to_bottom(&mut self) {
+        self.view_offset = 0;
+    }
+
+    /// Whether the viewport is showing the live screen (not scrolled back).
+    pub fn view_at_bottom(&self) -> bool {
+        self.view_offset == 0
+    }
+
+    /// One page (a screenful) of lines, for page-scroll bindings.
+    pub fn page(&self) -> usize {
+        self.rows.max(1)
+    }
+
+    /// The cells shown at viewport row `y` (0 = top of the window), accounting
+    /// for the scrollback offset. May differ from `cols` in width if the line
+    /// predates a resize (no reflow yet), so callers must not assume length.
+    pub fn view_row(&self, y: usize) -> &[Cell] {
+        let start = self.scrollback.len() - self.view_offset;
+        let idx = start + y;
+        if idx < self.scrollback.len() {
+            &self.scrollback[idx]
+        } else {
+            &self.lines[idx - self.scrollback.len()]
         }
     }
 
@@ -711,6 +780,25 @@ mod tests {
         g.move_to(1, 0);
         g.insert_chars(2);
         assert_eq!(g.row_text(0), "a  def");
+    }
+
+    #[test]
+    fn scrollback_captures_scrolled_lines() {
+        let mut g = Grid::new(8, 2);
+        for c in ['1', '2', '3'] {
+            g.print(c);
+            g.next_line();
+        }
+        // Live screen: newest line on top, cleared line below.
+        assert_eq!(g.view_row(0)[0].c, '3');
+        assert!(g.view_at_bottom());
+        // Scroll back to reveal the two captured lines.
+        g.scroll_view(2);
+        assert!(!g.view_at_bottom());
+        assert_eq!(g.view_row(0)[0].c, '1');
+        assert_eq!(g.view_row(1)[0].c, '2');
+        g.scroll_to_bottom();
+        assert_eq!(g.view_row(0)[0].c, '3');
     }
 
     #[test]
