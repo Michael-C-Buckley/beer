@@ -21,6 +21,16 @@ enum DaLevel {
     Tertiary,
 }
 
+/// A clipboard request from the application (OSC 52), for the front-end to act
+/// on since it owns the Wayland selections.
+#[derive(Clone, Debug)]
+pub enum ClipboardOp {
+    /// Set the clipboard (or primary) to `text`.
+    Set { primary: bool, text: String },
+    /// Report the current clipboard (or primary) contents back to the app.
+    Query { primary: bool },
+}
+
 /// DECRQM mode-state code: 1 = set, 2 = reset.
 fn set_reset(on: bool) -> u8 {
     if on { 1 } else { 2 }
@@ -85,6 +95,8 @@ pub struct Term {
     shift_out: bool,
     /// Accumulated payload of an in-progress `DCS + q` (XTGETTCAP) query.
     xtgettcap: Option<Vec<u8>>,
+    /// Pending OSC 52 clipboard requests, drained by the front-end.
+    clipboard_ops: Vec<ClipboardOp>,
 }
 
 impl Term {
@@ -98,7 +110,13 @@ impl Term {
             g1: Charset::Ascii,
             shift_out: false,
             xtgettcap: None,
+            clipboard_ops: Vec::new(),
         }
+    }
+
+    /// Drain the OSC 52 clipboard requests accumulated since the last call.
+    pub fn take_clipboard_ops(&mut self) -> Vec<ClipboardOp> {
+        std::mem::take(&mut self.clipboard_ops)
     }
 
     /// Answer an XTGETTCAP query: for each hex-encoded capability name, reply
@@ -562,6 +580,20 @@ impl Perform for Term {
                     .set_cursor_color(params.get(1).and_then(|s| parse_color(s)));
             }
             Some(&n) if n == b"112" => self.grid.set_cursor_color(None),
+            // OSC 52: clipboard get/set. Pc selects the target, Pd is base64 or
+            // `?` to query. We only touch `c` (clipboard) and `p` (primary).
+            Some(&n) if n == b"52" => {
+                let target = params.get(1).copied().unwrap_or(b"");
+                let data = params.get(2).copied().unwrap_or(b"");
+                let primary = target.first() == Some(&b'p');
+                if data == b"?" {
+                    self.clipboard_ops.push(ClipboardOp::Query { primary });
+                } else if let Some(text) =
+                    base64_decode(data).and_then(|b| String::from_utf8(b).ok())
+                {
+                    self.clipboard_ops.push(ClipboardOp::Set { primary, text });
+                }
+            }
             _ => {}
         }
     }
@@ -594,6 +626,73 @@ fn cap_value(name: &[u8]) -> Option<&'static str> {
         b"RGB" => Some("8/8/8"),
         _ => None,
     }
+}
+
+const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// Standard base64 encode (used for OSC 52 query replies).
+pub fn base64_encode(data: &[u8]) -> String {
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        out.push(B64[(n >> 18 & 63) as usize] as char);
+        out.push(B64[(n >> 12 & 63) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            B64[(n >> 6 & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            B64[(n & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// Standard base64 decode, ignoring padding and whitespace; `None` on a bad
+/// character.
+fn base64_decode(data: &[u8]) -> Option<Vec<u8>> {
+    let val = |c: u8| -> Option<u32> {
+        match c {
+            b'A'..=b'Z' => Some(u32::from(c - b'A')),
+            b'a'..=b'z' => Some(u32::from(c - b'a') + 26),
+            b'0'..=b'9' => Some(u32::from(c - b'0') + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    };
+    let filtered: Vec<u8> = data
+        .iter()
+        .copied()
+        .filter(|&c| c != b'=' && !c.is_ascii_whitespace())
+        .collect();
+    let mut out = Vec::with_capacity(filtered.len() / 4 * 3);
+    for chunk in filtered.chunks(4) {
+        if chunk.len() == 1 {
+            return None; // a lone sextet cannot form a byte
+        }
+        let mut n = 0u32;
+        for &c in chunk {
+            n = (n << 6) | val(c)?;
+        }
+        n <<= 6 * (4 - chunk.len() as u32);
+        out.push((n >> 16) as u8);
+        if chunk.len() >= 3 {
+            out.push((n >> 8) as u8);
+        }
+        if chunk.len() >= 4 {
+            out.push(n as u8);
+        }
+    }
+    Some(out)
 }
 
 /// Decode an even-length lowercase/uppercase hex string into bytes.
@@ -755,6 +854,49 @@ mod tests {
         feed(&mut t, b"\x1b[?2026l\x1b[?2026$p");
         assert!(!t.grid().sync_active());
         assert_eq!(t.take_response(), b"\x1b[?2026;2$y");
+    }
+
+    #[test]
+    fn base64_round_trips() {
+        for s in [
+            "",
+            "f",
+            "fo",
+            "foo",
+            "foob",
+            "fooba",
+            "foobar",
+            "hi there\n",
+        ] {
+            let enc = base64_encode(s.as_bytes());
+            assert_eq!(base64_decode(enc.as_bytes()).as_deref(), Some(s.as_bytes()));
+        }
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+        assert_eq!(base64_decode(b"Zm9vYmFy").as_deref(), Some(&b"foobar"[..]));
+    }
+
+    #[test]
+    fn osc52_set_and_query() {
+        let mut t = Term::new(20, 2);
+        // Set clipboard to "hi" (base64 "aGk=").
+        feed(&mut t, b"\x1b]52;c;aGk=\x07");
+        let ops = t.take_clipboard_ops();
+        match ops.as_slice() {
+            [
+                ClipboardOp::Set {
+                    primary: false,
+                    text,
+                },
+            ] => assert_eq!(text, "hi"),
+            other => panic!("unexpected ops: {other:?}"),
+        }
+        // Query the primary selection.
+        feed(&mut t, b"\x1b]52;p;?\x07");
+        let ops = t.take_clipboard_ops();
+        assert!(matches!(
+            ops.as_slice(),
+            [ClipboardOp::Query { primary: true }]
+        ));
     }
 
     #[test]

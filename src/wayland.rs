@@ -689,11 +689,8 @@ impl App {
         (!text.is_empty()).then_some(text)
     }
 
-    /// Claim the clipboard (CLIPBOARD) with the current selection (Ctrl+Shift+C).
-    fn set_clipboard(&mut self, qh: &QueueHandle<App>) {
-        let Some(text) = self.selection_text() else {
-            return;
-        };
+    /// Take ownership of the CLIPBOARD selection, serving `text` to pasters.
+    fn claim_clipboard(&mut self, text: String, qh: &QueueHandle<App>) {
         let Some(device) = self.data_device.as_ref() else {
             return;
         };
@@ -705,11 +702,8 @@ impl App {
         self.copy_source = Some(source);
     }
 
-    /// Claim the primary selection with the current selection (select-to-copy).
-    fn set_primary(&mut self, qh: &QueueHandle<App>) {
-        let Some(text) = self.selection_text() else {
-            return;
-        };
+    /// Take ownership of the primary selection, serving `text` to pasters.
+    fn claim_primary(&mut self, text: String, qh: &QueueHandle<App>) {
         let (Some(manager), Some(device)) =
             (self.primary_manager.as_ref(), self.primary_device.as_ref())
         else {
@@ -719,6 +713,52 @@ impl App {
         source.set_selection(device, self.serial);
         self.primary_clip = text;
         self.primary_source = Some(source);
+    }
+
+    /// Claim the clipboard (CLIPBOARD) with the current selection (Ctrl+Shift+C).
+    fn set_clipboard(&mut self, qh: &QueueHandle<App>) {
+        if let Some(text) = self.selection_text() {
+            self.claim_clipboard(text, qh);
+        }
+    }
+
+    /// Claim the primary selection with the current selection (select-to-copy).
+    fn set_primary(&mut self, qh: &QueueHandle<App>) {
+        if let Some(text) = self.selection_text() {
+            self.claim_primary(text, qh);
+        }
+    }
+
+    /// Act on the OSC 52 clipboard requests an application made: take ownership
+    /// of the selection it set, or answer a query with what we currently hold.
+    fn handle_clipboard_ops(&mut self, ops: Vec<crate::vt::ClipboardOp>) {
+        use crate::vt::ClipboardOp;
+        let qh = self.qh.clone();
+        for op in ops {
+            match op {
+                ClipboardOp::Set {
+                    primary: true,
+                    text,
+                } => self.claim_primary(text, &qh),
+                ClipboardOp::Set {
+                    primary: false,
+                    text,
+                } => self.claim_clipboard(text, &qh),
+                ClipboardOp::Query { primary } => {
+                    let text = if primary {
+                        &self.primary_clip
+                    } else {
+                        &self.clipboard
+                    };
+                    let kind = if primary { 'p' } else { 'c' };
+                    let reply = format!(
+                        "\x1b]52;{kind};{}\x07",
+                        crate::vt::base64_encode(text.as_bytes())
+                    );
+                    self.write_to_pty(reply.as_bytes());
+                }
+            }
+        }
     }
 
     /// Paste the CLIPBOARD selection into the shell (Ctrl+Shift+V).
@@ -835,6 +875,10 @@ impl App {
             self.title = new_title;
             self.window
                 .set_title(self.title.clone().unwrap_or_default());
+        }
+        let ops = session.term.take_clipboard_ops();
+        if !ops.is_empty() {
+            self.handle_clipboard_ops(ops);
         }
         self.needs_draw = true;
     }
