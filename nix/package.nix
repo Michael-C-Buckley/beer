@@ -30,7 +30,7 @@ rustPlatform.buildRustPackage (finalAttrs: {
       ];
     };
 
-  cargoLock.lockFile = "${finalAttrs.src}Cargo.lock";
+  cargoLock.lockFile = "${finalAttrs.src}/Cargo.lock";
   enableParallelBuilding = true;
 
   strictDeps = true;
