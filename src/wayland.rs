@@ -5,6 +5,7 @@
 
 use std::fs::File;
 use std::io::{Read as _, Write as _};
+use std::num::NonZeroU16;
 use std::os::fd::OwnedFd;
 use std::os::unix::process::ExitStatusExt;
 use std::process::ExitCode;
@@ -19,7 +20,7 @@ use calloop_wayland_source::WaylandSource;
 
 use crate::config::Config;
 use crate::font::Fonts;
-use crate::grid::{Cell, CursorShape, Grid, MouseProtocol};
+use crate::grid::{Cell, CursorShape, Grid, MouseProtocol, UrlHit};
 use crate::pty::Pty;
 use crate::render::Renderer;
 use crate::vt::Term;
@@ -273,6 +274,9 @@ pub fn run(config: Config, config_path: Option<std::path::PathBuf>) -> anyhow::R
         clipboard: String::new(),
         primary_clip: String::new(),
         selecting: false,
+        hovered_link: None,
+        pointer_enter_serial: 0,
+        press_cell: None,
         pressed_button: None,
         last_report_cell: None,
         autoscroll: 0,
@@ -302,6 +306,10 @@ pub fn run(config: Config, config_path: Option<std::path::PathBuf>) -> anyhow::R
         flashing: false,
         flash_timer: None,
         searching: false,
+        url_mode: false,
+        url_hits: Vec::new(),
+        url_labels: Vec::new(),
+        url_input: String::new(),
         focused: true,
         exit: false,
         exit_code: ExitCode::SUCCESS,
@@ -448,6 +456,12 @@ struct App {
     primary_clip: String,
     /// A left-button drag is in progress.
     selecting: bool,
+    /// OSC 8 hyperlink under the pointer, underlined and opened on click.
+    hovered_link: Option<NonZeroU16>,
+    /// Serial of the last pointer enter, reused to update the cursor shape.
+    pointer_enter_serial: u32,
+    /// Cell `(abs_row, col)` of the last left-press, for click-to-open links.
+    press_cell: Option<(usize, usize)>,
     /// Button base code held down while mouse reporting, for drag reports.
     pressed_button: Option<u8>,
     /// Last cell a motion report was emitted for, to suppress duplicates.
@@ -496,6 +510,13 @@ struct App {
     flash_timer: Option<RegistrationToken>,
     /// Whether incremental search mode is active (the query lives in the grid).
     searching: bool,
+    /// URL hint mode: detected URLs get keyboard labels to open them.
+    url_mode: bool,
+    /// Detected URLs and their hint labels (parallel), while `url_mode` is on.
+    url_hits: Vec<UrlHit>,
+    url_labels: Vec<String>,
+    /// Label characters typed so far in URL mode.
+    url_input: String,
     /// Whether the toplevel currently has keyboard focus (drives the cursor).
     focused: bool,
     exit: bool,
@@ -572,7 +593,11 @@ impl App {
     /// text bindings, else the byte encoding sent to the shell (which snaps the
     /// viewport back to the live screen).
     fn handle_key(&mut self, event: &KeyEvent) {
-        // While searching, the keyboard edits the query and navigates matches.
+        // URL hint mode and search both capture the keyboard while active.
+        if self.url_mode {
+            self.url_key(event);
+            return;
+        }
         if self.searching {
             self.search_key(event);
             return;
@@ -642,6 +667,69 @@ impl App {
             Action::JumpPromptUp => self.jump_prompt(true),
             Action::JumpPromptDown => self.jump_prompt(false),
             Action::PipeCommandOutput => self.pipe_command_output(),
+            Action::UrlMode => self.enter_url_mode(),
+        }
+    }
+
+    /// Enter URL hint mode: detect the visible URLs and label them. No-op (with
+    /// a brief log) when there are none.
+    fn enter_url_mode(&mut self) {
+        let Some(session) = self.session.as_ref() else {
+            return;
+        };
+        let hits = session.term.grid().visible_urls();
+        if hits.is_empty() {
+            return;
+        }
+        self.url_labels = hint_labels(hits.len());
+        self.url_hits = hits;
+        self.url_input = String::new();
+        self.url_mode = true;
+        self.needs_draw = true;
+    }
+
+    /// Leave URL hint mode, discarding any partial label input.
+    fn exit_url_mode(&mut self) {
+        self.url_mode = false;
+        self.url_hits.clear();
+        self.url_labels.clear();
+        self.url_input.clear();
+        // Drop the labelled buffers so the next present repaints without labels.
+        self.frames.clear();
+        self.needs_draw = true;
+    }
+
+    /// Handle a key while URL hint mode is active: build up a label, open the
+    /// matching URL, or cancel.
+    fn url_key(&mut self, event: &KeyEvent) {
+        match event.keysym {
+            Keysym::Escape => self.exit_url_mode(),
+            Keysym::BackSpace => {
+                self.url_input.pop();
+                self.needs_draw = true;
+            }
+            _ => {
+                let Some(text) = event.utf8.as_ref() else {
+                    return;
+                };
+                for c in text.chars().filter(|c| c.is_ascii_alphabetic()) {
+                    self.url_input.push(c.to_ascii_lowercase());
+                }
+                // Exact match opens; if no label even has this prefix, cancel.
+                if let Some(i) = self.url_labels.iter().position(|l| *l == self.url_input) {
+                    let url = self.url_hits[i].url.clone();
+                    self.exit_url_mode();
+                    self.open_url(&url);
+                } else if !self
+                    .url_labels
+                    .iter()
+                    .any(|l| l.starts_with(&self.url_input))
+                {
+                    self.exit_url_mode();
+                } else {
+                    self.needs_draw = true;
+                }
+            }
         }
     }
 
@@ -843,6 +931,75 @@ impl App {
             }
         }
         self.needs_draw = true;
+    }
+
+    /// The OSC 8 hyperlink id under the pointer, if any.
+    fn link_under_pointer(&self) -> Option<NonZeroU16> {
+        let (row, col) = self.cell_at(self.pointer_pos.0, self.pointer_pos.1)?;
+        self.session.as_ref()?.term.grid().link_at(row, col)
+    }
+
+    /// Recompute the hyperlink under the pointer; when it changes, repaint to
+    /// move the hover underline and update the pointer to a hand over a link.
+    fn update_hover(&mut self, pointer: &wl_pointer::WlPointer) {
+        let link = self.link_under_pointer();
+        if link == self.hovered_link {
+            return;
+        }
+        self.hovered_link = link;
+        // The hover underline lives in every buffer's snapshot; drop the ring so
+        // the affected rows repaint with (or without) it.
+        self.frames.clear();
+        self.needs_draw = true;
+        let shape = if link.is_some() {
+            Shape::Pointer
+        } else {
+            Shape::Text
+        };
+        if let Some(device) = self
+            .seats
+            .iter()
+            .find(|s| s.pointer.as_ref() == Some(pointer))
+            .and_then(|s| s.cursor_shape_device.as_ref())
+        {
+            device.set_shape(self.pointer_enter_serial, shape);
+        }
+    }
+
+    /// If the left button was pressed and released on the same hyperlinked cell
+    /// (a click, not a drag), open the link.
+    fn maybe_open_clicked_link(&mut self) {
+        let release = self.cell_at(self.pointer_pos.0, self.pointer_pos.1);
+        let Some((row, col)) = release else { return };
+        if self.press_cell != Some((row, col)) {
+            return;
+        }
+        let uri = self
+            .session
+            .as_ref()
+            .and_then(|s| s.term.grid().link_at(row, col).map(|id| (s, id)))
+            .and_then(|(s, id)| s.term.grid().link_uri(id))
+            .map(str::to_owned);
+        if let Some(uri) = uri {
+            self.open_url(&uri);
+        }
+    }
+
+    /// Launch the configured opener (default `xdg-open`) on a URL.
+    fn open_url(&self, url: &str) {
+        let Some((program, args)) = self.config.url.launch.split_first() else {
+            tracing::warn!("open url: no [url] launch command configured");
+            return;
+        };
+        let mut cmd = std::process::Command::new(program);
+        cmd.args(args)
+            .arg(url)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        if let Err(err) = cmd.spawn() {
+            tracing::warn!("open url {url:?}: {err}");
+        }
     }
 
     /// Scale a logical pixel length to physical (buffer) pixels at the current
@@ -1518,6 +1675,11 @@ impl App {
     /// them, damage just those rows, and commit with a frame-callback request.
     fn present(&mut self) {
         self.needs_draw = false;
+        // URL hint labels overlay the grid but are not part of the row snapshot,
+        // so force a full redraw while the labels are showing.
+        if self.url_mode {
+            self.frames.clear();
+        }
         // Render into a buffer sized in physical pixels (logical × scale); the
         // viewport presents it back at the logical surface size.
         let (w, h) = self.phys_dims();
@@ -1623,6 +1785,7 @@ impl App {
             theme,
             focused,
             blink_on,
+            hovered_link: self.hovered_link,
         };
         if fresh {
             self.renderer.clear(canvas, dims, theme);
@@ -1642,6 +1805,15 @@ impl App {
             if let Some((col, text)) = &cur[y].preedit {
                 self.renderer
                     .render_preedit(canvas, dims, theme, y, *col, text);
+            }
+        }
+        // Draw URL hint labels on top, narrowing to those matching the input.
+        if self.url_mode {
+            for (hit, label) in self.url_hits.iter().zip(&self.url_labels) {
+                if label.starts_with(&self.url_input) {
+                    self.renderer
+                        .render_label(canvas, dims, theme, hit.row, hit.col, label);
+                }
             }
         }
         self.frames[idx].rows = cur;
@@ -1952,6 +2124,31 @@ fn cursor_shape_from(style: Option<&str>) -> Option<CursorShape> {
     }
 }
 
+/// Generate `n` distinct keyboard hint labels (a, b, …, z, aa, ab, …), all the
+/// same length so prefix matching is unambiguous.
+fn hint_labels(n: usize) -> Vec<String> {
+    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz";
+    if n == 0 {
+        return Vec::new();
+    }
+    let (mut width, mut capacity) = (1usize, 26usize);
+    while capacity < n {
+        width += 1;
+        capacity *= 26;
+    }
+    (0..n)
+        .map(|i| {
+            let mut idx = i;
+            let mut chars = vec![b'a'; width];
+            for slot in chars.iter_mut().rev() {
+                *slot = ALPHABET[idx % 26];
+                idx /= 26;
+            }
+            String::from_utf8(chars).expect("ascii labels are valid utf-8")
+        })
+        .collect()
+}
+
 /// Map a Wayland button code to the terminal mouse base code, if reportable.
 fn button_code(button: u32) -> Option<u8> {
     match button {
@@ -1976,20 +2173,17 @@ impl PointerHandler for App {
             match &event.kind {
                 PointerEventKind::Enter { serial } => {
                     self.pointer_pos = event.position;
-                    let device = self
-                        .seats
-                        .iter()
-                        .find(|s| s.pointer.as_ref() == Some(pointer))
-                        .and_then(|s| s.cursor_shape_device.as_ref());
-                    if let Some(device) = device {
-                        device.set_shape(*serial, Shape::Text);
-                    }
+                    self.pointer_enter_serial = *serial;
+                    self.update_hover(pointer);
                     self.pointer_drag();
                 }
                 PointerEventKind::Motion { .. } => {
                     self.pointer_pos = event.position;
                     if self.try_report_motion() {
                         continue;
+                    }
+                    if !self.selecting {
+                        self.update_hover(pointer);
                     }
                     self.pointer_drag();
                 }
@@ -2008,7 +2202,10 @@ impl PointerHandler for App {
                         continue;
                     }
                     match *button {
-                        BTN_LEFT => self.pointer_press(*time),
+                        BTN_LEFT => {
+                            self.press_cell = self.cell_at(self.pointer_pos.0, self.pointer_pos.1);
+                            self.pointer_press(*time);
+                        }
                         BTN_MIDDLE => self.paste_primary(),
                         _ => {}
                     }
@@ -2025,6 +2222,7 @@ impl PointerHandler for App {
                         continue;
                     }
                     if *button == BTN_LEFT {
+                        self.maybe_open_clicked_link();
                         self.pointer_release(qh);
                     }
                 }

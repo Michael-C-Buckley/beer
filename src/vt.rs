@@ -680,6 +680,17 @@ impl Perform for Term {
                     self.grid.set_prompt_mark(kind);
                 }
             }
+            // OSC 8: hyperlink. `OSC 8 ; params ; URI ST`; an empty URI ends the
+            // link. The URI is everything after the second field, rejoined since
+            // a URI may itself contain ';'.
+            Some(&n) if n == b"8" => {
+                let uri_bytes = params
+                    .get(2..)
+                    .map(|parts| parts.join(&b';'))
+                    .unwrap_or_default();
+                let uri = std::str::from_utf8(&uri_bytes).unwrap_or("");
+                self.grid.set_link((!uri.is_empty()).then_some(uri));
+            }
             // OSC 4: set/query palette entries (pairs of index;spec).
             Some(&n) if n == b"4" => self.osc_palette(params, bell),
             // OSC 104: reset palette (all, or the listed indices).

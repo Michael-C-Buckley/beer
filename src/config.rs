@@ -18,6 +18,7 @@ pub struct Config {
     pub bell: Bell,
     pub mouse: Mouse,
     pub shell_integration: ShellIntegration,
+    pub url: Url,
     /// Chord → action, e.g. `"Ctrl+Shift+C" = "copy"`. Merged over the defaults;
     /// a value of `"none"` unbinds.
     pub key_bindings: std::collections::HashMap<String, String>,
@@ -71,6 +72,22 @@ pub struct ShellIntegration {
     /// Command the `pipe-command-output` binding feeds the last command's
     /// output to on stdin (argv form, e.g. `["less"]`). Empty disables it.
     pub pipe_command: Vec<String>,
+}
+
+/// `[url]`: opening OSC 8 hyperlinks and detected URLs.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct Url {
+    /// Launcher argv the URL is appended to (e.g. `["xdg-open"]`).
+    pub launch: Vec<String>,
+}
+
+impl Default for Url {
+    fn default() -> Self {
+        Self {
+            launch: vec!["xdg-open".to_string()],
+        }
+    }
 }
 
 /// `[colors]`: foreground/background, the 16 base palette entries, and accents.

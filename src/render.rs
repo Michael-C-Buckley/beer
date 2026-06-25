@@ -5,6 +5,8 @@
 //! then glyphs - so a wide glyph that overflows its cell is not clipped by the
 //! neighbouring cell's background fill.
 
+use std::num::NonZeroU16;
+
 use crate::font::{CellMetrics, Fonts, GlyphData, Style};
 use crate::grid::{Cell, CursorShape, Flags, Grid, Underline};
 use crate::theme::{Plane, Rgb, Theme};
@@ -94,6 +96,8 @@ pub struct Frame<'a> {
     pub theme: &'a Theme,
     pub focused: bool,
     pub blink_on: bool,
+    /// Hyperlink currently under the pointer; its cells get a hover underline.
+    pub hovered_link: Option<NonZeroU16>,
 }
 
 #[derive(Debug)]
@@ -217,6 +221,10 @@ impl Renderer {
                 }
             }
             draw_decorations(&mut canvas, cell, theme, origin_x, row_top, m, fg);
+            // Underline an OSC 8 hyperlink while the pointer hovers over it.
+            if cell.link.is_some() && cell.link == frame.hovered_link {
+                canvas.hline(origin_x, row_top + m.height as i32 - 2, m.width, fg);
+            }
         }
 
         // The cursor belongs to the live screen; hide it while scrolled back.
@@ -257,6 +265,43 @@ impl Renderer {
             }
             if c != ' ' {
                 self.draw_glyph(&mut canvas, c, style, x, row_top, theme.fg);
+            }
+            x += m.width as i32;
+        }
+    }
+
+    /// Draw a URL hint label (e.g. `a`, `bc`) as a highlighted tag starting at
+    /// viewport cell `(row, col)`, over whatever was there.
+    pub fn render_label(
+        &mut self,
+        pixels: &mut [u8],
+        dims: (usize, usize),
+        theme: &Theme,
+        row: usize,
+        col: usize,
+        text: &str,
+    ) {
+        let (width, height) = dims;
+        let mut canvas = Canvas {
+            pixels,
+            width,
+            height,
+        };
+        let m = self.fonts.metrics();
+        let (pad_x, pad_y) = self.pad;
+        let row_top = pad_y + row as i32 * m.height as i32;
+        let style = Style {
+            bold: true,
+            italic: false,
+        };
+        let mut x = pad_x + col as i32 * m.width as i32;
+        for c in text.chars() {
+            if x as usize + m.width as usize > width {
+                break;
+            }
+            canvas.fill_rect(x, row_top, m.width, m.height, theme.current_match_bg);
+            if c != ' ' {
+                self.draw_glyph(&mut canvas, c, style, x, row_top, theme.bg);
             }
             x += m.width as i32;
         }
