@@ -114,7 +114,7 @@ _jump-prompt-up_, _jump-prompt-down_, _pipe-command-output_, _url-mode_.
 ```
 [key-bindings]
 "Ctrl+Shift+C" = "copy"
-"Ctrl+grave" = "none"
+"Ctrl+`" = "none"
 ```
 
 # [shell-integration]

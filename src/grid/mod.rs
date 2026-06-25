@@ -1,10 +1,17 @@
 //! The terminal screen: a grid of styled cells, a cursor, and the editing
 //! operations the VT parser drives.
 
+mod links;
+mod search;
+mod selection;
+
 use std::collections::VecDeque;
 use std::num::NonZeroU16;
 
 use unicode_width::UnicodeWidthChar;
+
+pub use links::UrlHit;
+use search::SearchState;
 
 /// Maximum scrollback lines retained for the main screen.
 const SCROLLBACK_CAP: usize = 10_000;
@@ -143,67 +150,6 @@ struct Cursor {
     y: usize,
 }
 
-/// A URL detected in the visible viewport, with the `(row, col)` of its first
-/// character in viewport coordinates.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct UrlHit {
-    pub url: String,
-    pub row: usize,
-    pub col: usize,
-}
-
-/// Whether `c` may appear inside a URL (excludes whitespace, controls, and the
-/// delimiters that conventionally bound a URL in flowing text).
-fn is_url_char(c: char) -> bool {
-    !c.is_whitespace()
-        && !c.is_control()
-        && !matches!(c, '<' | '>' | '"' | '`' | '{' | '}' | '|' | '\\' | '^')
-}
-
-/// Find `scheme://…` URLs in `chars`, returning `(start, end)` index ranges.
-/// The scheme is a run of `[A-Za-z][A-Za-z0-9+.-]*` before `://`; the body runs
-/// to the first non-URL character, with trailing sentence punctuation trimmed.
-fn find_urls(chars: &[char]) -> Vec<(usize, usize)> {
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i + 2 < chars.len() {
-        if chars[i] == ':' && chars[i + 1] == '/' && chars[i + 2] == '/' {
-            // Backtrack over the scheme.
-            let mut start = i;
-            while start > 0 {
-                let c = chars[start - 1];
-                if c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.') {
-                    start -= 1;
-                } else {
-                    break;
-                }
-            }
-            if start < i && chars[start].is_ascii_alphabetic() {
-                let mut end = i + 3;
-                while end < chars.len() && is_url_char(chars[end]) {
-                    end += 1;
-                }
-                // Trim trailing punctuation that is usually sentence-level.
-                while end > i + 3
-                    && matches!(
-                        chars[end - 1],
-                        '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '\'' | '"'
-                    )
-                {
-                    end -= 1;
-                }
-                if end > i + 3 {
-                    out.push((start, end));
-                    i = end;
-                    continue;
-                }
-            }
-        }
-        i += 1;
-    }
-    out
-}
-
 /// Shell-integration prompt mark on a line (OSC 133): the start of a prompt,
 /// the start of typed command input, the start of command output, or the line
 /// where the command finished.
@@ -242,22 +188,6 @@ impl Line {
 pub struct Point {
     pub row: usize,
     pub col: usize,
-}
-
-/// One scrollback-search hit: a run of `len` cells at absolute `(row, col)`.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct Match {
-    row: usize,
-    col: usize,
-    len: usize,
-}
-
-/// Incremental scrollback search: the query, every hit, and the focused one.
-#[derive(Clone, Debug, Default)]
-struct SearchState {
-    query: String,
-    matches: Vec<Match>,
-    current: usize,
 }
 
 /// The active screen plus cursor, scroll region, and current pen.
@@ -375,43 +305,6 @@ impl Grid {
             last_base: None,
             links: Vec::new(),
         }
-    }
-
-    /// Set (or clear) the active OSC 8 hyperlink applied to printed cells. An
-    /// empty/`None` URI ends the current link.
-    pub fn set_link(&mut self, uri: Option<&str>) {
-        self.pen.link = match uri {
-            Some(uri) if !uri.is_empty() => Some(self.intern_link(uri)),
-            _ => None,
-        };
-    }
-
-    /// Intern a hyperlink URI, returning its 1-based id (deduplicated; the table
-    /// is capped so a pathological stream cannot grow it without bound).
-    fn intern_link(&mut self, uri: &str) -> NonZeroU16 {
-        if let Some(i) = self.links.iter().position(|u| u.as_ref() == uri) {
-            return NonZeroU16::new(i as u16 + 1).expect("index + 1 is non-zero");
-        }
-        // u16::MAX distinct links is far past any real document; reuse the last
-        // slot once saturated rather than overflow the id space.
-        if self.links.len() < usize::from(u16::MAX) - 1 {
-            self.links.push(uri.into());
-        } else {
-            *self.links.last_mut().expect("table is non-empty when full") = uri.into();
-        }
-        NonZeroU16::new(self.links.len() as u16).expect("len after push is non-zero")
-    }
-
-    /// The URI for a hyperlink id, if it is still in the table.
-    pub fn link_uri(&self, id: NonZeroU16) -> Option<&str> {
-        self.links
-            .get(usize::from(id.get()) - 1)
-            .map(|s| s.as_ref())
-    }
-
-    /// The hyperlink id of the cell at an absolute `(row, col)`, if any.
-    pub fn link_at(&self, abs_row: usize, col: usize) -> Option<NonZeroU16> {
-        self.abs_row(abs_row).get(col).and_then(|c| c.link)
     }
 
     /// Override the word-delimiter set; `None` keeps the built-in default.
@@ -1129,40 +1022,6 @@ impl Grid {
         }
     }
 
-    /// Detect plain-text URLs across the visible viewport, returning each with
-    /// the viewport `(row, col)` of its first character. Soft-wrapped rows are
-    /// joined so a URL split across a wrap is found whole; hard line breaks end
-    /// a URL.
-    pub fn visible_urls(&self) -> Vec<UrlHit> {
-        let mut chars: Vec<char> = Vec::new();
-        let mut pos: Vec<(usize, usize)> = Vec::new();
-        for y in 0..self.rows {
-            let line = self.line_at_abs(self.view_to_abs(y));
-            for (x, cell) in line.cells.iter().enumerate() {
-                if cell.flags.contains(Flags::WIDE_CONT) {
-                    continue;
-                }
-                chars.push(cell.c);
-                pos.push((y, x));
-            }
-            if !line.wrapped {
-                chars.push('\n'); // a hard break terminates any URL
-                pos.push((y, usize::MAX));
-            }
-        }
-        find_urls(&chars)
-            .into_iter()
-            .map(|(s, e)| {
-                let (row, col) = pos[s];
-                UrlHit {
-                    url: chars[s..e].iter().collect(),
-                    row,
-                    col,
-                }
-            })
-            .collect()
-    }
-
     /// Cells of an absolute row (scrollback first, then the live screen).
     fn abs_row(&self, row: usize) -> &[Cell] {
         if row < self.scrollback.len() {
@@ -1245,322 +1104,6 @@ impl Grid {
         let mut out = lines.join("\n");
         out.push('\n');
         Some(out)
-    }
-
-    /// Slide an active selection up by `n` rows after scrollback eviction,
-    /// dropping it if either endpoint scrolled off the top.
-    fn shift_selection(&mut self, n: usize) {
-        if let Some((a, b)) = self.selection {
-            if a.row < n || b.row < n {
-                self.selection = None;
-            } else {
-                self.selection = Some((
-                    Point {
-                        row: a.row - n,
-                        ..a
-                    },
-                    Point {
-                        row: b.row - n,
-                        ..b
-                    },
-                ));
-            }
-        }
-    }
-
-    pub fn clear_selection(&mut self) {
-        self.selection = None;
-    }
-
-    /// Begin a linear selection at an absolute point (drag anchor).
-    pub fn start_selection(&mut self, row: usize, col: usize) {
-        let p = Point { row, col };
-        self.selection = Some((p, p));
-        self.selection_block = false;
-    }
-
-    /// Begin a rectangular (block) selection at an absolute point.
-    pub fn start_block_selection(&mut self, row: usize, col: usize) {
-        let p = Point { row, col };
-        self.selection = Some((p, p));
-        self.selection_block = true;
-    }
-
-    /// Move the selection head (drag), keeping the anchor fixed.
-    pub fn extend_selection(&mut self, row: usize, col: usize) {
-        if let Some((_, head)) = self.selection.as_mut() {
-            *head = Point { row, col };
-        }
-    }
-
-    /// Select the word at an absolute point, breaking on whitespace and the
-    /// default delimiter set.
-    pub fn select_word(&mut self, row: usize, col: usize) {
-        let delims = &self.word_delimiters;
-        let line = self.abs_row(row);
-        if col >= line.len() || !is_word(line[col].c, delims) {
-            self.start_selection(row, col);
-            return;
-        }
-        let mut lo = col;
-        while lo > 0 && is_word(line[lo - 1].c, delims) {
-            lo -= 1;
-        }
-        let mut hi = col;
-        while hi + 1 < line.len() && is_word(line[hi + 1].c, delims) {
-            hi += 1;
-        }
-        self.selection = Some((Point { row, col: lo }, Point { row, col: hi }));
-        self.selection_block = false;
-    }
-
-    /// Select the whole line at an absolute row.
-    pub fn select_line(&mut self, row: usize) {
-        let last = self.abs_row(row).len().saturating_sub(1);
-        self.selection = Some((Point { row, col: 0 }, Point { row, col: last }));
-        self.selection_block = false;
-    }
-
-    /// The rectangle `(top_row, bottom_row, left_col, right_col)` of a block
-    /// selection.
-    fn block_rect(&self) -> Option<(usize, usize, usize, usize)> {
-        let (a, b) = self.selection?;
-        Some((
-            a.row.min(b.row),
-            a.row.max(b.row),
-            a.col.min(b.col),
-            a.col.max(b.col),
-        ))
-    }
-
-    /// Normalized selection (start <= end in reading order), if any.
-    fn ordered_selection(&self) -> Option<(Point, Point)> {
-        self.selection.map(|(a, b)| {
-            if (a.row, a.col) <= (b.row, b.col) {
-                (a, b)
-            } else {
-                (b, a)
-            }
-        })
-    }
-
-    /// Whether the cell at an absolute `(row, col)` falls inside the selection.
-    pub fn is_selected(&self, row: usize, col: usize) -> bool {
-        if self.selection_block {
-            let Some((r0, r1, c0, c1)) = self.block_rect() else {
-                return false;
-            };
-            return row >= r0 && row <= r1 && col >= c0 && col <= c1;
-        }
-        let Some((start, end)) = self.ordered_selection() else {
-            return false;
-        };
-        if row < start.row || row > end.row {
-            return false;
-        }
-        let lo = if row == start.row { start.col } else { 0 };
-        let hi = if row == end.row { end.col } else { usize::MAX };
-        col >= lo && col <= hi
-    }
-
-    /// The inclusive `(lo, hi)` column span selected on absolute row `row`, if
-    /// any part of that row is selected.
-    pub fn selection_span_on(&self, row: usize) -> Option<(usize, usize)> {
-        if self.selection_block {
-            let (r0, r1, c0, c1) = self.block_rect()?;
-            return (row >= r0 && row <= r1).then_some((c0, c1));
-        }
-        let (start, end) = self.ordered_selection()?;
-        if row < start.row || row > end.row {
-            return None;
-        }
-        let lo = if row == start.row { start.col } else { 0 };
-        let hi = if row == end.row {
-            end.col
-        } else {
-            self.abs_row(row).len().saturating_sub(1)
-        };
-        Some((lo, hi))
-    }
-
-    /// The selected text, with trailing blanks trimmed per line and rows joined
-    /// by newlines. `None` if there is no selection.
-    pub fn selection_text(&self) -> Option<String> {
-        if self.selection_block {
-            let (r0, r1, c0, c1) = self.block_rect()?;
-            let mut out = String::new();
-            for row in r0..=r1 {
-                out.push_str(self.row_slice_text(row, c0, c1 + 1).trim_end());
-                if row != r1 {
-                    out.push('\n');
-                }
-            }
-            return Some(out);
-        }
-        let (start, end) = self.ordered_selection()?;
-        let mut out = String::new();
-        for row in start.row..=end.row {
-            let line = self.abs_row(row);
-            let lo = if row == start.row { start.col } else { 0 };
-            let hi = if row == end.row {
-                (end.col + 1).min(line.len())
-            } else {
-                line.len()
-            };
-            out.push_str(self.row_slice_text(row, lo, hi).trim_end());
-            if row != end.row {
-                out.push('\n');
-            }
-        }
-        Some(out)
-    }
-
-    /// The characters of an absolute row in `[from, to)`, skipping wide
-    /// continuation cells.
-    fn row_slice_text(&self, row: usize, from: usize, to: usize) -> String {
-        let mut out = String::new();
-        for cell in self
-            .abs_row(row)
-            .get(from..to.min(self.abs_row(row).len()))
-            .unwrap_or(&[])
-            .iter()
-            .filter(|c| !c.flags.contains(Flags::WIDE_CONT))
-        {
-            out.push(cell.c);
-            if let Some(marks) = &cell.combining {
-                out.push_str(marks);
-            }
-        }
-        out
-    }
-
-    // --- scrollback search ---
-
-    /// Set the search query and recompute matches over scrollback + the live
-    /// screen, focusing the most recent hit and scrolling it into view. An
-    /// empty query keeps search mode active but clears the hit list.
-    pub fn set_search(&mut self, query: &str) {
-        let matches = if query.is_empty() {
-            Vec::new()
-        } else {
-            self.compute_matches(query)
-        };
-        let current = matches.len().saturating_sub(1);
-        self.search = Some(SearchState {
-            query: query.to_string(),
-            matches,
-            current,
-        });
-        self.jump_to_current();
-    }
-
-    /// Move the focused match `forward` (toward newer) or back (toward older),
-    /// wrapping, and scroll it into view.
-    pub fn search_step(&mut self, forward: bool) {
-        if let Some(s) = self.search.as_mut()
-            && !s.matches.is_empty()
-        {
-            let n = s.matches.len();
-            s.current = if forward {
-                (s.current + 1) % n
-            } else {
-                (s.current + n - 1) % n
-            };
-        }
-        self.jump_to_current();
-    }
-
-    pub fn clear_search(&mut self) {
-        self.search = None;
-    }
-
-    /// The current query, while search mode is active.
-    pub fn search_query(&self) -> Option<&str> {
-        self.search.as_ref().map(|s| s.query.as_str())
-    }
-
-    /// `(focused match index 1-based, total matches)` for the search prompt.
-    pub fn search_count(&self) -> (usize, usize) {
-        self.search.as_ref().map_or((0, 0), |s| {
-            let total = s.matches.len();
-            (if total == 0 { 0 } else { s.current + 1 }, total)
-        })
-    }
-
-    /// Match spans `(lo, hi, is_current)` on absolute row `row`, for highlight.
-    pub fn search_spans_on(&self, row: usize) -> Vec<(usize, usize, bool)> {
-        let Some(s) = self.search.as_ref() else {
-            return Vec::new();
-        };
-        s.matches
-            .iter()
-            .enumerate()
-            .filter(|(_, m)| m.row == row && m.len > 0)
-            .map(|(i, m)| (m.col, m.col + m.len - 1, i == s.current))
-            .collect()
-    }
-
-    fn compute_matches(&self, query: &str) -> Vec<Match> {
-        // Smart case: an uppercase letter in the query forces case sensitivity.
-        let sensitive = query.chars().any(|c| c.is_ascii_uppercase());
-        let fold = |c: char| {
-            if sensitive { c } else { c.to_ascii_lowercase() }
-        };
-        let needle: Vec<char> = query.chars().map(fold).collect();
-        if needle.is_empty() {
-            return Vec::new();
-        }
-        let total = self.scrollback.len() + self.rows;
-        let mut matches = Vec::new();
-        for row in 0..total {
-            let hay: Vec<char> = self.abs_row(row).iter().map(|cell| fold(cell.c)).collect();
-            let mut i = 0;
-            while i + needle.len() <= hay.len() {
-                if hay[i..i + needle.len()] == needle[..] {
-                    matches.push(Match {
-                        row,
-                        col: i,
-                        len: needle.len(),
-                    });
-                    i += needle.len();
-                } else {
-                    i += 1;
-                }
-            }
-        }
-        matches
-    }
-
-    /// Scroll the viewport so the focused match is on screen, centering it only
-    /// when it would otherwise be off the visible range.
-    fn jump_to_current(&mut self) {
-        let Some(abs) = self
-            .search
-            .as_ref()
-            .and_then(|s| s.matches.get(s.current))
-            .map(|m| m.row)
-        else {
-            return;
-        };
-        let sb = self.scrollback.len();
-        let top = sb - self.view_offset;
-        let bottom = top + self.rows - 1;
-        if abs < top || abs > bottom {
-            let target = sb as isize + self.rows as isize / 2 - abs as isize;
-            self.view_offset = target.clamp(0, sb as isize) as usize;
-        }
-    }
-
-    /// Slide search hits up by `n` rows after scrollback eviction, dropping any
-    /// that scrolled off the top.
-    fn shift_search(&mut self, n: usize) {
-        if let Some(s) = self.search.as_mut() {
-            s.matches.retain(|m| m.row >= n);
-            for m in &mut s.matches {
-                m.row -= n;
-            }
-            s.current = s.current.min(s.matches.len().saturating_sub(1));
-        }
     }
 
     pub fn set_bracketed_paste(&mut self, on: bool) {

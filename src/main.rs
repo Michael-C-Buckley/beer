@@ -20,7 +20,7 @@ use crate::config::Config;
 
 /// A fast, software-rendered, Wayland-native terminal emulator.
 #[derive(Parse)]
-#[pound(name = "beer", version = "0.0.0")]
+#[pound(name = "beer", version = "0.2.0")]
 struct Cli {
     /// Run as a daemon hosting multiple windows.
     #[pound(long)]
