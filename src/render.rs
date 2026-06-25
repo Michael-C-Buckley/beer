@@ -32,15 +32,6 @@ impl Canvas<'_> {
         Some((y as usize * self.width + x as usize) * 4)
     }
 
-    /// Fill the whole buffer with one colour (fast path, no per-pixel bounds
-    /// checks).
-    fn clear(&mut self, c: Rgb) {
-        let bytes = [c.2, c.1, c.0, 0xff];
-        for px in self.pixels.chunks_exact_mut(4) {
-            px.copy_from_slice(&bytes);
-        }
-    }
-
     fn fill_rect(&mut self, x0: i32, y0: i32, w: u32, h: u32, c: Rgb) {
         let x_start = x0.max(0) as usize;
         let x_end = ((x0 + w as i32).max(0) as usize).min(self.width);
@@ -110,76 +101,79 @@ impl Renderer {
         self.fonts.metrics()
     }
 
-    /// Compose `grid` into `pixels` (BGRA, `width`×`height` px). `focused`
-    /// selects a solid or hollow cursor.
-    pub fn render(
+    /// Repaint a single grid row `y` into `pixels` (BGRA, `width`×`height` px):
+    /// clear the row band, fill backgrounds (and selection), draw glyphs and
+    /// decorations, then the cursor if it sits on this row. `blink_on` is the
+    /// current blink phase; blinking cells and a blinking cursor vanish when it
+    /// is `false`. Painting one row at a time is what lets the caller damage
+    /// only the rows that actually changed.
+    pub fn render_row(
         &mut self,
-        grid: &Grid,
         pixels: &mut [u8],
-        width: usize,
-        height: usize,
+        dims: (usize, usize),
+        grid: &Grid,
+        y: usize,
         focused: bool,
+        blink_on: bool,
     ) {
+        let (width, height) = dims;
         let mut canvas = Canvas {
             pixels,
             width,
             height,
         };
-        canvas.clear(DEFAULT_BG);
-
         let m = self.fonts.metrics();
         let cols = grid.cols();
+        let row_top = y as i32 * m.height as i32;
+        canvas.fill_rect(0, row_top, width as u32, m.height, DEFAULT_BG);
 
-        // Cell backgrounds: only paint cells that differ from the cleared
-        // default - most of a screen is default background. Rows come through
-        // the scrollback viewport and may be shorter than `cols` after a resize.
-        for y in 0..grid.rows() {
-            let abs = grid.view_to_abs(y);
-            for (x, cell) in grid.view_row(y).iter().take(cols).enumerate() {
-                let bg = if grid.is_selected(abs, x) {
-                    SELECTION_BG
-                } else {
-                    cell_colors(cell).1
-                };
-                if bg != DEFAULT_BG {
-                    let (px, py) = (x as i32 * m.width as i32, y as i32 * m.height as i32);
-                    canvas.fill_rect(px, py, m.width, m.height, bg);
-                }
+        // Rows come through the scrollback viewport and may be shorter than
+        // `cols` after a resize, so clamp with `take`.
+        let abs = grid.view_to_abs(y);
+        let cells = grid.view_row(y);
+        for (x, cell) in cells.iter().take(cols).enumerate() {
+            let bg = if grid.is_selected(abs, x) {
+                SELECTION_BG
+            } else {
+                cell_colors(cell).1
+            };
+            if bg != DEFAULT_BG {
+                canvas.fill_rect(x as i32 * m.width as i32, row_top, m.width, m.height, bg);
             }
         }
 
-        for y in 0..grid.rows() {
-            for (x, cell) in grid.view_row(y).iter().take(cols).enumerate() {
-                if cell.flags.contains(Flags::WIDE_CONT) {
-                    continue;
-                }
-                let (fg, _) = cell_colors(cell);
-                let origin_x = x as i32 * m.width as i32;
-                let cell_top = y as i32 * m.height as i32;
-                if cell.c != ' ' {
-                    self.draw_glyph(
-                        &mut canvas,
-                        cell.c,
-                        cell_style(cell),
-                        origin_x,
-                        cell_top,
-                        fg,
-                    );
-                }
-                draw_decorations(&mut canvas, cell, origin_x, cell_top, m, fg);
+        for (x, cell) in cells.iter().take(cols).enumerate() {
+            if cell.flags.contains(Flags::WIDE_CONT) {
+                continue;
             }
+            if cell.flags.contains(Flags::BLINK) && !blink_on {
+                continue;
+            }
+            let (fg, _) = cell_colors(cell);
+            let origin_x = x as i32 * m.width as i32;
+            if cell.c != ' ' {
+                self.draw_glyph(&mut canvas, cell.c, cell_style(cell), origin_x, row_top, fg);
+            }
+            draw_decorations(&mut canvas, cell, origin_x, row_top, m, fg);
         }
 
         // The cursor belongs to the live screen; hide it while scrolled back.
-        if grid.view_at_bottom() {
-            self.draw_cursor(&mut canvas, grid, m, focused);
+        if grid.view_at_bottom() && grid.cursor().1 == y {
+            self.draw_cursor(&mut canvas, grid, m, focused, blink_on);
         }
     }
 
     /// Draw the cursor: a solid block/underline/beam when focused, a hollow
-    /// outline when not.
-    fn draw_cursor(&mut self, canvas: &mut Canvas, grid: &Grid, m: CellMetrics, focused: bool) {
-        if !grid.cursor_visible() {
+    /// outline when not. A blinking cursor shape is only drawn while `blink_on`.
+    fn draw_cursor(
+        &mut self,
+        canvas: &mut Canvas,
+        grid: &Grid,
+        m: CellMetrics,
+        focused: bool,
+        blink_on: bool,
+    ) {
+        if !grid.cursor_visible() || (grid.cursor_blink() && !blink_on) {
             return;
         }
         let (cx, cy) = grid.cursor();

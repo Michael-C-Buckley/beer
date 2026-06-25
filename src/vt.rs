@@ -473,11 +473,14 @@ impl Perform for Term {
             }),
             'q' if intermediates.first() == Some(&b'>') => self.report_version(),
             'q' if intermediates.first() == Some(&b' ') => {
-                self.grid.set_cursor_shape(match raw(params, 0) {
+                let code = raw(params, 0);
+                self.grid.set_cursor_shape(match code {
                     3 | 4 => CursorShape::Underline,
                     5 | 6 => CursorShape::Beam,
                     _ => CursorShape::Block,
                 });
+                // Even codes are steady; 0/1 and other odd codes blink.
+                self.grid.set_cursor_blink(code == 0 || code % 2 == 1);
             }
             'p' if intermediates.contains(&b'$') => self.report_mode(params, private),
             'n' => self.device_status(params),

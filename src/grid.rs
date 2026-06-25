@@ -140,6 +140,8 @@ pub struct Grid {
     /// How many lines the viewport is scrolled back from the live bottom.
     view_offset: usize,
     cursor_shape: CursorShape,
+    /// Whether the cursor shape is a blinking variant (DECSCUSR odd codes).
+    cursor_blink: bool,
     cursor_visible: bool,
     /// Application cursor-keys mode (DECCKM): arrows send SS3 instead of CSI.
     app_cursor: bool,
@@ -177,6 +179,7 @@ impl Grid {
             scrollback: VecDeque::new(),
             view_offset: 0,
             cursor_shape: CursorShape::default(),
+            cursor_blink: false,
             cursor_visible: true,
             cursor_color: None,
             app_cursor: false,
@@ -263,6 +266,14 @@ impl Grid {
 
     pub fn cursor_shape(&self) -> CursorShape {
         self.cursor_shape
+    }
+
+    pub fn set_cursor_blink(&mut self, blink: bool) {
+        self.cursor_blink = blink;
+    }
+
+    pub fn cursor_blink(&self) -> bool {
+        self.cursor_blink
     }
 
     pub fn set_cursor_visible(&mut self, visible: bool) {
@@ -817,6 +828,22 @@ impl Grid {
         let lo = if row == start.row { start.col } else { 0 };
         let hi = if row == end.row { end.col } else { usize::MAX };
         col >= lo && col <= hi
+    }
+
+    /// The inclusive `(lo, hi)` column span selected on absolute row `row`, if
+    /// any part of that row is selected.
+    pub fn selection_span_on(&self, row: usize) -> Option<(usize, usize)> {
+        let (start, end) = self.ordered_selection()?;
+        if row < start.row || row > end.row {
+            return None;
+        }
+        let lo = if row == start.row { start.col } else { 0 };
+        let hi = if row == end.row {
+            end.col
+        } else {
+            self.abs_row(row).len().saturating_sub(1)
+        };
+        Some((lo, hi))
     }
 
     /// The selected text, with trailing blanks trimmed per line and rows joined

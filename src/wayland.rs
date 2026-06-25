@@ -9,12 +9,16 @@ use std::os::fd::OwnedFd;
 use std::os::unix::process::ExitStatusExt;
 use std::process::ExitCode;
 
+use std::time::Duration;
+
 use anyhow::Context;
 use calloop::generic::Generic;
+use calloop::timer::{TimeoutAction, Timer};
 use calloop::{EventLoop, Interest, LoopHandle, Mode, PostAction};
 use calloop_wayland_source::WaylandSource;
 
 use crate::font::Fonts;
+use crate::grid::{Cell, CursorShape, Grid};
 use crate::pty::Pty;
 use crate::render::Renderer;
 use crate::vt::Term;
@@ -53,7 +57,10 @@ use smithay_client_toolkit::{
             window::{Window, WindowConfigure, WindowDecorations, WindowHandler},
         },
     },
-    shm::{Shm, ShmHandler, slot::SlotPool},
+    shm::{
+        Shm, ShmHandler,
+        slot::{Buffer, SlotPool},
+    },
 };
 use wayland_client::{
     Connection, QueueHandle,
@@ -85,6 +92,55 @@ fn pick_mime(mimes: &[String]) -> Option<String> {
 
 /// Max gap between clicks counted as a multi-click (ms).
 const MULTI_CLICK_MS: u32 = 400;
+
+/// Blink half-period: cells/cursor toggle visibility this often.
+const BLINK_MS: u64 = 500;
+
+/// Buffers kept for double/triple buffering before we wait for a release.
+const MAX_BUFFERS: usize = 3;
+
+/// What determines one rendered row's pixels: its cells, the cursor on it, the
+/// selection span over it, and the blink phase. Two equal `RowSnap`s render
+/// identically, so a buffer holding an equal snapshot needs no repaint.
+#[derive(Clone, PartialEq, Debug)]
+struct RowSnap {
+    cells: Vec<Cell>,
+    /// `(col, shape, focused)` when the cursor is drawn on this row.
+    cursor: Option<(usize, CursorShape, bool)>,
+    /// Inclusive selected column span on this row.
+    sel: Option<(usize, usize)>,
+    /// Blink phase, but only varied when the row actually has blinking ink, so
+    /// non-blinking rows stay equal across phase toggles.
+    blink: bool,
+}
+
+/// One shm buffer plus the per-row snapshot of what it currently displays.
+#[derive(Debug)]
+struct FrameBuf {
+    buffer: Buffer,
+    rows: Vec<RowSnap>,
+}
+
+/// Snapshot the determinants of viewport row `y`'s pixels.
+fn row_snap(grid: &Grid, y: usize, focused: bool, blink_on: bool) -> RowSnap {
+    let abs = grid.view_to_abs(y);
+    let cells = grid.view_row(y).to_vec();
+    let cursor = if grid.view_at_bottom() && grid.cursor().1 == y {
+        let visible = grid.cursor_visible() && (!grid.cursor_blink() || blink_on);
+        visible.then(|| (grid.cursor().0, grid.cursor_shape(), focused))
+    } else {
+        None
+    };
+    let has_blink = cells
+        .iter()
+        .any(|c| c.flags.contains(crate::grid::Flags::BLINK));
+    RowSnap {
+        cells,
+        cursor,
+        sel: grid.selection_span_on(abs),
+        blink: if has_blink { blink_on } else { true },
+    }
+}
 
 /// Default window size in pixels before the compositor suggests one.
 const DEFAULT_W: u32 = 800;
@@ -159,22 +215,37 @@ pub fn run() -> anyhow::Result<ExitCode> {
         title: None,
         width: DEFAULT_W,
         height: DEFAULT_H,
-        dirty: false,
+        needs_draw: false,
+        frame_pending: false,
+        frames: Vec::new(),
+        buf_dims: (0, 0),
+        blink_on: true,
         focused: true,
         exit: false,
         exit_code: ExitCode::SUCCESS,
     };
 
-    // Block until an event (PTY output, input, configure) arrives - every
-    // repaint is driven by one, so there is nothing to do on a timer.
+    // Toggle the blink phase on a timer so blinking text and cursors animate.
+    let blink = Timer::from_duration(Duration::from_millis(BLINK_MS));
+    let blink_registered = event_loop
+        .handle()
+        .insert_source(blink, |_, _, app: &mut App| {
+            app.blink_on = !app.blink_on;
+            app.needs_draw = true;
+            TimeoutAction::ToDuration(Duration::from_millis(BLINK_MS))
+        });
+    if let Err(err) = blink_registered {
+        tracing::warn!("register blink timer: {err}");
+    }
+
+    // Each iteration blocks until an event (PTY output, input, configure, frame
+    // callback, blink) arrives, then presents at most one frame; bursts of PTY
+    // output between frame callbacks coalesce into a single repaint.
     while !app.exit {
         event_loop
             .dispatch(None, &mut app)
             .context("dispatch event loop")?;
-        if app.dirty {
-            app.draw();
-            app.dirty = false;
-        }
+        app.flush();
     }
     Ok(app.exit_code)
 }
@@ -244,8 +315,16 @@ struct App {
     title: Option<String>,
     width: u32,
     height: u32,
-    /// The grid changed and the window needs repainting.
-    dirty: bool,
+    /// The grid changed and the window wants repainting on the next frame.
+    needs_draw: bool,
+    /// A `wl_surface.frame` callback is in flight; defer drawing until it fires.
+    frame_pending: bool,
+    /// Double/triple-buffer ring, each tagged with the rows it currently shows.
+    frames: Vec<FrameBuf>,
+    /// Pixel size the `frames` buffers were allocated for.
+    buf_dims: (u32, u32),
+    /// Current blink phase, toggled by a timer; off hides blinking ink.
+    blink_on: bool,
     /// Whether the toplevel currently has keyboard focus (drives the cursor).
     focused: bool,
     exit: bool,
@@ -341,7 +420,7 @@ impl App {
                     -page
                 };
                 session.term.scroll_view(delta);
-                self.dirty = true;
+                self.needs_draw = true;
             }
             return;
         }
@@ -355,7 +434,7 @@ impl App {
         {
             session.term.scroll_to_bottom();
             session.term.grid_mut().clear_selection();
-            self.dirty = true;
+            self.needs_draw = true;
             if let Err(err) = write_all(session.pty.master(), &bytes) {
                 tracing::warn!("write key to pty: {err}");
             }
@@ -396,7 +475,7 @@ impl App {
             _ => grid.start_selection(row, col),
         }
         self.selecting = true;
-        self.dirty = true;
+        self.needs_draw = true;
     }
 
     /// Pointer motion during a drag: extend the selection head.
@@ -409,7 +488,7 @@ impl App {
         };
         if let Some(session) = self.session.as_mut() {
             session.term.grid_mut().extend_selection(row, col);
-            self.dirty = true;
+            self.needs_draw = true;
         }
     }
 
@@ -534,7 +613,7 @@ impl App {
             return;
         };
         session.term.scroll_to_bottom();
-        self.dirty = true;
+        self.needs_draw = true;
         let bracketed = session.term.grid().bracketed_paste();
         // Strip control bytes a terminal must never receive raw from a paste;
         // keep tab and newlines (CR is what the shell expects for Enter).
@@ -575,7 +654,7 @@ impl App {
             self.window
                 .set_title(self.title.clone().unwrap_or_default());
         }
-        self.dirty = true;
+        self.needs_draw = true;
     }
 
     /// Recompute the grid size for the current window and tell the grid and the
@@ -615,41 +694,106 @@ impl App {
         self.exit = true;
     }
 
-    /// Render the grid into a fresh buffer and present it.
-    fn draw(&mut self) {
+    /// Present a frame if one is wanted and the compositor is ready for it.
+    /// Called after every event-loop wake; the frame-callback gate keeps draws
+    /// paced to the display instead of one per PTY read.
+    fn flush(&mut self) {
+        if self.needs_draw && !self.frame_pending && self.session.is_some() {
+            self.present();
+        }
+    }
+
+    /// Render only the rows that changed since the chosen buffer last displayed
+    /// them, damage just those rows, and commit with a frame-callback request.
+    fn present(&mut self) {
+        self.needs_draw = false;
+        let (w, h) = (self.width, self.height);
+        let m = self.renderer.metrics();
+        let (focused, blink_on) = (self.focused, self.blink_on);
+
+        // A resize invalidates every buffer's contents and size.
+        if self.buf_dims != (w, h) {
+            self.frames.clear();
+            self.buf_dims = (w, h);
+        }
+
         let Some(session) = self.session.as_ref() else {
             return;
         };
-        let (w, h) = (self.width, self.height);
+        let grid = session.term.grid();
+        let rows = grid.rows();
+        let cur: Vec<RowSnap> = (0..rows)
+            .map(|y| row_snap(grid, y, focused, blink_on))
+            .collect();
+
+        // Reuse a buffer the compositor has released, else grow the ring.
         let stride = w as i32 * 4;
-
-        let (buffer, canvas) =
-            match self
-                .pool
-                .create_buffer(w as i32, h as i32, stride, wl_shm::Format::Argb8888)
-            {
-                Ok(buf) => buf,
-                Err(err) => {
-                    tracing::error!("allocate shm buffer: {err}");
-                    return;
+        let mut idx = None;
+        for i in 0..self.frames.len() {
+            if self.pool.canvas(&self.frames[i].buffer).is_some() {
+                idx = Some(i);
+                break;
+            }
+        }
+        let idx = match idx {
+            Some(i) => i,
+            None if self.frames.len() < MAX_BUFFERS => {
+                match self
+                    .pool
+                    .create_buffer(w as i32, h as i32, stride, wl_shm::Format::Argb8888)
+                {
+                    Ok((buffer, _)) => {
+                        self.frames.push(FrameBuf {
+                            buffer,
+                            rows: Vec::new(),
+                        });
+                        self.frames.len() - 1
+                    }
+                    Err(err) => {
+                        tracing::error!("allocate shm buffer: {err}");
+                        return;
+                    }
                 }
-            };
+            }
+            // All buffers are still held by the compositor; a release event will
+            // wake us and `needs_draw` (re-set below) retries then.
+            None => {
+                self.needs_draw = true;
+                return;
+            }
+        };
 
-        self.renderer.render(
-            session.term.grid(),
-            canvas,
-            w as usize,
-            h as usize,
-            self.focused,
-        );
+        // Rows that differ from what this buffer last showed (all, if fresh).
+        let prev = &self.frames[idx].rows;
+        let dirty: Vec<usize> = (0..rows)
+            .filter(|&y| prev.get(y) != Some(&cur[y]))
+            .collect();
+        if dirty.is_empty() {
+            return;
+        }
+
+        let Some(canvas) = self.pool.canvas(&self.frames[idx].buffer) else {
+            return;
+        };
+        let dims = (w as usize, h as usize);
+        for &y in &dirty {
+            self.renderer
+                .render_row(canvas, dims, grid, y, focused, blink_on);
+        }
+        self.frames[idx].rows = cur;
 
         let surface = self.window.wl_surface();
-        if let Err(err) = buffer.attach_to(surface) {
+        if let Err(err) = self.frames[idx].buffer.attach_to(surface) {
             tracing::error!("attach buffer: {err}");
             return;
         }
-        surface.damage_buffer(0, 0, w as i32, h as i32);
+        for &y in &dirty {
+            let top = y as i32 * m.height as i32;
+            surface.damage_buffer(0, top, w as i32, m.height as i32);
+        }
+        surface.frame(&self.qh, surface.clone());
         self.window.commit();
+        self.frame_pending = true;
     }
 }
 
@@ -672,7 +816,11 @@ impl CompositorHandler for App {
     ) {
     }
 
-    fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: u32) {}
+    fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: u32) {
+        // The compositor is ready for another frame; `flush` will repaint if the
+        // grid has changed since the last present.
+        self.frame_pending = false;
+    }
 
     fn surface_enter(
         &mut self,
@@ -716,7 +864,7 @@ impl WindowHandler for App {
         } else {
             self.resize_grid();
         }
-        self.draw();
+        self.needs_draw = true;
     }
 }
 
@@ -811,7 +959,7 @@ impl KeyboardHandler for App {
     ) {
         self.serial = serial;
         self.focused = true;
-        self.dirty = true;
+        self.needs_draw = true;
     }
 
     fn leave(
@@ -823,7 +971,7 @@ impl KeyboardHandler for App {
         _: u32,
     ) {
         self.focused = false;
-        self.dirty = true;
+        self.needs_draw = true;
     }
 
     fn press_key(
@@ -936,7 +1084,7 @@ impl PointerHandler for App {
                     let delta = if raw < 0.0 { lines } else { -lines };
                     if let Some(session) = self.session.as_mut() {
                         session.term.scroll_view(delta);
-                        self.dirty = true;
+                        self.needs_draw = true;
                     }
                 }
                 _ => {}
