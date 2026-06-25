@@ -113,6 +113,9 @@ const SYNC_TIMEOUT_MS: u64 = 150;
 /// Interval between autoscroll steps while a drag selection runs off an edge.
 const AUTOSCROLL_MS: u64 = 40;
 
+/// How long the visual bell inverts the screen.
+const FLASH_MS: u64 = 80;
+
 /// What determines one rendered row's pixels: its cells, the cursor on it, the
 /// selection span over it, and the blink phase. Two equal `RowSnap`s render
 /// identically, so a buffer holding an equal snapshot needs no repaint.
@@ -255,6 +258,8 @@ pub fn run(config: Config) -> anyhow::Result<ExitCode> {
         buf_dims: (0, 0),
         blink_on: true,
         sync_timeout: None,
+        flashing: false,
+        flash_timer: None,
         searching: false,
         focused: true,
         exit: false,
@@ -382,6 +387,10 @@ struct App {
     blink_on: bool,
     /// Armed while synchronized output holds the screen, to force it open.
     sync_timeout: Option<RegistrationToken>,
+    /// The visual bell is inverting the screen.
+    flashing: bool,
+    /// Timer that ends the visual-bell flash.
+    flash_timer: Option<RegistrationToken>,
     /// Whether incremental search mode is active (the query lives in the grid).
     searching: bool,
     /// Whether the toplevel currently has keyboard focus (drives the cursor).
@@ -454,6 +463,10 @@ impl App {
         let grid = term.grid_mut();
         grid.set_word_delimiters(self.config.main.word_delimiters.clone());
         grid.set_scrollback_cap(self.config.scrollback.lines);
+        if let Some(shape) = cursor_shape_from(self.config.cursor.style.as_deref()) {
+            grid.set_cursor_shape(shape);
+        }
+        grid.set_cursor_blink(self.config.cursor.blink);
         self.session = Some(Session { pty, term });
     }
 
@@ -982,11 +995,36 @@ impl App {
             self.window
                 .set_title(self.title.clone().unwrap_or_default());
         }
+        let rang = session.term.take_bell();
         let ops = session.term.take_clipboard_ops();
         if !ops.is_empty() {
             self.handle_clipboard_ops(ops);
         }
+        if rang && self.config.bell.visual {
+            self.start_flash();
+        }
         self.needs_draw = true;
+    }
+
+    /// Begin a visual-bell flash: invert the screen for a moment. Clearing the
+    /// buffer ring forces a full repaint with the inverted theme.
+    fn start_flash(&mut self) {
+        self.flashing = true;
+        self.frames.clear();
+        self.needs_draw = true;
+        if self.flash_timer.is_none() {
+            let timer = Timer::from_duration(Duration::from_millis(FLASH_MS));
+            self.flash_timer = self
+                .loop_handle
+                .insert_source(timer, |_, _, app: &mut App| {
+                    app.flashing = false;
+                    app.frames.clear();
+                    app.needs_draw = true;
+                    app.flash_timer = None;
+                    TimeoutAction::Drop
+                })
+                .ok();
+        }
     }
 
     /// Recompute the grid size for the current window and tell the grid and the
@@ -1084,7 +1122,9 @@ impl App {
             return;
         };
         let grid = session.term.grid();
-        let theme = session.term.theme();
+        // The visual bell inverts fg/bg for the duration of the flash.
+        let flashed = self.flashing.then(|| session.term.theme().inverted());
+        let theme = flashed.as_ref().unwrap_or(session.term.theme());
         let rows = grid.rows();
         let mut cur: Vec<RowSnap> = (0..rows)
             .map(|y| row_snap(grid, y, focused, blink_on))
@@ -1437,6 +1477,19 @@ impl KeyboardHandler for App {
         _: &wl_keyboard::WlKeyboard,
         _: RepeatInfo,
     ) {
+    }
+}
+
+/// Parse a configured cursor-style name into a [`CursorShape`].
+fn cursor_shape_from(style: Option<&str>) -> Option<CursorShape> {
+    match style? {
+        "block" => Some(CursorShape::Block),
+        "beam" | "bar" => Some(CursorShape::Beam),
+        "underline" => Some(CursorShape::Underline),
+        other => {
+            tracing::warn!("unknown cursor style {other:?}");
+            None
+        }
     }
 }
 

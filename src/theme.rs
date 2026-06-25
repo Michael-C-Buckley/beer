@@ -138,6 +138,13 @@ impl Theme {
     pub fn reset_bg(&mut self) {
         self.bg = self.default_bg;
     }
+
+    /// A copy with foreground and background swapped, for the visual bell flash.
+    pub fn inverted(&self) -> Self {
+        let mut t = self.clone();
+        std::mem::swap(&mut t.fg, &mut t.bg);
+        t
+    }
 }
 
 /// Foreground/background used for `Color::Default`.

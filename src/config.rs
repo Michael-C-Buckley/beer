@@ -13,7 +13,27 @@ use serde::Deserialize;
 pub struct Config {
     pub main: Main,
     pub colors: Colors,
+    pub cursor: Cursor,
     pub scrollback: Scrollback,
+    pub bell: Bell,
+}
+
+/// `[cursor]`: the default cursor presentation (DECSCUSR may override at runtime).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct Cursor {
+    /// `block`, `beam`/`bar`, or `underline`.
+    pub style: Option<String>,
+    /// Whether the cursor blinks by default.
+    pub blink: bool,
+}
+
+/// `[bell]`: what happens on `BEL` (0x07).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct Bell {
+    /// Briefly flash the screen.
+    pub visual: bool,
 }
 
 /// `[colors]`: foreground/background, the 16 base palette entries, and accents.

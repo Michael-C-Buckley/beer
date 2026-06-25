@@ -100,6 +100,8 @@ pub struct Term {
     clipboard_ops: Vec<ClipboardOp>,
     /// The active colour scheme (seeded from config, mutated by OSC escapes).
     theme: Theme,
+    /// Set when the child rings the bell (`BEL`); cleared by the front-end.
+    bell: bool,
 }
 
 impl Term {
@@ -115,7 +117,13 @@ impl Term {
             xtgettcap: None,
             clipboard_ops: Vec::new(),
             theme: Theme::default(),
+            bell: false,
         }
+    }
+
+    /// Take and clear the pending bell flag.
+    pub fn take_bell(&mut self) -> bool {
+        std::mem::take(&mut self.bell)
     }
 
     /// Drain the OSC 52 clipboard requests accumulated since the last call.
@@ -535,6 +543,7 @@ impl Perform for Term {
 
     fn execute(&mut self, byte: u8) {
         match byte {
+            0x07 => self.bell = true,
             0x08 => self.grid.backspace(),
             0x09 => self.grid.tab(),
             0x0A..=0x0C => self.grid.line_feed(),
