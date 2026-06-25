@@ -4,7 +4,7 @@ use std::io::Write as _;
 
 use vte::{Params, Perform};
 
-use crate::grid::{Color, CursorShape, Flags, Grid, Underline};
+use crate::grid::{Color, CursorShape, Flags, Grid, MouseEncoding, MouseProtocol, Underline};
 
 /// G0/G1 character set designation.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -24,6 +24,16 @@ enum DaLevel {
 /// DECRQM mode-state code: 1 = set, 2 = reset.
 fn set_reset(on: bool) -> u8 {
     if on { 1 } else { 2 }
+}
+
+/// Select `protocol` when a mouse mode is set, else turn reporting off.
+fn proto(on: bool, protocol: MouseProtocol) -> MouseProtocol {
+    if on { protocol } else { MouseProtocol::Off }
+}
+
+/// Select `encoding` when its mode is set, else fall back to the default form.
+fn enc(on: bool, encoding: MouseEncoding) -> MouseEncoding {
+    if on { encoding } else { MouseEncoding::X10 }
 }
 
 /// Parse an X11 colour spec from an OSC string: `rgb:rr/gg/bb` (1-4 hex
@@ -179,10 +189,19 @@ impl Term {
                 (false, 4) => self.grid.set_insert(on),
                 (true, 1) => self.grid.set_app_cursor(on),
                 (true, 25) => self.grid.set_cursor_visible(on),
+                (true, 9) => self.grid.set_mouse_protocol(proto(on, MouseProtocol::X10)),
+                (true, 1000) => self
+                    .grid
+                    .set_mouse_protocol(proto(on, MouseProtocol::Normal)),
+                (true, 1002) => self
+                    .grid
+                    .set_mouse_protocol(proto(on, MouseProtocol::Button)),
+                (true, 1003) => self.grid.set_mouse_protocol(proto(on, MouseProtocol::Any)),
+                (true, 1004) => self.grid.set_focus_events(on),
+                (true, 1005) => self.grid.set_mouse_encoding(enc(on, MouseEncoding::Utf8)),
+                (true, 1006) => self.grid.set_mouse_encoding(enc(on, MouseEncoding::Sgr)),
                 (true, 2004) => self.grid.set_bracketed_paste(on),
                 (true, 2026) => self.grid.set_sync(on),
-                // App-cursor/bracketed-paste/mouse/sync modes affect input and
-                // rendering, which arrive with the keyboard and renderer.
                 _ => tracing::trace!("unhandled mode {code} private={private} on={on}"),
             }
         }
@@ -282,6 +301,13 @@ impl Term {
             (true, 6) => set_reset(self.grid.origin()),
             (true, 7) => set_reset(self.grid.autowrap()),
             (true, 47 | 1047 | 1049) => set_reset(self.grid.alt_active()),
+            (true, 9) => set_reset(self.grid.mouse_protocol() == MouseProtocol::X10),
+            (true, 1000) => set_reset(self.grid.mouse_protocol() == MouseProtocol::Normal),
+            (true, 1002) => set_reset(self.grid.mouse_protocol() == MouseProtocol::Button),
+            (true, 1003) => set_reset(self.grid.mouse_protocol() == MouseProtocol::Any),
+            (true, 1004) => set_reset(self.grid.focus_events()),
+            (true, 1005) => set_reset(self.grid.mouse_encoding() == MouseEncoding::Utf8),
+            (true, 1006) => set_reset(self.grid.mouse_encoding() == MouseEncoding::Sgr),
             (true, 2004) => set_reset(self.grid.bracketed_paste()),
             (true, 2026) => set_reset(self.grid.sync_active()),
             (false, 4) => set_reset(self.grid.insert()),
@@ -584,6 +610,7 @@ fn decode_hex(s: &[u8]) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::grid::{MouseEncoding, MouseProtocol};
 
     fn feed(term: &mut Term, bytes: &[u8]) {
         let mut parser = vte::Parser::new();
@@ -728,6 +755,22 @@ mod tests {
         feed(&mut t, b"\x1b[?2026l\x1b[?2026$p");
         assert!(!t.grid().sync_active());
         assert_eq!(t.take_response(), b"\x1b[?2026;2$y");
+    }
+
+    #[test]
+    fn mouse_modes_track_protocol_and_encoding() {
+        let mut t = Term::new(20, 4);
+        feed(&mut t, b"\x1b[?1002h\x1b[?1006h");
+        assert_eq!(t.grid().mouse_protocol(), MouseProtocol::Button);
+        assert_eq!(t.grid().mouse_encoding(), MouseEncoding::Sgr);
+        feed(&mut t, b"\x1b[?1002$p");
+        assert_eq!(t.take_response(), b"\x1b[?1002;1$y");
+        feed(&mut t, b"\x1b[?1003h"); // any-event supersedes button-event
+        assert_eq!(t.grid().mouse_protocol(), MouseProtocol::Any);
+        feed(&mut t, b"\x1b[?1000l"); // turning a mouse mode off clears reporting
+        assert_eq!(t.grid().mouse_protocol(), MouseProtocol::Off);
+        feed(&mut t, b"\x1b[?1004h");
+        assert!(t.grid().focus_events());
     }
 
     #[test]

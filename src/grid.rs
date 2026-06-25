@@ -75,6 +75,34 @@ pub enum CursorShape {
     Beam,
 }
 
+/// Which mouse events the application has asked to receive (DECSET 9/1000-1003).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum MouseProtocol {
+    /// No reporting; the pointer drives local selection/scroll.
+    #[default]
+    Off,
+    /// X10 (9): button presses only.
+    X10,
+    /// Normal (1000): button press and release.
+    Normal,
+    /// Button-event (1002): press, release, and motion while a button is held.
+    Button,
+    /// Any-event (1003): press, release, and all pointer motion.
+    Any,
+}
+
+/// How mouse events are framed on the wire (default byte form, UTF-8, or SGR).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum MouseEncoding {
+    /// Legacy `CSI M Cb Cx Cy`, each value a byte offset by 32 (≤ 223).
+    #[default]
+    X10,
+    /// As X10 but coordinates above 95 are UTF-8 encoded (DECSET 1005).
+    Utf8,
+    /// `CSI < Cb ; Cx ; Cy M/m`, decimal and unbounded (DECSET 1006).
+    Sgr,
+}
+
 /// One grid cell: a character plus its rendering style.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Cell {
@@ -154,6 +182,12 @@ pub struct Grid {
     /// Synchronized output (DECSET 2026): hold presentation while a frame is
     /// being assembled, so the screen never shows a half-drawn update.
     sync: bool,
+    /// Which mouse events the application wants reported.
+    mouse_protocol: MouseProtocol,
+    /// Wire framing for those reports.
+    mouse_encoding: MouseEncoding,
+    /// Focus in/out reporting (DECSET 1004).
+    focus_events: bool,
 }
 
 fn default_tabs(cols: usize) -> Vec<bool> {
@@ -189,6 +223,9 @@ impl Grid {
             selection: None,
             bracketed_paste: false,
             sync: false,
+            mouse_protocol: MouseProtocol::Off,
+            mouse_encoding: MouseEncoding::X10,
+            focus_events: false,
         }
     }
 
@@ -892,6 +929,30 @@ impl Grid {
 
     pub fn sync_active(&self) -> bool {
         self.sync
+    }
+
+    pub fn set_mouse_protocol(&mut self, protocol: MouseProtocol) {
+        self.mouse_protocol = protocol;
+    }
+
+    pub fn mouse_protocol(&self) -> MouseProtocol {
+        self.mouse_protocol
+    }
+
+    pub fn set_mouse_encoding(&mut self, encoding: MouseEncoding) {
+        self.mouse_encoding = encoding;
+    }
+
+    pub fn mouse_encoding(&self) -> MouseEncoding {
+        self.mouse_encoding
+    }
+
+    pub fn set_focus_events(&mut self, on: bool) {
+        self.focus_events = on;
+    }
+
+    pub fn focus_events(&self) -> bool {
+        self.focus_events
     }
 
     // --- inspection (logging + tests) ---

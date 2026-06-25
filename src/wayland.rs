@@ -18,7 +18,7 @@ use calloop::{EventLoop, Interest, LoopHandle, Mode, PostAction, RegistrationTok
 use calloop_wayland_source::WaylandSource;
 
 use crate::font::Fonts;
-use crate::grid::{Cell, CursorShape, Grid};
+use crate::grid::{Cell, CursorShape, Grid, MouseProtocol};
 use crate::pty::Pty;
 use crate::render::Renderer;
 use crate::vt::Term;
@@ -52,7 +52,7 @@ use smithay_client_toolkit::{
         Capability, SeatHandler, SeatState,
         keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers, RawModifiers, RepeatInfo},
         pointer::{
-            BTN_LEFT, BTN_MIDDLE, PointerEvent, PointerEventKind, PointerHandler,
+            BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, PointerEvent, PointerEventKind, PointerHandler,
             cursor_shape::CursorShapeManager,
         },
     },
@@ -215,6 +215,8 @@ pub fn run() -> anyhow::Result<ExitCode> {
         clipboard: String::new(),
         primary_clip: String::new(),
         selecting: false,
+        pressed_button: None,
+        last_report_cell: None,
         pointer_pos: (0.0, 0.0),
         last_click: None,
         serial: 0,
@@ -318,6 +320,10 @@ struct App {
     primary_clip: String,
     /// A left-button drag is in progress.
     selecting: bool,
+    /// Button base code held down while mouse reporting, for drag reports.
+    pressed_button: Option<u8>,
+    /// Last cell a motion report was emitted for, to suppress duplicates.
+    last_report_cell: Option<(usize, usize)>,
     pointer_pos: (f64, f64),
     /// Last click (time ms, abs row, col, count) for double/triple detection.
     last_click: Option<(u32, usize, usize, u32)>,
@@ -518,6 +524,101 @@ impl App {
         }
         self.selecting = false;
         self.set_primary(qh);
+    }
+
+    /// Whether the application wants mouse reports and the user is not holding
+    /// Shift (which forces local selection regardless of mode).
+    fn mouse_reporting(&self) -> bool {
+        self.session
+            .as_ref()
+            .is_some_and(|s| s.term.grid().mouse_protocol() != MouseProtocol::Off)
+            && !self.modifiers.shift
+    }
+
+    /// The viewport cell `(col, row)` under the pointer, clamped to the screen.
+    fn report_screen_cell(&self) -> Option<(usize, usize)> {
+        let session = self.session.as_ref()?;
+        let m = self.renderer.metrics();
+        let grid = session.term.grid();
+        let col = (self.pointer_pos.0.max(0.0) as usize / m.width as usize)
+            .min(grid.cols().saturating_sub(1));
+        let row = (self.pointer_pos.1.max(0.0) as usize / m.height as usize)
+            .min(grid.rows().saturating_sub(1));
+        Some((col, row))
+    }
+
+    /// Report a button press/release to the application, if reporting is active.
+    /// Returns whether the event was consumed (so local handling is skipped).
+    fn try_report_button(&mut self, code: u8, pressed: bool) -> bool {
+        let Some(session) = self.session.as_ref() else {
+            return false;
+        };
+        let grid = session.term.grid();
+        let proto = grid.mouse_protocol();
+        if proto == MouseProtocol::Off || self.modifiers.shift {
+            return false;
+        }
+        let enc = grid.mouse_encoding();
+        // X10 (mode 9) reports presses only; a release is swallowed, not sent.
+        if (pressed || proto != MouseProtocol::X10)
+            && let Some((col, row)) = self.report_screen_cell()
+        {
+            let bytes =
+                crate::input::encode_mouse(enc, code, col, row, pressed, false, self.modifiers);
+            self.write_to_pty(&bytes);
+            self.last_report_cell = Some((col, row));
+        }
+        true
+    }
+
+    /// Report pointer motion to the application when the active mode wants it.
+    /// Returns whether reporting consumed the motion (suppressing local drag).
+    fn try_report_motion(&mut self) -> bool {
+        let Some(session) = self.session.as_ref() else {
+            return false;
+        };
+        let grid = session.term.grid();
+        let proto = grid.mouse_protocol();
+        if proto == MouseProtocol::Off || self.modifiers.shift {
+            return false;
+        }
+        let enc = grid.mouse_encoding();
+        let wants = match proto {
+            MouseProtocol::Any => true,
+            MouseProtocol::Button => self.pressed_button.is_some(),
+            _ => false,
+        };
+        if wants
+            && let Some((col, row)) = self.report_screen_cell()
+            && self.last_report_cell != Some((col, row))
+        {
+            // Any-event motion with no button held uses the "no button" code 3.
+            let code = self.pressed_button.unwrap_or(3);
+            let bytes = crate::input::encode_mouse(enc, code, col, row, true, true, self.modifiers);
+            self.write_to_pty(&bytes);
+            self.last_report_cell = Some((col, row));
+        }
+        true
+    }
+
+    /// Send focus in/out (DECSET 1004) to the application when it asked for it.
+    fn report_focus(&mut self, focused: bool) {
+        if self
+            .session
+            .as_ref()
+            .is_some_and(|s| s.term.grid().focus_events())
+        {
+            self.write_to_pty(if focused { b"\x1b[I" } else { b"\x1b[O" });
+        }
+    }
+
+    /// Write bytes to the PTY master, logging on failure.
+    fn write_to_pty(&mut self, bytes: &[u8]) {
+        if let Some(session) = self.session.as_mut()
+            && let Err(err) = write_all(session.pty.master(), bytes)
+        {
+            tracing::warn!("write to pty: {err}");
+        }
     }
 
     /// The current selection text, if any and non-empty.
@@ -1010,6 +1111,7 @@ impl KeyboardHandler for App {
     ) {
         self.serial = serial;
         self.focused = true;
+        self.report_focus(true);
         self.needs_draw = true;
     }
 
@@ -1022,6 +1124,7 @@ impl KeyboardHandler for App {
         _: u32,
     ) {
         self.focused = false;
+        self.report_focus(false);
         self.needs_draw = true;
     }
 
@@ -1082,6 +1185,16 @@ impl KeyboardHandler for App {
     }
 }
 
+/// Map a Wayland button code to the terminal mouse base code, if reportable.
+fn button_code(button: u32) -> Option<u8> {
+    match button {
+        BTN_LEFT => Some(0),
+        BTN_MIDDLE => Some(1),
+        BTN_RIGHT => Some(2),
+        _ => None,
+    }
+}
+
 impl PointerHandler for App {
     fn pointer_frame(
         &mut self,
@@ -1102,6 +1215,9 @@ impl PointerHandler for App {
                 }
                 PointerEventKind::Motion { .. } => {
                     self.pointer_pos = event.position;
+                    if self.try_report_motion() {
+                        continue;
+                    }
                     self.pointer_drag();
                 }
                 PointerEventKind::Press {
@@ -1112,14 +1228,32 @@ impl PointerHandler for App {
                 } => {
                     self.serial = *serial;
                     self.pointer_pos = event.position;
+                    if let Some(code) = button_code(*button)
+                        && self.try_report_button(code, true)
+                    {
+                        self.pressed_button = Some(code);
+                        continue;
+                    }
                     match *button {
                         BTN_LEFT => self.pointer_press(*time),
                         BTN_MIDDLE => self.paste_primary(),
                         _ => {}
                     }
                 }
-                PointerEventKind::Release { button, .. } if *button == BTN_LEFT => {
-                    self.pointer_release(qh);
+                PointerEventKind::Release { button, .. } => {
+                    self.pointer_pos = event.position;
+                    let code = button_code(*button);
+                    if let Some(code) = code
+                        && self.try_report_button(code, false)
+                    {
+                        if self.pressed_button == Some(code) {
+                            self.pressed_button = None;
+                        }
+                        continue;
+                    }
+                    if *button == BTN_LEFT {
+                        self.pointer_release(qh);
+                    }
                 }
                 PointerEventKind::Axis { vertical, .. } => {
                     // Wheel notches arrive as value120 (÷120) or legacy discrete
@@ -1136,9 +1270,18 @@ impl PointerHandler for App {
                     if raw == 0.0 {
                         continue;
                     }
+                    let lines = (raw.abs() * scale).ceil().max(1.0) as isize;
+                    // Reporting apps get wheel buttons (64 up / 65 down) as
+                    // presses, one per line, capped so a flick cannot flood.
+                    if self.mouse_reporting() {
+                        let code = if raw < 0.0 { 64 } else { 65 };
+                        for _ in 0..lines.clamp(1, 8) {
+                            self.try_report_button(code, true);
+                        }
+                        continue;
+                    }
                     // Positive axis = scroll down (toward live); the viewport
                     // scrolls the opposite way (negative offset delta).
-                    let lines = (raw.abs() * scale).ceil().max(1.0) as isize;
                     let delta = if raw < 0.0 { lines } else { -lines };
                     if let Some(session) = self.session.as_mut() {
                         session.term.scroll_view(delta);
