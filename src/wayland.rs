@@ -251,12 +251,11 @@ pub fn run(config: Config, config_path: Option<std::path::PathBuf>) -> anyhow::R
         data_device_manager,
         primary_manager,
         cursor_shape_manager,
-        cursor_shape_device: None,
         viewport,
         fractional_scale,
         scale120: 120,
-        data_device: None,
-        primary_device: None,
+        seats: Vec::new(),
+        active_seat: 0,
         copy_source: None,
         primary_source: None,
         clipboard: String::new(),
@@ -269,8 +268,6 @@ pub fn run(config: Config, config_path: Option<std::path::PathBuf>) -> anyhow::R
         pointer_pos: (0.0, 0.0),
         last_click: None,
         serial: 0,
-        keyboard: None,
-        pointer: None,
         modifiers: Modifiers::default(),
         // The PTY is spawned on the first configure, once the real window size
         // is known, so the shell starts at the final size and is not hit by a
@@ -386,6 +383,18 @@ struct Session {
     term: Term,
 }
 
+/// Input devices for one seat. Several seats can drive the single window; the
+/// most recently used one owns clipboard/primary claims.
+#[derive(Debug)]
+struct SeatData {
+    seat: wl_seat::WlSeat,
+    keyboard: Option<wl_keyboard::WlKeyboard>,
+    pointer: Option<wl_pointer::WlPointer>,
+    cursor_shape_device: Option<WpCursorShapeDeviceV1>,
+    data_device: Option<DataDevice>,
+    primary_device: Option<PrimarySelectionDevice>,
+}
+
 /// Window + Wayland client state shared across all protocol handlers.
 #[derive(Debug)]
 struct App {
@@ -402,15 +411,15 @@ struct App {
     primary_manager: Option<PrimarySelectionManagerState>,
     /// Sets the pointer to an I-beam over the window (cursor-shape-v1).
     cursor_shape_manager: Option<CursorShapeManager>,
-    cursor_shape_device: Option<WpCursorShapeDeviceV1>,
     /// Presents a scaled buffer at the logical surface size (viewporter).
     viewport: Option<WpViewport>,
     /// Per-surface fractional-scale object; kept alive to receive scale events.
     fractional_scale: Option<WpFractionalScaleV1>,
     /// Compositor's preferred scale in 120ths (120 = 1.0, 180 = 1.5).
     scale120: u32,
-    data_device: Option<DataDevice>,
-    primary_device: Option<PrimarySelectionDevice>,
+    /// One entry per seat; `active_seat` indexes the most recently used.
+    seats: Vec<SeatData>,
+    active_seat: usize,
     /// Held while we own the clipboard / primary selection, serving paste reads.
     copy_source: Option<CopyPasteSource>,
     primary_source: Option<PrimarySelectionSource>,
@@ -431,8 +440,6 @@ struct App {
     last_click: Option<(u32, usize, usize, u32)>,
     /// Most recent input serial, used to claim selections.
     serial: u32,
-    keyboard: Option<wl_keyboard::WlKeyboard>,
-    pointer: Option<wl_pointer::WlPointer>,
     modifiers: Modifiers,
     /// `None` until the first configure spawns the shell.
     session: Option<Session>,
@@ -803,6 +810,59 @@ impl App {
         v * f64::from(self.scale120) / 120.0
     }
 
+    /// The active seat (the one that most recently produced input).
+    fn active(&self) -> Option<&SeatData> {
+        self.seats.get(self.active_seat)
+    }
+
+    /// The active seat's clipboard device, if any.
+    fn data_device(&self) -> Option<&DataDevice> {
+        self.active().and_then(|s| s.data_device.as_ref())
+    }
+
+    /// The active seat's primary-selection device, if any.
+    fn primary_device(&self) -> Option<&PrimarySelectionDevice> {
+        self.active().and_then(|s| s.primary_device.as_ref())
+    }
+
+    /// Find (or create) the per-seat entry for `seat`, returning its index.
+    fn seat_index(&mut self, seat: &wl_seat::WlSeat) -> usize {
+        if let Some(i) = self.seats.iter().position(|s| &s.seat == seat) {
+            return i;
+        }
+        self.seats.push(SeatData {
+            seat: seat.clone(),
+            keyboard: None,
+            pointer: None,
+            cursor_shape_device: None,
+            data_device: None,
+            primary_device: None,
+        });
+        self.seats.len() - 1
+    }
+
+    /// Mark the seat owning `keyboard` as active for clipboard ownership.
+    fn activate_keyboard(&mut self, keyboard: &wl_keyboard::WlKeyboard) {
+        if let Some(i) = self
+            .seats
+            .iter()
+            .position(|s| s.keyboard.as_ref() == Some(keyboard))
+        {
+            self.active_seat = i;
+        }
+    }
+
+    /// Mark the seat owning `pointer` as active for clipboard ownership.
+    fn activate_pointer(&mut self, pointer: &wl_pointer::WlPointer) {
+        if let Some(i) = self
+            .seats
+            .iter()
+            .position(|s| s.pointer.as_ref() == Some(pointer))
+        {
+            self.active_seat = i;
+        }
+    }
+
     /// Map window pixel coordinates to an absolute `(row, col)` grid point.
     fn cell_at(&self, px: f64, py: f64) -> Option<(usize, usize)> {
         let session = self.session.as_ref()?;
@@ -1028,7 +1088,7 @@ impl App {
 
     /// Take ownership of the CLIPBOARD selection, serving `text` to pasters.
     fn claim_clipboard(&mut self, text: String, qh: &QueueHandle<App>) {
-        let Some(device) = self.data_device.as_ref() else {
+        let Some(device) = self.data_device() else {
             return;
         };
         let source = self
@@ -1041,8 +1101,7 @@ impl App {
 
     /// Take ownership of the primary selection, serving `text` to pasters.
     fn claim_primary(&mut self, text: String, qh: &QueueHandle<App>) {
-        let (Some(manager), Some(device)) =
-            (self.primary_manager.as_ref(), self.primary_device.as_ref())
+        let (Some(manager), Some(device)) = (self.primary_manager.as_ref(), self.primary_device())
         else {
             return;
         };
@@ -1100,11 +1159,7 @@ impl App {
 
     /// Paste the CLIPBOARD selection into the shell (Ctrl+Shift+V).
     fn paste_clipboard(&mut self) {
-        let Some(offer) = self
-            .data_device
-            .as_ref()
-            .and_then(|d| d.data().selection_offer())
-        else {
+        let Some(offer) = self.data_device().and_then(|d| d.data().selection_offer()) else {
             return;
         };
         let Some(mime) = offer.with_mime_types(pick_mime) else {
@@ -1118,8 +1173,7 @@ impl App {
     /// Paste the primary selection into the shell (middle click).
     fn paste_primary(&mut self) {
         let Some(offer) = self
-            .primary_device
-            .as_ref()
+            .primary_device()
             .and_then(|d| d.data().selection_offer())
         else {
             return;
@@ -1551,7 +1605,17 @@ impl SeatHandler for App {
         &mut self.seat_state
     }
 
-    fn new_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
+    fn new_seat(&mut self, _: &Connection, qh: &QueueHandle<Self>, seat: wl_seat::WlSeat) {
+        // Clipboard/primary devices are seat-scoped, not capability-scoped.
+        let data_device = Some(self.data_device_manager.get_data_device(qh, &seat));
+        let primary_device = self
+            .primary_manager
+            .as_ref()
+            .map(|m| m.get_selection_device(qh, &seat));
+        let i = self.seat_index(&seat);
+        self.seats[i].data_device = data_device;
+        self.seats[i].primary_device = primary_device;
+    }
 
     fn new_capability(
         &mut self,
@@ -1560,16 +1624,8 @@ impl SeatHandler for App {
         seat: wl_seat::WlSeat,
         capability: Capability,
     ) {
-        if self.data_device.is_none() {
-            self.data_device = Some(self.data_device_manager.get_data_device(qh, &seat));
-        }
-        if self.primary_device.is_none() {
-            self.primary_device = self
-                .primary_manager
-                .as_ref()
-                .map(|m| m.get_selection_device(qh, &seat));
-        }
-        if capability == Capability::Keyboard && self.keyboard.is_none() {
+        let i = self.seat_index(&seat);
+        if capability == Capability::Keyboard && self.seats[i].keyboard.is_none() {
             // get_keyboard_with_repeat drives key repeat off a calloop timer and
             // delivers each repeat through the callback.
             let loop_handle = self.loop_handle.clone();
@@ -1581,18 +1637,18 @@ impl SeatHandler for App {
                 Box::new(|app: &mut App, _kbd, event| app.handle_key(&event)),
             );
             match keyboard {
-                Ok(keyboard) => self.keyboard = Some(keyboard),
+                Ok(keyboard) => self.seats[i].keyboard = Some(keyboard),
                 Err(err) => tracing::warn!("get keyboard: {err}"),
             }
         }
-        if capability == Capability::Pointer && self.pointer.is_none() {
+        if capability == Capability::Pointer && self.seats[i].pointer.is_none() {
             match self.seat_state.get_pointer(qh, &seat) {
                 Ok(pointer) => {
-                    self.cursor_shape_device = self
+                    self.seats[i].cursor_shape_device = self
                         .cursor_shape_manager
                         .as_ref()
                         .map(|m| m.get_shape_device(&pointer, qh));
-                    self.pointer = Some(pointer);
+                    self.seats[i].pointer = Some(pointer);
                 }
                 Err(err) => tracing::warn!("get pointer: {err}"),
             }
@@ -1603,17 +1659,21 @@ impl SeatHandler for App {
         &mut self,
         _: &Connection,
         _: &QueueHandle<Self>,
-        _: wl_seat::WlSeat,
+        seat: wl_seat::WlSeat,
         capability: Capability,
     ) {
+        let Some(s) = self.seats.iter_mut().find(|s| s.seat == seat) else {
+            return;
+        };
         match capability {
             Capability::Keyboard => {
-                if let Some(keyboard) = self.keyboard.take() {
+                if let Some(keyboard) = s.keyboard.take() {
                     keyboard.release();
                 }
             }
             Capability::Pointer => {
-                if let Some(pointer) = self.pointer.take() {
+                s.cursor_shape_device = None;
+                if let Some(pointer) = s.pointer.take() {
                     pointer.release();
                 }
             }
@@ -1621,7 +1681,10 @@ impl SeatHandler for App {
         }
     }
 
-    fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
+    fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, seat: wl_seat::WlSeat) {
+        self.seats.retain(|s| s.seat != seat);
+        self.active_seat = self.active_seat.min(self.seats.len().saturating_sub(1));
+    }
 }
 
 impl KeyboardHandler for App {
@@ -1629,12 +1692,13 @@ impl KeyboardHandler for App {
         &mut self,
         _: &Connection,
         _: &QueueHandle<Self>,
-        _: &wl_keyboard::WlKeyboard,
+        keyboard: &wl_keyboard::WlKeyboard,
         _: &wl_surface::WlSurface,
         serial: u32,
         _: &[u32],
         _: &[Keysym],
     ) {
+        self.activate_keyboard(keyboard);
         self.serial = serial;
         self.focused = true;
         self.report_focus(true);
@@ -1658,10 +1722,11 @@ impl KeyboardHandler for App {
         &mut self,
         _: &Connection,
         _: &QueueHandle<Self>,
-        _: &wl_keyboard::WlKeyboard,
+        keyboard: &wl_keyboard::WlKeyboard,
         serial: u32,
         event: KeyEvent,
     ) {
+        self.activate_keyboard(keyboard);
         self.serial = serial;
         self.handle_key(&event);
     }
@@ -1739,15 +1804,21 @@ impl PointerHandler for App {
         &mut self,
         _: &Connection,
         qh: &QueueHandle<Self>,
-        _: &wl_pointer::WlPointer,
+        pointer: &wl_pointer::WlPointer,
         events: &[PointerEvent],
     ) {
+        self.activate_pointer(pointer);
         let cell_h = f64::from(self.renderer.metrics().height);
         for event in events {
             match &event.kind {
                 PointerEventKind::Enter { serial } => {
                     self.pointer_pos = event.position;
-                    if let Some(device) = self.cursor_shape_device.as_ref() {
+                    let device = self
+                        .seats
+                        .iter()
+                        .find(|s| s.pointer.as_ref() == Some(pointer))
+                        .and_then(|s| s.cursor_shape_device.as_ref());
+                    if let Some(device) = device {
                         device.set_shape(*serial, Shape::Text);
                     }
                     self.pointer_drag();
