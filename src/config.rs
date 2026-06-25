@@ -16,6 +16,7 @@ pub struct Config {
     pub cursor: Cursor,
     pub scrollback: Scrollback,
     pub bell: Bell,
+    pub mouse: Mouse,
     /// Chord → action, e.g. `"Ctrl+Shift+C" = "copy"`. Merged over the defaults;
     /// a value of `"none"` unbinds.
     pub key_bindings: std::collections::HashMap<String, String>,
@@ -39,6 +40,27 @@ pub struct Cursor {
 pub struct Bell {
     /// Briefly flash the screen.
     pub visual: bool,
+}
+
+/// `[mouse]`: pointer and wheel behaviour.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct Mouse {
+    /// Multiplier applied to the lines scrolled per wheel notch.
+    pub scroll_multiplier: f64,
+    /// On the alternate screen, translate the wheel into arrow-key presses so
+    /// full-screen apps that did not request mouse reporting (less, man, …)
+    /// still scroll.
+    pub alternate_scroll: bool,
+}
+
+impl Default for Mouse {
+    fn default() -> Self {
+        Self {
+            scroll_multiplier: 1.0,
+            alternate_scroll: true,
+        }
+    }
 }
 
 /// `[colors]`: foreground/background, the 16 base palette entries, and accents.

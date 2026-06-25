@@ -641,6 +641,24 @@ impl App {
         }
     }
 
+    /// Send `count` cursor-up/down keys to the shell for alternate-scroll,
+    /// honouring the application cursor-key mode (DECCKM).
+    fn alternate_scroll(&mut self, up: bool, count: isize) {
+        let app_cursor = self
+            .session
+            .as_ref()
+            .is_some_and(|s| s.term.grid().app_cursor());
+        let seq: &[u8] = match (up, app_cursor) {
+            (true, false) => b"\x1b[A",
+            (true, true) => b"\x1bOA",
+            (false, false) => b"\x1b[B",
+            (false, true) => b"\x1bOB",
+        };
+        for _ in 0..count {
+            self.write_to_pty(seq);
+        }
+    }
+
     /// Scroll the viewport one page back (`up`) or toward the live screen.
     fn scroll_page(&mut self, up: bool) {
         if let Some(session) = self.session.as_mut() {
@@ -1955,19 +1973,32 @@ impl PointerHandler for App {
                     if raw == 0.0 {
                         continue;
                     }
-                    let lines = (raw.abs() * scale).ceil().max(1.0) as isize;
+                    let mult = self.config.mouse.scroll_multiplier.max(0.0);
+                    let lines = (raw.abs() * scale * mult).ceil().max(1.0) as isize;
+                    let up = raw < 0.0;
                     // Reporting apps get wheel buttons (64 up / 65 down) as
                     // presses, one per line, capped so a flick cannot flood.
                     if self.mouse_reporting() {
-                        let code = if raw < 0.0 { 64 } else { 65 };
+                        let code = if up { 64 } else { 65 };
                         for _ in 0..lines.clamp(1, 8) {
                             self.try_report_button(code, true);
                         }
                         continue;
                     }
+                    // On the alternate screen there is no scrollback to move, so
+                    // (when enabled) translate the wheel into cursor-key presses
+                    // for apps that did not request mouse reporting.
+                    let alt = self
+                        .session
+                        .as_ref()
+                        .is_some_and(|s| s.term.grid().alt_active());
+                    if alt && self.config.mouse.alternate_scroll {
+                        self.alternate_scroll(up, lines.clamp(1, 8));
+                        continue;
+                    }
                     // Positive axis = scroll down (toward live); the viewport
                     // scrolls the opposite way (negative offset delta).
-                    let delta = if raw < 0.0 { lines } else { -lines };
+                    let delta = if up { lines } else { -lines };
                     if let Some(session) = self.session.as_mut() {
                         session.term.scroll_view(delta);
                         self.needs_draw = true;
