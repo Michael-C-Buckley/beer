@@ -53,9 +53,21 @@ table of _beer.toml_(5).
 :  Reset the font size
 |  F11
 :  Toggle fullscreen
+|  Ctrl+Shift+N
+:  Open a new window in the shell's current directory
+|  Ctrl+Shift+Up / Ctrl+Shift+Down
+:  Jump to the previous / next shell prompt (OSC 133)
+|  Ctrl+Shift+O
+:  Enter URL hint mode
+
+The *pipe-command-output* action (unbound by default) feeds the last command's
+output to the configured command; see *shell-integration* in _beer.toml_(5).
 
 In incremental search, type to refine the query, *Up*/*Return* jumps to the
 previous match, *Down* to the next, and *Escape* exits.
+
+In URL hint mode each visible URL is tagged with a label; type the label to open
+the URL in the configured launcher, or press *Escape* to cancel.
 
 # MOUSE
 
@@ -63,7 +75,15 @@ Left-click and drag selects text; double-click selects a word, triple-click a
 line, and Ctrl+drag selects a rectangular block. The selection is copied to the
 primary selection on release; middle-click pastes it. The wheel scrolls
 history. Holding *Shift* forces local selection even while an application has
-requested mouse reporting.
+requested mouse reporting. Clicking an *OSC 8* hyperlink opens it; hovering one
+underlines it.
+
+# SHELL INTEGRATION
+
+With a shell configured to emit them, *beer* tracks the working directory
+(*OSC 7*, used by new windows) and prompt marks (*OSC 133*) for prompt jumping
+and piping the last command's output. Applications may raise desktop
+notifications via *OSC 9*, *OSC 777*, and *OSC 99*.
 
 # ENVIRONMENT
 

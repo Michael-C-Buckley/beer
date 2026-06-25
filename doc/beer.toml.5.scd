@@ -82,6 +82,14 @@ channel).
 *visual* = _bool_
 	Briefly flash the screen on the terminal bell. Default _false_.
 
+*command* = _[argv]_
+	Command run on the bell, e.g. _["paplay", "/usr/share/sounds/bell.oga"]_.
+	Unset runs nothing.
+
+*urgent* = _bool_
+	Request the compositor's attention (xdg-activation) when the bell rings
+	while the window is unfocused. Default _false_.
+
 # [mouse]
 
 *scroll-multiplier* = _float_
@@ -100,13 +108,34 @@ _"none"_ unbinds the chord.
 
 Recognized actions: _copy_, _paste_, _paste-primary_, _scrollback-up_,
 _scrollback-down_, _scrollback-top_, _scrollback-bottom_, _search_,
-_font-increase_, _font-decrease_, _font-reset_, _fullscreen_.
+_font-increase_, _font-decrease_, _font-reset_, _fullscreen_, _new-window_,
+_jump-prompt-up_, _jump-prompt-down_, _pipe-command-output_, _url-mode_.
 
 ```
 [key-bindings]
 "Ctrl+Shift+C" = "copy"
 "Ctrl+grave" = "none"
 ```
+
+# [shell-integration]
+
+Behaviour driven by *OSC 7* (cwd) and *OSC 133* (prompt) marks.
+
+*pipe-command* = _[argv]_
+	Command the _pipe-command-output_ binding feeds the last command's output
+	to on stdin, e.g. _["less"]_. Empty (the default) disables the action.
+
+# [url]
+
+*launch* = _[argv]_
+	Launcher the URL is appended to when an _OSC 8_ hyperlink is clicked or a
+	hint-mode label is chosen. Default _["xdg-open"]_.
+
+# [notify]
+
+*command* = _[argv]_
+	Notifier for desktop notifications (_OSC 9_/_777_/_99_); the title and body
+	are appended as the final two arguments. Default _["notify-send"]_.
 
 # [text-bindings]
 
