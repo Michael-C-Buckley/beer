@@ -180,6 +180,7 @@ impl Term {
                 (true, 1) => self.grid.set_app_cursor(on),
                 (true, 25) => self.grid.set_cursor_visible(on),
                 (true, 2004) => self.grid.set_bracketed_paste(on),
+                (true, 2026) => self.grid.set_sync(on),
                 // App-cursor/bracketed-paste/mouse/sync modes affect input and
                 // rendering, which arrive with the keyboard and renderer.
                 _ => tracing::trace!("unhandled mode {code} private={private} on={on}"),
@@ -281,6 +282,8 @@ impl Term {
             (true, 6) => set_reset(self.grid.origin()),
             (true, 7) => set_reset(self.grid.autowrap()),
             (true, 47 | 1047 | 1049) => set_reset(self.grid.alt_active()),
+            (true, 2004) => set_reset(self.grid.bracketed_paste()),
+            (true, 2026) => set_reset(self.grid.sync_active()),
             (false, 4) => set_reset(self.grid.insert()),
             _ => 0,
         };
@@ -711,6 +714,20 @@ mod tests {
         assert_eq!(t.take_response(), b"\x1bP1+r544e=62656572\x1b\\"); // = "beer"
         feed(&mut t, b"\x1bP+q6162\x1b\\"); // "ab", unknown
         assert_eq!(t.take_response(), b"\x1bP0+r6162\x1b\\");
+    }
+
+    #[test]
+    fn bracketed_paste_and_sync_modes() {
+        let mut t = Term::new(20, 2);
+        feed(&mut t, b"\x1b[?2004h");
+        assert!(t.grid().bracketed_paste());
+        feed(&mut t, b"\x1b[?2004$p");
+        assert_eq!(t.take_response(), b"\x1b[?2004;1$y");
+        feed(&mut t, b"\x1b[?2026h");
+        assert!(t.grid().sync_active());
+        feed(&mut t, b"\x1b[?2026l\x1b[?2026$p");
+        assert!(!t.grid().sync_active());
+        assert_eq!(t.take_response(), b"\x1b[?2026;2$y");
     }
 
     #[test]

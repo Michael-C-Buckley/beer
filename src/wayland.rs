@@ -14,7 +14,7 @@ use std::time::Duration;
 use anyhow::Context;
 use calloop::generic::Generic;
 use calloop::timer::{TimeoutAction, Timer};
-use calloop::{EventLoop, Interest, LoopHandle, Mode, PostAction};
+use calloop::{EventLoop, Interest, LoopHandle, Mode, PostAction, RegistrationToken};
 use calloop_wayland_source::WaylandSource;
 
 use crate::font::Fonts;
@@ -98,6 +98,10 @@ const BLINK_MS: u64 = 500;
 
 /// Buffers kept for double/triple buffering before we wait for a release.
 const MAX_BUFFERS: usize = 3;
+
+/// How long synchronized output (DECSET 2026) may hold the screen before we
+/// present anyway, so a misbehaving app cannot freeze the window.
+const SYNC_TIMEOUT_MS: u64 = 150;
 
 /// What determines one rendered row's pixels: its cells, the cursor on it, the
 /// selection span over it, and the blink phase. Two equal `RowSnap`s render
@@ -220,6 +224,7 @@ pub fn run() -> anyhow::Result<ExitCode> {
         frames: Vec::new(),
         buf_dims: (0, 0),
         blink_on: true,
+        sync_timeout: None,
         focused: true,
         exit: false,
         exit_code: ExitCode::SUCCESS,
@@ -325,6 +330,8 @@ struct App {
     buf_dims: (u32, u32),
     /// Current blink phase, toggled by a timer; off hides blinking ink.
     blink_on: bool,
+    /// Armed while synchronized output holds the screen, to force it open.
+    sync_timeout: Option<RegistrationToken>,
     /// Whether the toplevel currently has keyboard focus (drives the cursor).
     focused: bool,
     exit: bool,
@@ -696,8 +703,34 @@ impl App {
 
     /// Present a frame if one is wanted and the compositor is ready for it.
     /// Called after every event-loop wake; the frame-callback gate keeps draws
-    /// paced to the display instead of one per PTY read.
+    /// paced to the display instead of one per PTY read. While the app holds
+    /// synchronized output (DECSET 2026) we withhold the frame, but arm a
+    /// timeout so a stuck `2026h` cannot freeze the window.
     fn flush(&mut self) {
+        let sync = self
+            .session
+            .as_ref()
+            .is_some_and(|s| s.term.grid().sync_active());
+        if sync {
+            if self.sync_timeout.is_none() {
+                let timer = Timer::from_duration(Duration::from_millis(SYNC_TIMEOUT_MS));
+                self.sync_timeout = self
+                    .loop_handle
+                    .insert_source(timer, |_, _, app: &mut App| {
+                        if let Some(session) = app.session.as_mut() {
+                            session.term.grid_mut().set_sync(false);
+                        }
+                        app.sync_timeout = None;
+                        app.needs_draw = true;
+                        TimeoutAction::Drop
+                    })
+                    .ok();
+            }
+            return;
+        }
+        if let Some(token) = self.sync_timeout.take() {
+            self.loop_handle.remove(token);
+        }
         if self.needs_draw && !self.frame_pending && self.session.is_some() {
             self.present();
         }

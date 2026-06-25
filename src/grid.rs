@@ -151,6 +151,9 @@ pub struct Grid {
     selection: Option<(Point, Point)>,
     /// Bracketed paste mode (DECSET 2004): wrap pasted text in `ESC[200~`/`201~`.
     bracketed_paste: bool,
+    /// Synchronized output (DECSET 2026): hold presentation while a frame is
+    /// being assembled, so the screen never shows a half-drawn update.
+    sync: bool,
 }
 
 fn default_tabs(cols: usize) -> Vec<bool> {
@@ -185,6 +188,7 @@ impl Grid {
             app_cursor: false,
             selection: None,
             bracketed_paste: false,
+            sync: false,
         }
     }
 
@@ -880,6 +884,14 @@ impl Grid {
 
     pub fn bracketed_paste(&self) -> bool {
         self.bracketed_paste
+    }
+
+    pub fn set_sync(&mut self, on: bool) {
+        self.sync = on;
+    }
+
+    pub fn sync_active(&self) -> bool {
+        self.sync
     }
 
     // --- inspection (logging + tests) ---
