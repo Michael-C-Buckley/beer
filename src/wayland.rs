@@ -22,6 +22,9 @@ use crate::grid::{Cell, CursorShape, Grid};
 use crate::pty::Pty;
 use crate::render::Renderer;
 use crate::vt::Term;
+use smithay_client_toolkit::reexports::protocols::wp::cursor_shape::v1::client::wp_cursor_shape_device_v1::{
+    Shape, WpCursorShapeDeviceV1,
+};
 use smithay_client_toolkit::reexports::protocols::wp::primary_selection::zv1::client::{
     zwp_primary_selection_device_v1::ZwpPrimarySelectionDeviceV1,
     zwp_primary_selection_source_v1::ZwpPrimarySelectionSourceV1,
@@ -48,7 +51,10 @@ use smithay_client_toolkit::{
     seat::{
         Capability, SeatHandler, SeatState,
         keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers, RawModifiers, RepeatInfo},
-        pointer::{BTN_LEFT, BTN_MIDDLE, PointerEvent, PointerEventKind, PointerHandler},
+        pointer::{
+            BTN_LEFT, BTN_MIDDLE, PointerEvent, PointerEventKind, PointerHandler,
+            cursor_shape::CursorShapeManager,
+        },
     },
     shell::{
         WaylandSurface,
@@ -172,6 +178,7 @@ pub fn run() -> anyhow::Result<ExitCode> {
     let data_device_manager = DataDeviceManagerState::bind(&globals, &qh)
         .context("wl_data_device_manager not available")?;
     let primary_manager = PrimarySelectionManagerState::bind(&globals, &qh).ok();
+    let cursor_shape_manager = CursorShapeManager::bind(&globals, &qh).ok();
 
     let surface = compositor.create_surface(&qh);
     let window = xdg_shell.create_window(surface, WindowDecorations::RequestServer, &qh);
@@ -199,6 +206,8 @@ pub fn run() -> anyhow::Result<ExitCode> {
         qh: qh.clone(),
         data_device_manager,
         primary_manager,
+        cursor_shape_manager,
+        cursor_shape_device: None,
         data_device: None,
         primary_device: None,
         copy_source: None,
@@ -297,6 +306,9 @@ struct App {
     qh: QueueHandle<App>,
     data_device_manager: DataDeviceManagerState,
     primary_manager: Option<PrimarySelectionManagerState>,
+    /// Sets the pointer to an I-beam over the window (cursor-shape-v1).
+    cursor_shape_manager: Option<CursorShapeManager>,
+    cursor_shape_device: Option<WpCursorShapeDeviceV1>,
     data_device: Option<DataDevice>,
     primary_device: Option<PrimarySelectionDevice>,
     /// Held while we own the clipboard / primary selection, serving paste reads.
@@ -948,7 +960,13 @@ impl SeatHandler for App {
         }
         if capability == Capability::Pointer && self.pointer.is_none() {
             match self.seat_state.get_pointer(qh, &seat) {
-                Ok(pointer) => self.pointer = Some(pointer),
+                Ok(pointer) => {
+                    self.cursor_shape_device = self
+                        .cursor_shape_manager
+                        .as_ref()
+                        .map(|m| m.get_shape_device(&pointer, qh));
+                    self.pointer = Some(pointer);
+                }
                 Err(err) => tracing::warn!("get pointer: {err}"),
             }
         }
@@ -1075,7 +1093,14 @@ impl PointerHandler for App {
         let cell_h = f64::from(self.renderer.metrics().height);
         for event in events {
             match &event.kind {
-                PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => {
+                PointerEventKind::Enter { serial } => {
+                    self.pointer_pos = event.position;
+                    if let Some(device) = self.cursor_shape_device.as_ref() {
+                        device.set_shape(*serial, Shape::Text);
+                    }
+                    self.pointer_drag();
+                }
+                PointerEventKind::Motion { .. } => {
                     self.pointer_pos = event.position;
                     self.pointer_drag();
                 }
