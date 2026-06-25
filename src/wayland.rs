@@ -196,13 +196,14 @@ pub fn run(config: Config) -> anyhow::Result<ExitCode> {
     window.commit();
 
     let fonts = Fonts::new(&config.main.font, config.main.font_size).context("load font")?;
-    let renderer = Renderer::new(fonts);
+    let mut renderer = Renderer::new(fonts);
+    renderer.set_padding(config.main.pad_x, config.main.pad_y);
 
-    // Start at the configured cell geometry; the compositor may override it on
-    // the first configure.
+    // Start at the configured cell geometry plus padding; the compositor may
+    // override it on the first configure.
     let m = renderer.metrics();
-    let width = (u32::from(config.main.initial_cols) * m.width).max(1);
-    let height = (u32::from(config.main.initial_rows) * m.height).max(1);
+    let width = (u32::from(config.main.initial_cols) * m.width + 2 * config.main.pad_x).max(1);
+    let height = (u32::from(config.main.initial_rows) * m.height + 2 * config.main.pad_y).max(1);
     let pool = SlotPool::new(
         (width * height * 4).max(DEFAULT_W * DEFAULT_H) as usize,
         &shm,
@@ -285,10 +286,16 @@ pub fn run(config: Config) -> anyhow::Result<ExitCode> {
     Ok(app.exit_code)
 }
 
-/// Columns and rows that fit a `width`×`height` px window at `metrics`.
-fn grid_size(metrics: crate::font::CellMetrics, width: u32, height: u32) -> (u16, u16) {
-    let cols = (width / metrics.width).max(1);
-    let rows = (height / metrics.height).max(1);
+/// Columns and rows that fit a `width`×`height` px window at `metrics`, after
+/// reserving `2 * pad` pixels of inner padding on each axis.
+fn grid_size(
+    metrics: crate::font::CellMetrics,
+    width: u32,
+    height: u32,
+    pad: (u32, u32),
+) -> (u16, u16) {
+    let cols = (width.saturating_sub(2 * pad.0) / metrics.width).max(1);
+    let rows = (height.saturating_sub(2 * pad.1) / metrics.height).max(1);
     (cols as u16, rows as u16)
 }
 
@@ -387,7 +394,12 @@ struct App {
 impl App {
     /// Spawn the shell at the current window size and start reading its output.
     fn spawn_session(&mut self) {
-        let (cols, rows) = grid_size(self.renderer.metrics(), self.width, self.height);
+        let (cols, rows) = grid_size(
+            self.renderer.metrics(),
+            self.width,
+            self.height,
+            (self.config.main.pad_x, self.config.main.pad_y),
+        );
         let pty = match Pty::spawn(cols, rows, &self.config.main.term) {
             Ok(pty) => pty,
             Err(err) => {
@@ -557,13 +569,24 @@ impl App {
         self.needs_draw = true;
     }
 
+    /// Inner padding `(x, y)` in pixels.
+    fn padding(&self) -> (f64, f64) {
+        (
+            f64::from(self.config.main.pad_x),
+            f64::from(self.config.main.pad_y),
+        )
+    }
+
     /// Map window pixel coordinates to an absolute `(row, col)` grid point.
     fn cell_at(&self, px: f64, py: f64) -> Option<(usize, usize)> {
         let session = self.session.as_ref()?;
         let m = self.renderer.metrics();
+        let (pad_x, pad_y) = self.padding();
         let grid = session.term.grid();
-        let col = (px.max(0.0) as usize / m.width as usize).min(grid.cols().saturating_sub(1));
-        let vrow = (py.max(0.0) as usize / m.height as usize).min(grid.rows().saturating_sub(1));
+        let col =
+            ((px - pad_x).max(0.0) as usize / m.width as usize).min(grid.cols().saturating_sub(1));
+        let vrow =
+            ((py - pad_y).max(0.0) as usize / m.height as usize).min(grid.rows().saturating_sub(1));
         Some((grid.view_to_abs(vrow), col))
     }
 
@@ -683,10 +706,11 @@ impl App {
     fn report_screen_cell(&self) -> Option<(usize, usize)> {
         let session = self.session.as_ref()?;
         let m = self.renderer.metrics();
+        let (pad_x, pad_y) = self.padding();
         let grid = session.term.grid();
-        let col = (self.pointer_pos.0.max(0.0) as usize / m.width as usize)
+        let col = ((self.pointer_pos.0 - pad_x).max(0.0) as usize / m.width as usize)
             .min(grid.cols().saturating_sub(1));
-        let row = (self.pointer_pos.1.max(0.0) as usize / m.height as usize)
+        let row = ((self.pointer_pos.1 - pad_y).max(0.0) as usize / m.height as usize)
             .min(grid.rows().saturating_sub(1));
         Some((col, row))
     }
@@ -968,7 +992,12 @@ impl App {
     /// Recompute the grid size for the current window and tell the grid and the
     /// PTY about it if it changed.
     fn resize_grid(&mut self) {
-        let (cols, rows) = grid_size(self.renderer.metrics(), self.width, self.height);
+        let (cols, rows) = grid_size(
+            self.renderer.metrics(),
+            self.width,
+            self.height,
+            (self.config.main.pad_x, self.config.main.pad_y),
+        );
         let Some(session) = self.session.as_mut() else {
             return;
         };
@@ -1122,6 +1151,10 @@ impl App {
             return;
         }
 
+        // A buffer used for the first time has uninitialized margins; paint the
+        // whole thing (background + padding) once, then damage it in full below.
+        let fresh = self.frames[idx].rows.is_empty();
+        let pad_y = self.config.main.pad_y as i32;
         let Some(canvas) = self.pool.canvas(&self.frames[idx].buffer) else {
             return;
         };
@@ -1131,6 +1164,9 @@ impl App {
             focused,
             blink_on,
         };
+        if fresh {
+            self.renderer.clear(canvas, dims, theme);
+        }
         for &y in &dirty {
             self.renderer.render_row(canvas, dims, grid, &frame, y);
         }
@@ -1138,7 +1174,8 @@ impl App {
         if let Some(text) = &bar_text
             && dirty.contains(&(rows - 1))
         {
-            self.renderer.render_search_bar(canvas, dims, theme, text);
+            self.renderer
+                .render_search_bar(canvas, dims, theme, rows - 1, text);
         }
         self.frames[idx].rows = cur;
 
@@ -1147,9 +1184,13 @@ impl App {
             tracing::error!("attach buffer: {err}");
             return;
         }
-        for &y in &dirty {
-            let top = y as i32 * m.height as i32;
-            surface.damage_buffer(0, top, w as i32, m.height as i32);
+        if fresh {
+            surface.damage_buffer(0, 0, w as i32, h as i32);
+        } else {
+            for &y in &dirty {
+                let top = pad_y + y as i32 * m.height as i32;
+                surface.damage_buffer(0, top, w as i32, m.height as i32);
+            }
         }
         surface.frame(&self.qh, surface.clone());
         self.window.commit();

@@ -52,6 +52,9 @@ pub struct Main {
     /// Initial size in character cells.
     pub initial_cols: u16,
     pub initial_rows: u16,
+    /// Inner padding in pixels between the window edge and the cell grid.
+    pub pad_x: u32,
+    pub pad_y: u32,
     /// Characters that break a word for double-click selection. Empty/unset
     /// keeps the built-in default.
     pub word_delimiters: Option<String>,
@@ -65,6 +68,8 @@ impl Default for Main {
             term: "beer".to_string(),
             initial_cols: 80,
             initial_rows: 24,
+            pad_x: 2,
+            pad_y: 2,
             word_delimiters: None,
         }
     }

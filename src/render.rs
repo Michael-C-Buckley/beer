@@ -99,15 +99,34 @@ pub struct Frame<'a> {
 #[derive(Debug)]
 pub struct Renderer {
     fonts: Fonts,
+    /// Inner padding `(x, y)` in pixels between the window edge and the grid.
+    pad: (i32, i32),
 }
 
 impl Renderer {
     pub fn new(fonts: Fonts) -> Self {
-        Self { fonts }
+        Self { fonts, pad: (0, 0) }
     }
 
     pub fn metrics(&self) -> CellMetrics {
         self.fonts.metrics()
+    }
+
+    pub fn set_padding(&mut self, pad_x: u32, pad_y: u32) {
+        self.pad = (pad_x as i32, pad_y as i32);
+    }
+
+    /// Fill the whole buffer (including the padding margins) with the background
+    /// colour. Called once per fresh shm buffer; per-row repaints then leave the
+    /// margins untouched.
+    pub fn clear(&self, pixels: &mut [u8], dims: (usize, usize), theme: &Theme) {
+        let (width, height) = dims;
+        let mut canvas = Canvas {
+            pixels,
+            width,
+            height,
+        };
+        canvas.fill_rect_a(0, 0, width as u32, height as u32, theme.bg, theme.alpha);
     }
 
     /// Repaint a single grid row `y` into `pixels` (BGRA, `width`×`height` px):
@@ -132,8 +151,9 @@ impl Renderer {
             height,
         };
         let m = self.fonts.metrics();
+        let (pad_x, pad_y) = self.pad;
         let cols = grid.cols();
-        let row_top = y as i32 * m.height as i32;
+        let row_top = pad_y + y as i32 * m.height as i32;
         canvas.fill_rect_a(0, row_top, width as u32, m.height, theme.bg, theme.alpha);
 
         // Rows come through the scrollback viewport and may be shorter than
@@ -156,7 +176,13 @@ impl Renderer {
                 None => cell_colors(cell, theme).1,
             };
             if bg != theme.bg {
-                canvas.fill_rect(x as i32 * m.width as i32, row_top, m.width, m.height, bg);
+                canvas.fill_rect(
+                    pad_x + x as i32 * m.width as i32,
+                    row_top,
+                    m.width,
+                    m.height,
+                    bg,
+                );
             }
         }
 
@@ -168,7 +194,7 @@ impl Renderer {
                 continue;
             }
             let (fg, _) = cell_colors(cell, theme);
-            let origin_x = x as i32 * m.width as i32;
+            let origin_x = pad_x + x as i32 * m.width as i32;
             if cell.c != ' ' {
                 self.draw_glyph(&mut canvas, cell.c, cell_style(cell), origin_x, row_top, fg);
             }
@@ -189,6 +215,7 @@ impl Renderer {
         pixels: &mut [u8],
         dims: (usize, usize),
         theme: &Theme,
+        row: usize,
         text: &str,
     ) {
         let (width, height) = dims;
@@ -198,14 +225,14 @@ impl Renderer {
             height,
         };
         let m = self.fonts.metrics();
-        let rows = (height / m.height as usize).max(1);
-        let row_top = (rows - 1) as i32 * m.height as i32;
+        let (pad_x, pad_y) = self.pad;
+        let row_top = pad_y + row as i32 * m.height as i32;
         canvas.fill_rect(0, row_top, width as u32, m.height, theme.search_bar_bg);
         let style = Style {
             bold: false,
             italic: false,
         };
-        let mut x = 0i32;
+        let mut x = pad_x;
         for c in text.chars() {
             if x as usize + m.width as usize > width {
                 break;
@@ -232,8 +259,8 @@ impl Renderer {
             return;
         }
         let (cx, cy) = grid.cursor();
-        let x0 = cx as i32 * m.width as i32;
-        let top = cy as i32 * m.height as i32;
+        let x0 = self.pad.0 + cx as i32 * m.width as i32;
+        let top = self.pad.1 + cy as i32 * m.height as i32;
         // OSC 12 cursor colour wins, then the configured cursor colour, then fg.
         let color = grid
             .cursor_color()
