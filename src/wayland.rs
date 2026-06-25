@@ -213,6 +213,10 @@ pub fn run(config: Config) -> anyhow::Result<ExitCode> {
     )
     .context("create shm slot pool")?;
 
+    let bindings =
+        crate::bindings::Bindings::from_config(&config.key_bindings, &config.text_bindings);
+    let font_size = config.main.font_size;
+
     let mut app = App {
         registry_state: RegistryState::new(&globals),
         output_state: OutputState::new(&globals, &qh),
@@ -250,6 +254,9 @@ pub fn run(config: Config) -> anyhow::Result<ExitCode> {
         session: None,
         title: None,
         config,
+        bindings,
+        font_size,
+        fullscreen: false,
         width,
         height,
         needs_draw: false,
@@ -373,6 +380,12 @@ struct App {
     title: Option<String>,
     /// The active user configuration.
     config: Config,
+    /// Resolved key/text bindings.
+    bindings: crate::bindings::Bindings,
+    /// Current font size in pixels (changed by font-resize bindings).
+    font_size: u32,
+    /// Whether the toplevel is fullscreen.
+    fullscreen: bool,
     width: u32,
     height: u32,
     /// The grid changed and the window wants repainting on the next frame.
@@ -470,50 +483,22 @@ impl App {
         self.session = Some(Session { pty, term });
     }
 
-    /// Handle a key (initial press or repeat): Shift+PageUp/PageDown scroll the
-    /// viewport locally; anything else is encoded to the shell and snaps the
-    /// viewport back to the live screen.
+    /// Handle a key (initial press or repeat): configured bindings first, then
+    /// text bindings, else the byte encoding sent to the shell (which snaps the
+    /// viewport back to the live screen).
     fn handle_key(&mut self, event: &KeyEvent) {
-        // Ctrl+Shift+F toggles incremental search mode.
-        if self.modifiers.ctrl
-            && self.modifiers.shift
-            && matches!(event.keysym, Keysym::F | Keysym::f)
-        {
-            self.toggle_search();
-            return;
-        }
         // While searching, the keyboard edits the query and navigates matches.
         if self.searching {
             self.search_key(event);
             return;
         }
-        // Ctrl+Shift+C/V copy the selection and paste the clipboard; these take
-        // precedence over the control bytes the chord would otherwise encode.
-        if self.modifiers.ctrl && self.modifiers.shift {
-            match event.keysym {
-                Keysym::C | Keysym::c => {
-                    let qh = self.qh.clone();
-                    self.set_clipboard(&qh);
-                    return;
-                }
-                Keysym::V | Keysym::v => {
-                    self.paste_clipboard();
-                    return;
-                }
-                _ => {}
-            }
+        if let Some(action) = self.bindings.action(event, self.modifiers) {
+            self.dispatch_action(action);
+            return;
         }
-        if self.modifiers.shift && matches!(event.keysym, Keysym::Page_Up | Keysym::Page_Down) {
-            if let Some(session) = self.session.as_mut() {
-                let page = session.term.page() as isize;
-                let delta = if event.keysym == Keysym::Page_Up {
-                    page
-                } else {
-                    -page
-                };
-                session.term.scroll_view(delta);
-                self.needs_draw = true;
-            }
+        if let Some(text) = self.bindings.text(event, self.modifiers) {
+            let bytes = text.to_vec();
+            self.send_to_shell(&bytes);
             return;
         }
 
@@ -521,16 +506,89 @@ impl App {
             .session
             .as_ref()
             .is_some_and(|s| s.term.grid().app_cursor());
-        if let Some(bytes) = crate::input::encode(event, self.modifiers, app_cursor)
-            && let Some(session) = self.session.as_mut()
-        {
+        if let Some(bytes) = crate::input::encode(event, self.modifiers, app_cursor) {
+            self.send_to_shell(&bytes);
+        }
+    }
+
+    /// Write key/text bytes to the shell, snapping the viewport to the live
+    /// screen and clearing any selection first.
+    fn send_to_shell(&mut self, bytes: &[u8]) {
+        if let Some(session) = self.session.as_mut() {
             session.term.scroll_to_bottom();
             session.term.grid_mut().clear_selection();
             self.needs_draw = true;
-            if let Err(err) = write_all(session.pty.master(), &bytes) {
+            if let Err(err) = write_all(session.pty.master(), bytes) {
                 tracing::warn!("write key to pty: {err}");
             }
         }
+    }
+
+    /// Run a bound editor action.
+    fn dispatch_action(&mut self, action: crate::bindings::Action) {
+        use crate::bindings::Action;
+        match action {
+            Action::Copy => {
+                let qh = self.qh.clone();
+                self.set_clipboard(&qh);
+            }
+            Action::Paste => self.paste_clipboard(),
+            Action::PastePrimary => self.paste_primary(),
+            Action::ScrollPageUp => self.scroll_page(true),
+            Action::ScrollPageDown => self.scroll_page(false),
+            Action::ScrollTop => {
+                if let Some(session) = self.session.as_mut() {
+                    session.term.scroll_view(isize::MAX);
+                    self.needs_draw = true;
+                }
+            }
+            Action::ScrollBottom => {
+                if let Some(session) = self.session.as_mut() {
+                    session.term.scroll_to_bottom();
+                    self.needs_draw = true;
+                }
+            }
+            Action::SearchStart => self.toggle_search(),
+            Action::FontIncrease => self.change_font_size(self.font_size + 1),
+            Action::FontDecrease => self.change_font_size(self.font_size.saturating_sub(1)),
+            Action::FontReset => self.change_font_size(self.config.main.font_size),
+            Action::Fullscreen => self.toggle_fullscreen(),
+        }
+    }
+
+    /// Scroll the viewport one page back (`up`) or toward the live screen.
+    fn scroll_page(&mut self, up: bool) {
+        if let Some(session) = self.session.as_mut() {
+            let page = session.term.page() as isize;
+            session.term.scroll_view(if up { page } else { -page });
+            self.needs_draw = true;
+        }
+    }
+
+    /// Toggle the toplevel between fullscreen and windowed.
+    fn toggle_fullscreen(&mut self) {
+        self.fullscreen = !self.fullscreen;
+        if self.fullscreen {
+            self.window.set_fullscreen(None);
+        } else {
+            self.window.unset_fullscreen();
+        }
+    }
+
+    /// Re-rasterize the font at `new_size`, then re-derive the grid geometry.
+    fn change_font_size(&mut self, new_size: u32) {
+        let new_size = new_size.clamp(6, 200);
+        if new_size == self.font_size {
+            return;
+        }
+        if let Err(err) = self.renderer.set_font(&self.config.main.font, new_size) {
+            tracing::warn!("resize font: {err:#}");
+            return;
+        }
+        self.font_size = new_size;
+        self.frames.clear();
+        self.resize_grid();
+        self.needs_draw = true;
     }
 
     /// Enter or leave incremental search mode.

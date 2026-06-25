@@ -116,6 +116,12 @@ impl Renderer {
         self.pad = (pad_x as i32, pad_y as i32);
     }
 
+    /// Rebuild the font set at a new size (font-resize bindings).
+    pub fn set_font(&mut self, family: &str, size_px: u32) -> Result<(), crate::font::FontError> {
+        self.fonts = Fonts::new(family, size_px)?;
+        Ok(())
+    }
+
     /// Fill the whole buffer (including the padding margins) with the background
     /// colour. Called once per fresh shm buffer; per-row repaints then leave the
     /// margins untouched.

@@ -16,6 +16,11 @@ pub struct Config {
     pub cursor: Cursor,
     pub scrollback: Scrollback,
     pub bell: Bell,
+    /// Chord → action, e.g. `"Ctrl+Shift+C" = "copy"`. Merged over the defaults;
+    /// a value of `"none"` unbinds.
+    pub key_bindings: std::collections::HashMap<String, String>,
+    /// Chord → literal text to send (supports `\e \n \r \t \\ \xNN`).
+    pub text_bindings: std::collections::HashMap<String, String>,
 }
 
 /// `[cursor]`: the default cursor presentation (DECSCUSR may override at runtime).
