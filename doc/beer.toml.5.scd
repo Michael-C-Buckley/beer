@@ -82,6 +82,16 @@ channel).
 *visual* = _bool_
 	Briefly flash the screen on the terminal bell. Default _false_.
 
+# [mouse]
+
+*scroll-multiplier* = _float_
+	Multiplier applied to the lines scrolled per wheel notch. Default _1.0_.
+
+*alternate-scroll* = _bool_
+	On the alternate screen, translate the wheel into cursor-key presses so
+	full-screen programs that did not request mouse reporting (such as _less_
+	and _man_) still scroll. Default _true_.
+
 # [key-bindings]
 
 A table of _chord_ = _action_ entries, merged over the built-in defaults. A
