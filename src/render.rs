@@ -250,6 +250,46 @@ impl Renderer {
         }
     }
 
+    /// Draw the IME preedit string inline, starting at grid cell `start_col` of
+    /// row `row`, over whatever was there. The preedit sits on the selection
+    /// background and is underlined so it reads as uncommitted, in-flight text.
+    pub fn render_preedit(
+        &mut self,
+        pixels: &mut [u8],
+        dims: (usize, usize),
+        theme: &Theme,
+        row: usize,
+        start_col: usize,
+        text: &str,
+    ) {
+        let (width, height) = dims;
+        let mut canvas = Canvas {
+            pixels,
+            width,
+            height,
+        };
+        let m = self.fonts.metrics();
+        let (pad_x, pad_y) = self.pad;
+        let row_top = pad_y + row as i32 * m.height as i32;
+        let style = Style {
+            bold: false,
+            italic: false,
+        };
+        let mut x = pad_x + start_col as i32 * m.width as i32;
+        for c in text.chars() {
+            if x < 0 || x as usize + m.width as usize > width {
+                break;
+            }
+            canvas.fill_rect(x, row_top, m.width, m.height, theme.selection_bg);
+            if c != ' ' {
+                self.draw_glyph(&mut canvas, c, style, x, row_top, theme.fg);
+            }
+            // Underline the run a row above the cell bottom.
+            canvas.hline(x, row_top + m.height as i32 - 2, m.width, theme.fg);
+            x += m.width as i32;
+        }
+    }
+
     /// Draw the cursor: a solid block/underline/beam when focused, a hollow
     /// outline when not. A blinking cursor shape is only drawn while `blink_on`.
     fn draw_cursor(

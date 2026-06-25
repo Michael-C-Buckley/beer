@@ -82,6 +82,10 @@ use wayland_protocols::wp::fractional_scale::v1::client::{
     wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1,
     wp_fractional_scale_v1::{self, WpFractionalScaleV1},
 };
+use wayland_protocols::wp::text_input::zv3::client::{
+    zwp_text_input_manager_v3::ZwpTextInputManagerV3,
+    zwp_text_input_v3::{self, ContentHint, ContentPurpose, ZwpTextInputV3},
+};
 use wayland_protocols::wp::viewporter::client::{
     wp_viewport::WpViewport, wp_viewporter::WpViewporter,
 };
@@ -137,6 +141,8 @@ struct RowSnap {
     search: Vec<(usize, usize, bool)>,
     /// Search-prompt text drawn over this row (only the bottom row, when active).
     overlay: Option<String>,
+    /// IME preedit `(start_col, text)` drawn inline over this row (cursor row).
+    preedit: Option<(usize, String)>,
     /// Blink phase, but only varied when the row actually has blinking ink, so
     /// non-blinking rows stay equal across phase toggles.
     blink: bool,
@@ -168,6 +174,7 @@ fn row_snap(grid: &Grid, y: usize, focused: bool, blink_on: bool) -> RowSnap {
         sel: grid.selection_span_on(abs),
         search: grid.search_spans_on(abs),
         overlay: None,
+        preedit: None,
         blink: if has_blink { blink_on } else { true },
     }
 }
@@ -215,6 +222,7 @@ pub fn run(config: Config, config_path: Option<std::path::PathBuf>) -> anyhow::R
         bind_global::<WpFractionalScaleManagerV1>(&globals, &qh)
             .map(|mgr| mgr.get_fractional_scale(window.wl_surface(), &qh, ()))
     });
+    let text_input_manager = bind_global::<ZwpTextInputManagerV3>(&globals, &qh);
 
     // First commit with no buffer kicks off the initial configure.
     window.commit();
@@ -251,6 +259,10 @@ pub fn run(config: Config, config_path: Option<std::path::PathBuf>) -> anyhow::R
         data_device_manager,
         primary_manager,
         cursor_shape_manager,
+        text_input_manager,
+        preedit: String::new(),
+        ime_preedit_pending: String::new(),
+        ime_commit_pending: String::new(),
         viewport,
         fractional_scale,
         scale120: 120,
@@ -393,6 +405,8 @@ struct SeatData {
     cursor_shape_device: Option<WpCursorShapeDeviceV1>,
     data_device: Option<DataDevice>,
     primary_device: Option<PrimarySelectionDevice>,
+    /// text-input-v3 handle for IME preedit/commit, if the compositor offers it.
+    text_input: Option<ZwpTextInputV3>,
 }
 
 /// Window + Wayland client state shared across all protocol handlers.
@@ -411,6 +425,13 @@ struct App {
     primary_manager: Option<PrimarySelectionManagerState>,
     /// Sets the pointer to an I-beam over the window (cursor-shape-v1).
     cursor_shape_manager: Option<CursorShapeManager>,
+    /// IME manager (text-input-v3); per-seat handles live in `seats`.
+    text_input_manager: Option<ZwpTextInputManagerV3>,
+    /// Committed IME preedit string shown inline at the cursor while composing.
+    preedit: String,
+    /// Preedit/commit accumulated since the last text-input `done`.
+    ime_preedit_pending: String,
+    ime_commit_pending: String,
     /// Presents a scaled buffer at the logical surface size (viewporter).
     viewport: Option<WpViewport>,
     /// Per-surface fractional-scale object; kept alive to receive scale events.
@@ -837,6 +858,7 @@ impl App {
             cursor_shape_device: None,
             data_device: None,
             primary_device: None,
+            text_input: None,
         });
         self.seats.len() - 1
     }
@@ -1123,6 +1145,39 @@ impl App {
         if let Some(text) = self.selection_text() {
             self.claim_primary(text, qh);
         }
+    }
+
+    /// Point the IME's candidate popup at the terminal cursor, in logical
+    /// surface coordinates (the renderer works in physical pixels, so divide
+    /// the physical cell rectangle back down by the scale).
+    fn ime_set_cursor_rect(&self, ti: &ZwpTextInputV3) {
+        let Some(session) = self.session.as_ref() else {
+            return;
+        };
+        let (cx, cy) = session.term.grid().cursor();
+        let m = self.renderer.metrics();
+        let s = f64::from(self.scale120) / 120.0;
+        let pad_x = f64::from(self.to_phys(self.config.main.pad_x));
+        let pad_y = f64::from(self.to_phys(self.config.main.pad_y));
+        let x = ((pad_x + cx as f64 * f64::from(m.width)) / s) as i32;
+        let y = ((pad_y + cy as f64 * f64::from(m.height)) / s) as i32;
+        let w = (f64::from(m.width) / s) as i32;
+        let h = (f64::from(m.height) / s) as i32;
+        ti.set_cursor_rectangle(x, y, w.max(1), h.max(1));
+    }
+
+    /// Apply one IME transaction: commit any committed text to the shell, adopt
+    /// the new preedit, then re-commit our state (cursor rectangle) to the IME.
+    fn ime_done(&mut self, ti: &ZwpTextInputV3) {
+        let commit = std::mem::take(&mut self.ime_commit_pending);
+        // Preedit is replaced wholesale each cycle; an absent preedit clears it.
+        self.preedit = std::mem::take(&mut self.ime_preedit_pending);
+        if !commit.is_empty() {
+            self.send_to_shell(commit.as_bytes());
+        }
+        self.ime_set_cursor_rect(ti);
+        ti.commit();
+        self.needs_draw = true;
     }
 
     /// Act on the OSC 52 clipboard requests an application made: take ownership
@@ -1414,6 +1469,14 @@ impl App {
             cur[rows - 1].overlay = Some(text.clone());
         }
 
+        // The IME preedit is drawn inline at the cursor while composing.
+        if !self.preedit.is_empty() && grid.view_at_bottom() {
+            let (cx, cy) = grid.cursor();
+            if cy < rows {
+                cur[cy].preedit = Some((cx, self.preedit.clone()));
+            }
+        }
+
         // Reuse a buffer the compositor has released, else grow the ring.
         let stride = w as i32 * 4;
         let mut idx = None;
@@ -1485,6 +1548,13 @@ impl App {
         {
             self.renderer
                 .render_search_bar(canvas, dims, theme, rows - 1, text);
+        }
+        // Draw the IME preedit inline over its (repainted) cursor row.
+        for &y in &dirty {
+            if let Some((col, text)) = &cur[y].preedit {
+                self.renderer
+                    .render_preedit(canvas, dims, theme, y, *col, text);
+            }
         }
         self.frames[idx].rows = cur;
 
@@ -1639,6 +1709,11 @@ impl SeatHandler for App {
             match keyboard {
                 Ok(keyboard) => self.seats[i].keyboard = Some(keyboard),
                 Err(err) => tracing::warn!("get keyboard: {err}"),
+            }
+            if self.seats[i].text_input.is_none()
+                && let Some(mgr) = self.text_input_manager.as_ref()
+            {
+                self.seats[i].text_input = Some(mgr.get_text_input(&seat, qh, ()));
             }
         }
         if capability == Capability::Pointer && self.seats[i].pointer.is_none() {
@@ -2101,6 +2176,59 @@ impl Dispatch<WpViewport, ()> for App {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
+    }
+}
+
+impl Dispatch<ZwpTextInputManagerV3, ()> for App {
+    fn event(
+        _: &mut Self,
+        _: &ZwpTextInputManagerV3,
+        _: <ZwpTextInputManagerV3 as Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+// text-input-v3 batches preedit/commit between `enter` and `done`; we apply the
+// accumulated transaction on `done` and re-enable on focus enter.
+impl Dispatch<ZwpTextInputV3, ()> for App {
+    fn event(
+        state: &mut Self,
+        ti: &ZwpTextInputV3,
+        event: zwp_text_input_v3::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        use zwp_text_input_v3::Event;
+        match event {
+            Event::Enter { .. } => {
+                ti.enable();
+                ti.set_content_type(ContentHint::None, ContentPurpose::Terminal);
+                state.ime_set_cursor_rect(ti);
+                ti.commit();
+            }
+            Event::Leave { .. } => {
+                ti.disable();
+                ti.commit();
+                state.preedit.clear();
+                state.ime_preedit_pending.clear();
+                state.ime_commit_pending.clear();
+                state.needs_draw = true;
+            }
+            Event::PreeditString { text, .. } => {
+                state.ime_preedit_pending = text.unwrap_or_default();
+            }
+            Event::CommitString { text } => {
+                state.ime_commit_pending.push_str(&text.unwrap_or_default());
+            }
+            Event::Done { .. } => state.ime_done(ti),
+            // We do not expose surrounding text, so nothing to delete.
+            Event::DeleteSurroundingText { .. } => {}
+            _ => {}
+        }
     }
 }
 
