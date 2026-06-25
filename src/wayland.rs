@@ -122,6 +122,10 @@ struct RowSnap {
     cursor: Option<(usize, CursorShape, bool)>,
     /// Inclusive selected column span on this row.
     sel: Option<(usize, usize)>,
+    /// Search-match spans `(lo, hi, is_current)` highlighted on this row.
+    search: Vec<(usize, usize, bool)>,
+    /// Search-prompt text drawn over this row (only the bottom row, when active).
+    overlay: Option<String>,
     /// Blink phase, but only varied when the row actually has blinking ink, so
     /// non-blinking rows stay equal across phase toggles.
     blink: bool,
@@ -151,6 +155,8 @@ fn row_snap(grid: &Grid, y: usize, focused: bool, blink_on: bool) -> RowSnap {
         cells,
         cursor,
         sel: grid.selection_span_on(abs),
+        search: grid.search_spans_on(abs),
+        overlay: None,
         blink: if has_blink { blink_on } else { true },
     }
 }
@@ -241,6 +247,7 @@ pub fn run() -> anyhow::Result<ExitCode> {
         buf_dims: (0, 0),
         blink_on: true,
         sync_timeout: None,
+        searching: false,
         focused: true,
         exit: false,
         exit_code: ExitCode::SUCCESS,
@@ -359,6 +366,8 @@ struct App {
     blink_on: bool,
     /// Armed while synchronized output holds the screen, to force it open.
     sync_timeout: Option<RegistrationToken>,
+    /// Whether incremental search mode is active (the query lives in the grid).
+    searching: bool,
     /// Whether the toplevel currently has keyboard focus (drives the cursor).
     focused: bool,
     exit: bool,
@@ -429,6 +438,19 @@ impl App {
     /// viewport locally; anything else is encoded to the shell and snaps the
     /// viewport back to the live screen.
     fn handle_key(&mut self, event: &KeyEvent) {
+        // Ctrl+Shift+F toggles incremental search mode.
+        if self.modifiers.ctrl
+            && self.modifiers.shift
+            && matches!(event.keysym, Keysym::F | Keysym::f)
+        {
+            self.toggle_search();
+            return;
+        }
+        // While searching, the keyboard edits the query and navigates matches.
+        if self.searching {
+            self.search_key(event);
+            return;
+        }
         // Ctrl+Shift+C/V copy the selection and paste the clipboard; these take
         // precedence over the control bytes the chord would otherwise encode.
         if self.modifiers.ctrl && self.modifiers.shift {
@@ -473,6 +495,55 @@ impl App {
                 tracing::warn!("write key to pty: {err}");
             }
         }
+    }
+
+    /// Enter or leave incremental search mode.
+    fn toggle_search(&mut self) {
+        self.searching = !self.searching;
+        if let Some(session) = self.session.as_mut() {
+            if self.searching {
+                session.term.grid_mut().set_search("");
+            } else {
+                session.term.grid_mut().clear_search();
+            }
+        }
+        self.needs_draw = true;
+    }
+
+    /// Handle a key while search mode is active: edit the query incrementally,
+    /// step between matches, or exit.
+    fn search_key(&mut self, event: &KeyEvent) {
+        let Some(session) = self.session.as_mut() else {
+            return;
+        };
+        let grid = session.term.grid_mut();
+        match event.keysym {
+            Keysym::Escape => {
+                grid.clear_search();
+                self.searching = false;
+            }
+            Keysym::Return | Keysym::KP_Enter | Keysym::Up | Keysym::Page_Up => {
+                grid.search_step(false);
+            }
+            Keysym::Down | Keysym::Page_Down => grid.search_step(true),
+            Keysym::BackSpace => {
+                let mut query = grid.search_query().unwrap_or("").to_string();
+                query.pop();
+                grid.set_search(&query);
+            }
+            _ => {
+                // Append typed text, ignoring control characters.
+                if let Some(text) = event.utf8.as_ref() {
+                    let printable: String = text.chars().filter(|c| !c.is_control()).collect();
+                    if !printable.is_empty() {
+                        let mut query = grid.search_query().unwrap_or("").to_string();
+                        query.push_str(&printable);
+                        grid.set_search(&query);
+                    }
+                }
+            }
+        }
+        self.needs_draw = true;
     }
 
     /// Map window pixel coordinates to an absolute `(row, col)` grid point.
@@ -974,9 +1045,24 @@ impl App {
         };
         let grid = session.term.grid();
         let rows = grid.rows();
-        let cur: Vec<RowSnap> = (0..rows)
+        let mut cur: Vec<RowSnap> = (0..rows)
             .map(|y| row_snap(grid, y, focused, blink_on))
             .collect();
+
+        // The search prompt occupies the bottom row while search mode is active.
+        // Recording it in the snapshot keeps the row's damage/diff correct.
+        let bar_text = self.searching.then(|| {
+            let (n, total) = grid.search_count();
+            format!(
+                "search: {}  [{n}/{total}]",
+                grid.search_query().unwrap_or("")
+            )
+        });
+        if let Some(text) = &bar_text
+            && rows > 0
+        {
+            cur[rows - 1].overlay = Some(text.clone());
+        }
 
         // Reuse a buffer the compositor has released, else grow the ring.
         let stride = w as i32 * 4;
@@ -1031,6 +1117,12 @@ impl App {
         for &y in &dirty {
             self.renderer
                 .render_row(canvas, dims, grid, y, focused, blink_on);
+        }
+        // Draw the search prompt over the (now repainted) bottom row.
+        if let Some(text) = &bar_text
+            && dirty.contains(&(rows - 1))
+        {
+            self.renderer.render_search_bar(canvas, dims, text);
         }
         self.frames[idx].rows = cur;
 

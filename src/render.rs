@@ -13,6 +13,11 @@ const DEFAULT_FG: Rgb = Rgb(0xc5, 0xc8, 0xc6);
 const DEFAULT_BG: Rgb = Rgb(0x18, 0x18, 0x18);
 /// Background painted behind selected cells.
 const SELECTION_BG: Rgb = Rgb(0x44, 0x47, 0x5a);
+/// Background behind a search match, and the focused match.
+const MATCH_BG: Rgb = Rgb(0x5a, 0x51, 0x2a);
+const CURRENT_MATCH_BG: Rgb = Rgb(0xb8, 0x8a, 0x2a);
+/// Search prompt bar drawn along the bottom row.
+const SEARCH_BAR_BG: Rgb = Rgb(0x30, 0x30, 0x40);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Rgb(u8, u8, u8);
@@ -131,11 +136,20 @@ impl Renderer {
         // `cols` after a resize, so clamp with `take`.
         let abs = grid.view_to_abs(y);
         let cells = grid.view_row(y);
+        let search = grid.search_spans_on(abs);
+        let match_at = |x: usize| -> Option<bool> {
+            search
+                .iter()
+                .find(|(lo, hi, _)| x >= *lo && x <= *hi)
+                .map(|(_, _, current)| *current)
+        };
         for (x, cell) in cells.iter().take(cols).enumerate() {
-            let bg = if grid.is_selected(abs, x) {
-                SELECTION_BG
-            } else {
-                cell_colors(cell).1
+            // Focused match > selection > other match > the cell's own bg.
+            let bg = match match_at(x) {
+                Some(true) => CURRENT_MATCH_BG,
+                _ if grid.is_selected(abs, x) => SELECTION_BG,
+                Some(false) => MATCH_BG,
+                None => cell_colors(cell).1,
             };
             if bg != DEFAULT_BG {
                 canvas.fill_rect(x as i32 * m.width as i32, row_top, m.width, m.height, bg);
@@ -160,6 +174,36 @@ impl Renderer {
         // The cursor belongs to the live screen; hide it while scrolled back.
         if grid.view_at_bottom() && grid.cursor().1 == y {
             self.draw_cursor(&mut canvas, grid, m, focused, blink_on);
+        }
+    }
+
+    /// Draw the incremental-search prompt across the bottom row, over whatever
+    /// grid content was there. The caller marks the bottom row dirty so this
+    /// repaints whenever the query or match count changes.
+    pub fn render_search_bar(&mut self, pixels: &mut [u8], dims: (usize, usize), text: &str) {
+        let (width, height) = dims;
+        let mut canvas = Canvas {
+            pixels,
+            width,
+            height,
+        };
+        let m = self.fonts.metrics();
+        let rows = (height / m.height as usize).max(1);
+        let row_top = (rows - 1) as i32 * m.height as i32;
+        canvas.fill_rect(0, row_top, width as u32, m.height, SEARCH_BAR_BG);
+        let style = Style {
+            bold: false,
+            italic: false,
+        };
+        let mut x = 0i32;
+        for c in text.chars() {
+            if x as usize + m.width as usize > width {
+                break;
+            }
+            if c != ' ' {
+                self.draw_glyph(&mut canvas, c, style, x, row_top, DEFAULT_FG);
+            }
+            x += m.width as i32;
         }
     }
 
