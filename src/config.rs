@@ -12,7 +12,31 @@ use serde::Deserialize;
 #[serde(default, rename_all = "kebab-case")]
 pub struct Config {
     pub main: Main,
+    pub colors: Colors,
     pub scrollback: Scrollback,
+}
+
+/// `[colors]`: foreground/background, the 16 base palette entries, and accents.
+/// Each value is an X11 colour spec (`#rrggbb` or `rgb:rr/gg/bb`); unset entries
+/// keep the built-in default.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct Colors {
+    pub foreground: Option<String>,
+    pub background: Option<String>,
+    pub cursor: Option<String>,
+    pub selection_foreground: Option<String>,
+    pub selection_background: Option<String>,
+    /// The eight regular palette entries (indices 0-7).
+    pub regular: Option<Vec<String>>,
+    /// The eight bright palette entries (indices 8-15).
+    pub bright: Option<Vec<String>>,
+    pub match_background: Option<String>,
+    pub match_current_background: Option<String>,
+    /// Background opacity, 0.0 (transparent) - 1.0 (opaque).
+    pub alpha: Option<f32>,
+    /// Render bold text with the bright palette variant.
+    pub bold_as_bright: Option<bool>,
 }
 
 /// `[main]`: fonts, window geometry, padding, and the terminal name.

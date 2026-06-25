@@ -6,21 +6,8 @@
 //! neighbouring cell's background fill.
 
 use crate::font::{CellMetrics, Fonts, GlyphData, Style};
-use crate::grid::{Cell, Color, CursorShape, Flags, Grid, Underline};
-
-/// Foreground/background used for `Color::Default`.
-const DEFAULT_FG: Rgb = Rgb(0xc5, 0xc8, 0xc6);
-const DEFAULT_BG: Rgb = Rgb(0x18, 0x18, 0x18);
-/// Background painted behind selected cells.
-const SELECTION_BG: Rgb = Rgb(0x44, 0x47, 0x5a);
-/// Background behind a search match, and the focused match.
-const MATCH_BG: Rgb = Rgb(0x5a, 0x51, 0x2a);
-const CURRENT_MATCH_BG: Rgb = Rgb(0xb8, 0x8a, 0x2a);
-/// Search prompt bar drawn along the bottom row.
-const SEARCH_BAR_BG: Rgb = Rgb(0x30, 0x30, 0x40);
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct Rgb(u8, u8, u8);
+use crate::grid::{Cell, CursorShape, Flags, Grid, Underline};
+use crate::theme::{Plane, Rgb, Theme};
 
 /// A mutable view over a BGRA pixel buffer.
 struct Canvas<'a> {
@@ -38,6 +25,12 @@ impl Canvas<'_> {
     }
 
     fn fill_rect(&mut self, x0: i32, y0: i32, w: u32, h: u32, c: Rgb) {
+        self.fill_rect_a(x0, y0, w, h, c, 0xff);
+    }
+
+    /// Fill a rectangle with colour `c` at opacity `alpha`. The shm buffer is
+    /// premultiplied ARGB, so a translucent fill stores `rgb * alpha`.
+    fn fill_rect_a(&mut self, x0: i32, y0: i32, w: u32, h: u32, c: Rgb, alpha: u8) {
         let x_start = x0.max(0) as usize;
         let x_end = ((x0 + w as i32).max(0) as usize).min(self.width);
         let y_start = y0.max(0) as usize;
@@ -45,7 +38,9 @@ impl Canvas<'_> {
         if x_start >= x_end {
             return;
         }
-        let bytes = [c.2, c.1, c.0, 0xff];
+        let a = u32::from(alpha);
+        let pm = |v: u8| ((u32::from(v) * a) / 255) as u8;
+        let bytes = [pm(c.2), pm(c.1), pm(c.0), alpha];
         for y in y_start..y_end {
             let row =
                 &mut self.pixels[(y * self.width + x_start) * 4..(y * self.width + x_end) * 4];
@@ -92,6 +87,15 @@ impl Canvas<'_> {
     }
 }
 
+/// Per-frame constants shared by every row: the colour scheme, focus, and the
+/// current blink phase.
+#[derive(Clone, Copy, Debug)]
+pub struct Frame<'a> {
+    pub theme: &'a Theme,
+    pub focused: bool,
+    pub blink_on: bool,
+}
+
 #[derive(Debug)]
 pub struct Renderer {
     fonts: Fonts,
@@ -117,10 +121,10 @@ impl Renderer {
         pixels: &mut [u8],
         dims: (usize, usize),
         grid: &Grid,
+        frame: &Frame,
         y: usize,
-        focused: bool,
-        blink_on: bool,
     ) {
+        let (theme, focused, blink_on) = (frame.theme, frame.focused, frame.blink_on);
         let (width, height) = dims;
         let mut canvas = Canvas {
             pixels,
@@ -130,7 +134,7 @@ impl Renderer {
         let m = self.fonts.metrics();
         let cols = grid.cols();
         let row_top = y as i32 * m.height as i32;
-        canvas.fill_rect(0, row_top, width as u32, m.height, DEFAULT_BG);
+        canvas.fill_rect_a(0, row_top, width as u32, m.height, theme.bg, theme.alpha);
 
         // Rows come through the scrollback viewport and may be shorter than
         // `cols` after a resize, so clamp with `take`.
@@ -146,12 +150,12 @@ impl Renderer {
         for (x, cell) in cells.iter().take(cols).enumerate() {
             // Focused match > selection > other match > the cell's own bg.
             let bg = match match_at(x) {
-                Some(true) => CURRENT_MATCH_BG,
-                _ if grid.is_selected(abs, x) => SELECTION_BG,
-                Some(false) => MATCH_BG,
-                None => cell_colors(cell).1,
+                Some(true) => theme.current_match_bg,
+                _ if grid.is_selected(abs, x) => theme.selection_bg,
+                Some(false) => theme.match_bg,
+                None => cell_colors(cell, theme).1,
             };
-            if bg != DEFAULT_BG {
+            if bg != theme.bg {
                 canvas.fill_rect(x as i32 * m.width as i32, row_top, m.width, m.height, bg);
             }
         }
@@ -163,24 +167,30 @@ impl Renderer {
             if cell.flags.contains(Flags::BLINK) && !blink_on {
                 continue;
             }
-            let (fg, _) = cell_colors(cell);
+            let (fg, _) = cell_colors(cell, theme);
             let origin_x = x as i32 * m.width as i32;
             if cell.c != ' ' {
                 self.draw_glyph(&mut canvas, cell.c, cell_style(cell), origin_x, row_top, fg);
             }
-            draw_decorations(&mut canvas, cell, origin_x, row_top, m, fg);
+            draw_decorations(&mut canvas, cell, theme, origin_x, row_top, m, fg);
         }
 
         // The cursor belongs to the live screen; hide it while scrolled back.
         if grid.view_at_bottom() && grid.cursor().1 == y {
-            self.draw_cursor(&mut canvas, grid, m, focused, blink_on);
+            self.draw_cursor(&mut canvas, grid, theme, m, focused, blink_on);
         }
     }
 
     /// Draw the incremental-search prompt across the bottom row, over whatever
     /// grid content was there. The caller marks the bottom row dirty so this
     /// repaints whenever the query or match count changes.
-    pub fn render_search_bar(&mut self, pixels: &mut [u8], dims: (usize, usize), text: &str) {
+    pub fn render_search_bar(
+        &mut self,
+        pixels: &mut [u8],
+        dims: (usize, usize),
+        theme: &Theme,
+        text: &str,
+    ) {
         let (width, height) = dims;
         let mut canvas = Canvas {
             pixels,
@@ -190,7 +200,7 @@ impl Renderer {
         let m = self.fonts.metrics();
         let rows = (height / m.height as usize).max(1);
         let row_top = (rows - 1) as i32 * m.height as i32;
-        canvas.fill_rect(0, row_top, width as u32, m.height, SEARCH_BAR_BG);
+        canvas.fill_rect(0, row_top, width as u32, m.height, theme.search_bar_bg);
         let style = Style {
             bold: false,
             italic: false,
@@ -201,7 +211,7 @@ impl Renderer {
                 break;
             }
             if c != ' ' {
-                self.draw_glyph(&mut canvas, c, style, x, row_top, DEFAULT_FG);
+                self.draw_glyph(&mut canvas, c, style, x, row_top, theme.fg);
             }
             x += m.width as i32;
         }
@@ -213,6 +223,7 @@ impl Renderer {
         &mut self,
         canvas: &mut Canvas,
         grid: &Grid,
+        theme: &Theme,
         m: CellMetrics,
         focused: bool,
         blink_on: bool,
@@ -223,9 +234,12 @@ impl Renderer {
         let (cx, cy) = grid.cursor();
         let x0 = cx as i32 * m.width as i32;
         let top = cy as i32 * m.height as i32;
+        // OSC 12 cursor colour wins, then the configured cursor colour, then fg.
         let color = grid
             .cursor_color()
-            .map_or(DEFAULT_FG, |(r, g, b)| Rgb(r, g, b));
+            .map(|(r, g, b)| Rgb(r, g, b))
+            .or(theme.cursor)
+            .unwrap_or(theme.fg);
 
         if !focused {
             let right = x0 + m.width as i32 - 1;
@@ -242,7 +256,7 @@ impl Renderer {
                 canvas.fill_rect(x0, top, m.width, m.height, color);
                 let cell = grid.cell(cx, cy);
                 if cell.c != ' ' && !cell.flags.contains(Flags::WIDE_CONT) {
-                    let (_, bg) = cell_colors(cell);
+                    let (_, bg) = cell_colors(cell, theme);
                     self.draw_glyph(canvas, cell.c, cell_style(cell), x0, top, bg);
                 }
             }
@@ -316,10 +330,10 @@ fn cell_style(cell: &Cell) -> Style {
 
 /// Resolve a cell's (foreground, background) RGB, applying reverse video,
 /// bold-as-bright, dim, and hidden.
-fn cell_colors(cell: &Cell) -> (Rgb, Rgb) {
+fn cell_colors(cell: &Cell, theme: &Theme) -> (Rgb, Rgb) {
     let bold = cell.flags.contains(Flags::BOLD);
-    let mut fg = resolve(cell.fg, DEFAULT_FG, bold);
-    let mut bg = resolve(cell.bg, DEFAULT_BG, false);
+    let mut fg = theme.resolve(cell.fg, Plane::Fg, bold);
+    let mut bg = theme.resolve(cell.bg, Plane::Bg, false);
     if cell.flags.contains(Flags::REVERSE) {
         std::mem::swap(&mut fg, &mut bg);
     }
@@ -339,11 +353,23 @@ fn blend_rgb(c: Rgb, toward: Rgb) -> Rgb {
 }
 
 /// Draw underline, strikethrough, and overline for one cell.
-fn draw_decorations(canvas: &mut Canvas, cell: &Cell, x0: i32, top: i32, m: CellMetrics, fg: Rgb) {
+fn draw_decorations(
+    canvas: &mut Canvas,
+    cell: &Cell,
+    theme: &Theme,
+    x0: i32,
+    top: i32,
+    m: CellMetrics,
+    fg: Rgb,
+) {
     let w = m.width;
     let baseline = top + m.ascent as i32;
     let uy = (baseline + 1).min(top + m.height as i32 - 1);
-    let uc = resolve(cell.underline_color, fg, false);
+    // A `Default` underline colour follows the cell's foreground.
+    let uc = match cell.underline_color {
+        crate::grid::Color::Default => fg,
+        other => theme.resolve(other, Plane::Fg, false),
+    };
     match cell.underline {
         Underline::None => {}
         Underline::Single => canvas.hline(x0, uy, w, uc),
@@ -375,63 +401,5 @@ fn draw_decorations(canvas: &mut Canvas, cell: &Cell, x0: i32, top: i32, m: Cell
     }
     if cell.flags.contains(Flags::STRIKE) {
         canvas.hline(x0, top + m.ascent as i32 * 2 / 3, w, fg);
-    }
-}
-
-fn resolve(color: Color, default: Rgb, bold: bool) -> Rgb {
-    match color {
-        Color::Default => default,
-        Color::Indexed(i) => ansi256(if bold && i < 8 { i + 8 } else { i }),
-        Color::Rgb(r, g, b) => Rgb(r, g, b),
-    }
-}
-
-/// The xterm 256-colour palette: 16 base, a 6×6×6 cube, then 24 greys.
-fn ansi256(i: u8) -> Rgb {
-    const BASE: [Rgb; 16] = [
-        Rgb(0x00, 0x00, 0x00),
-        Rgb(0xcd, 0x00, 0x00),
-        Rgb(0x00, 0xcd, 0x00),
-        Rgb(0xcd, 0xcd, 0x00),
-        Rgb(0x00, 0x00, 0xee),
-        Rgb(0xcd, 0x00, 0xcd),
-        Rgb(0x00, 0xcd, 0xcd),
-        Rgb(0xe5, 0xe5, 0xe5),
-        Rgb(0x7f, 0x7f, 0x7f),
-        Rgb(0xff, 0x00, 0x00),
-        Rgb(0x00, 0xff, 0x00),
-        Rgb(0xff, 0xff, 0x00),
-        Rgb(0x5c, 0x5c, 0xff),
-        Rgb(0xff, 0x00, 0xff),
-        Rgb(0x00, 0xff, 0xff),
-        Rgb(0xff, 0xff, 0xff),
-    ];
-    match i {
-        0..=15 => BASE[i as usize],
-        16..=231 => {
-            let i = i - 16;
-            Rgb(cube(i / 36), cube((i / 6) % 6), cube(i % 6))
-        }
-        _ => {
-            let v = 8 + 10 * (i - 232);
-            Rgb(v, v, v)
-        }
-    }
-}
-
-fn cube(step: u8) -> u8 {
-    if step == 0 { 0 } else { 55 + 40 * step }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn palette_cube_and_grey() {
-        assert_eq!(ansi256(16).0, 0); // cube origin is black
-        let white = ansi256(231);
-        assert_eq!((white.0, white.1, white.2), (255, 255, 255));
-        assert_eq!(ansi256(232).0, 8); // first grey step
     }
 }

@@ -438,6 +438,7 @@ impl App {
         }
 
         let mut term = Term::new(cols as usize, rows as usize);
+        term.set_theme(crate::theme::Theme::from_config(&self.config.colors));
         let grid = term.grid_mut();
         grid.set_word_delimiters(self.config.main.word_delimiters.clone());
         grid.set_scrollback_cap(self.config.scrollback.lines);
@@ -1054,6 +1055,7 @@ impl App {
             return;
         };
         let grid = session.term.grid();
+        let theme = session.term.theme();
         let rows = grid.rows();
         let mut cur: Vec<RowSnap> = (0..rows)
             .map(|y| row_snap(grid, y, focused, blink_on))
@@ -1124,15 +1126,19 @@ impl App {
             return;
         };
         let dims = (w as usize, h as usize);
+        let frame = crate::render::Frame {
+            theme,
+            focused,
+            blink_on,
+        };
         for &y in &dirty {
-            self.renderer
-                .render_row(canvas, dims, grid, y, focused, blink_on);
+            self.renderer.render_row(canvas, dims, grid, &frame, y);
         }
         // Draw the search prompt over the (now repainted) bottom row.
         if let Some(text) = &bar_text
             && dirty.contains(&(rows - 1))
         {
-            self.renderer.render_search_bar(canvas, dims, text);
+            self.renderer.render_search_bar(canvas, dims, theme, text);
         }
         self.frames[idx].rows = cur;
 

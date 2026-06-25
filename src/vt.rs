@@ -5,6 +5,7 @@ use std::io::Write as _;
 use vte::{Params, Perform};
 
 use crate::grid::{Color, CursorShape, Flags, Grid, MouseEncoding, MouseProtocol, Underline};
+use crate::theme::{Rgb, Theme};
 
 /// G0/G1 character set designation.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -31,9 +32,34 @@ pub enum ClipboardOp {
     Query { primary: bool },
 }
 
+/// Which dynamic colour an OSC 10/11/17/19 escape targets.
+#[derive(Clone, Copy, Debug)]
+enum Dynamic {
+    Fg,
+    Bg,
+    SelBg,
+    SelFg,
+}
+
 /// DECRQM mode-state code: 1 = set, 2 = reset.
 fn set_reset(on: bool) -> u8 {
     if on { 1 } else { 2 }
+}
+
+/// Parse an OSC colour spec into an [`Rgb`].
+fn parse_spec(spec: &[u8]) -> Option<Rgb> {
+    std::str::from_utf8(spec)
+        .ok()
+        .and_then(crate::theme::parse_color)
+}
+
+/// Parse a decimal palette index (0-255).
+fn parse_index(b: &[u8]) -> Option<u8> {
+    std::str::from_utf8(b).ok()?.parse().ok()
+}
+
+fn rgb_tuple(rgb: Rgb) -> (u8, u8, u8) {
+    (rgb.0, rgb.1, rgb.2)
 }
 
 /// Select `protocol` when a mouse mode is set, else turn reporting off.
@@ -44,31 +70,6 @@ fn proto(on: bool, protocol: MouseProtocol) -> MouseProtocol {
 /// Select `encoding` when its mode is set, else fall back to the default form.
 fn enc(on: bool, encoding: MouseEncoding) -> MouseEncoding {
     if on { encoding } else { MouseEncoding::X10 }
-}
-
-/// Parse an X11 colour spec from an OSC string: `rgb:rr/gg/bb` (1-4 hex
-/// digits per channel) or `#rrggbb`.
-fn parse_color(spec: &[u8]) -> Option<(u8, u8, u8)> {
-    let spec = std::str::from_utf8(spec).ok()?;
-    if let Some(rest) = spec.strip_prefix("rgb:") {
-        let mut it = rest.split('/');
-        let chan = |s: &str| -> Option<u8> {
-            // Normalize an n-hex-digit fraction to 8 bits (X11 rule).
-            let v = u32::from_str_radix(s, 16).ok()?;
-            let max = (1u32 << (4 * s.len() as u32)) - 1;
-            Some((v * 255 / max) as u8)
-        };
-        let r = chan(it.next()?)?;
-        let g = chan(it.next()?)?;
-        let b = chan(it.next()?)?;
-        return Some((r, g, b));
-    }
-    let hex = spec.strip_prefix('#')?;
-    if hex.len() == 6 {
-        let byte = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).ok();
-        return Some((byte(0)?, byte(2)?, byte(4)?));
-    }
-    None
 }
 
 /// Map an SGR 4 param (`4` or `4:x`) to an underline style.
@@ -97,6 +98,8 @@ pub struct Term {
     xtgettcap: Option<Vec<u8>>,
     /// Pending OSC 52 clipboard requests, drained by the front-end.
     clipboard_ops: Vec<ClipboardOp>,
+    /// The active colour scheme (seeded from config, mutated by OSC escapes).
+    theme: Theme,
 }
 
 impl Term {
@@ -111,12 +114,22 @@ impl Term {
             shift_out: false,
             xtgettcap: None,
             clipboard_ops: Vec::new(),
+            theme: Theme::default(),
         }
     }
 
     /// Drain the OSC 52 clipboard requests accumulated since the last call.
     pub fn take_clipboard_ops(&mut self) -> Vec<ClipboardOp> {
         std::mem::take(&mut self.clipboard_ops)
+    }
+
+    pub fn theme(&self) -> &Theme {
+        &self.theme
+    }
+
+    /// Replace the colour scheme (config load / reload).
+    pub fn set_theme(&mut self, theme: Theme) {
+        self.theme = theme;
     }
 
     /// Answer an XTGETTCAP query: for each hex-encoded capability name, reply
@@ -298,6 +311,63 @@ impl Term {
             "\x1bP>|beer({})\x1b\\",
             env!("CARGO_PKG_VERSION")
         );
+    }
+
+    /// Emit an OSC colour reply (`OSC code ; rgb:rrrr/gggg/bbbb` + terminator).
+    fn reply_color(&mut self, code: &str, rgb: Rgb, bell: bool) {
+        let Rgb(r, g, b) = rgb;
+        let _ = write!(
+            self.response,
+            "\x1b]{code};rgb:{:04x}/{:04x}/{:04x}",
+            u16::from(r) * 0x101,
+            u16::from(g) * 0x101,
+            u16::from(b) * 0x101,
+        );
+        self.response
+            .extend_from_slice(if bell { b"\x07" } else { b"\x1b\\" });
+    }
+
+    /// OSC 4: set or query palette entries, given as `index;spec` pairs.
+    fn osc_palette(&mut self, params: &[&[u8]], bell: bool) {
+        let mut rest = params[1..].iter();
+        while let (Some(idx_raw), Some(spec)) = (rest.next(), rest.next()) {
+            let Some(idx) = parse_index(idx_raw) else {
+                continue;
+            };
+            if *spec == b"?" {
+                let rgb = self.theme.palette[idx as usize];
+                self.reply_color(&format!("4;{idx}"), rgb, bell);
+            } else if let Some(rgb) = parse_spec(spec) {
+                self.theme.set_palette(idx, rgb);
+            }
+        }
+    }
+
+    /// OSC 10/11/17/19: set or query a dynamic colour.
+    fn osc_dynamic_color(&mut self, kind: Dynamic, spec: Option<&&[u8]>, bell: bool) {
+        let Some(spec) = spec else { return };
+        if **spec == b"?"[..] {
+            let rgb = match kind {
+                Dynamic::Fg => self.theme.fg,
+                Dynamic::Bg => self.theme.bg,
+                Dynamic::SelBg => self.theme.selection_bg,
+                Dynamic::SelFg => self.theme.selection_fg.unwrap_or(self.theme.fg),
+            };
+            let code = match kind {
+                Dynamic::Fg => "10",
+                Dynamic::Bg => "11",
+                Dynamic::SelBg => "17",
+                Dynamic::SelFg => "19",
+            };
+            self.reply_color(code, rgb, bell);
+        } else if let Some(rgb) = parse_spec(spec) {
+            match kind {
+                Dynamic::Fg => self.theme.fg = rgb,
+                Dynamic::Bg => self.theme.bg = rgb,
+                Dynamic::SelBg => self.theme.selection_bg = rgb,
+                Dynamic::SelFg => self.theme.selection_fg = Some(rgb),
+            }
+        }
     }
 
     fn device_status(&mut self, params: &Params) {
@@ -567,17 +637,39 @@ impl Perform for Term {
         }
     }
 
-    fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+    fn osc_dispatch(&mut self, params: &[&[u8]], bell: bool) {
         match params.first() {
             Some(&n) if n == b"0" || n == b"2" => {
                 if let Some(text) = params.get(1) {
                     self.title = Some(String::from_utf8_lossy(text).into_owned());
                 }
             }
+            // OSC 4: set/query palette entries (pairs of index;spec).
+            Some(&n) if n == b"4" => self.osc_palette(params, bell),
+            // OSC 104: reset palette (all, or the listed indices).
+            Some(&n) if n == b"104" => {
+                if params.len() <= 1 {
+                    self.theme.reset_palette();
+                } else {
+                    for p in &params[1..] {
+                        if let Some(i) = parse_index(p) {
+                            self.theme.reset_palette_index(i);
+                        }
+                    }
+                }
+            }
+            // OSC 10/11: foreground / background; OSC 110/111 reset them.
+            Some(&n) if n == b"10" => self.osc_dynamic_color(Dynamic::Fg, params.get(1), bell),
+            Some(&n) if n == b"11" => self.osc_dynamic_color(Dynamic::Bg, params.get(1), bell),
+            Some(&n) if n == b"110" => self.theme.reset_fg(),
+            Some(&n) if n == b"111" => self.theme.reset_bg(),
+            // OSC 17/19: selection (highlight) background / foreground.
+            Some(&n) if n == b"17" => self.osc_dynamic_color(Dynamic::SelBg, params.get(1), bell),
+            Some(&n) if n == b"19" => self.osc_dynamic_color(Dynamic::SelFg, params.get(1), bell),
             // OSC 12: set cursor colour; OSC 112: reset to default.
             Some(&n) if n == b"12" => {
                 self.grid
-                    .set_cursor_color(params.get(1).and_then(|s| parse_color(s)));
+                    .set_cursor_color(params.get(1).and_then(|s| parse_spec(s)).map(rgb_tuple));
             }
             Some(&n) if n == b"112" => self.grid.set_cursor_color(None),
             // OSC 52: clipboard get/set. Pc selects the target, Pd is base64 or
@@ -826,11 +918,20 @@ mod tests {
     }
 
     #[test]
-    fn parse_color_forms() {
-        assert_eq!(parse_color(b"rgb:ff/00/80"), Some((255, 0, 128)));
-        assert_eq!(parse_color(b"rgb:ffff/0000/8080"), Some((255, 0, 128)));
-        assert_eq!(parse_color(b"#ff0080"), Some((255, 0, 128)));
-        assert_eq!(parse_color(b"nonsense"), None);
+    fn osc_palette_and_dynamic_colors() {
+        use crate::theme::Rgb;
+        let mut t = Term::new(20, 2);
+        // Set palette index 1 and foreground via OSC, then query them back.
+        feed(&mut t, b"\x1b]4;1;#ff0000\x1b\\");
+        assert_eq!(t.theme().palette[1], Rgb(0xff, 0, 0));
+        feed(&mut t, b"\x1b]10;rgb:00/80/ff\x1b\\");
+        assert_eq!(t.theme().fg, Rgb(0, 0x80, 0xff));
+        feed(&mut t, b"\x1b]11;?\x07");
+        let resp = t.take_response();
+        assert!(resp.starts_with(b"\x1b]11;rgb:"));
+        // Reset returns the palette entry to its default.
+        feed(&mut t, b"\x1b]104;1\x1b\\");
+        assert_ne!(t.theme().palette[1], Rgb(0xff, 0, 0));
     }
 
     #[test]

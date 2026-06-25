@@ -6,6 +6,7 @@ mod grid;
 mod input;
 mod pty;
 mod render;
+mod theme;
 mod vt;
 mod wayland;
 
