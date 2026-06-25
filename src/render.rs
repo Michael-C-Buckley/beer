@@ -204,6 +204,13 @@ impl Renderer {
             if cell.c != ' ' {
                 self.draw_glyph(&mut canvas, cell.c, cell_style(cell), origin_x, row_top, fg);
             }
+            // Stack any combining marks over the base glyph; their own bearings
+            // position them (no shaper, so placement is the font's default).
+            if let Some(marks) = &cell.combining {
+                for mark in marks.chars() {
+                    self.draw_glyph(&mut canvas, mark, cell_style(cell), origin_x, row_top, fg);
+                }
+            }
             draw_decorations(&mut canvas, cell, theme, origin_x, row_top, m, fg);
         }
 

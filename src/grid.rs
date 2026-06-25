@@ -113,6 +113,10 @@ pub struct Cell {
     pub underline: Underline,
     /// Underline colour; `Default` means "follow the foreground".
     pub underline_color: Color,
+    /// Zero-width combining marks attached to `c`, in arrival order. `None` for
+    /// the common case; the renderer stacks each over the base glyph. This is
+    /// the grapheme cluster a future shaper (HarfBuzz) would consume.
+    pub combining: Option<Box<str>>,
 }
 
 impl Default for Cell {
@@ -124,6 +128,7 @@ impl Default for Cell {
             flags: Flags::empty(),
             underline: Underline::None,
             underline_color: Color::Default,
+            combining: None,
         }
     }
 }
@@ -230,15 +235,19 @@ pub struct Grid {
     word_delimiters: String,
     /// History retention cap for the main screen.
     scrollback_cap: usize,
+    /// Position of the last printed base cell, so a following zero-width
+    /// combining mark can attach to it.
+    last_base: Option<(usize, usize)>,
 }
 
 fn default_tabs(cols: usize) -> Vec<bool> {
     (0..cols).map(|i| i % 8 == 0 && i != 0).collect()
 }
 
-/// Characters that terminate a word for double-click selection. `_`, `-`, `.`,
-/// `/`, `:`, `~` are deliberately *not* delimiters so paths, URLs, and option
-/// flags select as one unit.
+/// Default characters that terminate a word for double-click selection (the
+/// `word-delimiters` config key overrides this). `_`, `-`, `.`, `/`, `:`, `~`
+/// are deliberately *not* delimiters so paths, URLs, and option flags select as
+/// one unit.
 const WORD_DELIMITERS: &str = " \t`!@#$%^&*()+=[]{}\\|;'\",<>?";
 
 /// Whether `c` is part of a word (not whitespace, not in `delims`).
@@ -282,6 +291,7 @@ impl Grid {
             search: None,
             word_delimiters: WORD_DELIMITERS.to_string(),
             scrollback_cap: SCROLLBACK_CAP,
+            last_base: None,
         }
     }
 
@@ -526,7 +536,8 @@ impl Grid {
     pub fn print(&mut self, c: char) {
         let width = c.width().unwrap_or(0);
         if width == 0 {
-            // Combining/zero-width: no standalone storage yet.
+            // A zero-width combining mark attaches to the last base cell.
+            self.add_combining(c);
             return;
         }
         if self.wrap_pending {
@@ -552,11 +563,14 @@ impl Grid {
         let (x, y) = (self.cursor.x, self.cursor.y);
         let mut cell = self.pen.clone();
         cell.c = c;
+        cell.combining = None;
         cell.flags.remove(Flags::WIDE_CONT);
         self.lines[y].cells[x] = cell;
+        self.last_base = Some((x, y));
         if width == 2 && x + 1 < self.cols {
             let mut cont = self.pen.clone();
             cont.c = ' ';
+            cont.combining = None;
             cont.flags.insert(Flags::WIDE_CONT);
             self.lines[y].cells[x + 1] = cont;
         }
@@ -572,6 +586,23 @@ impl Grid {
         } else {
             self.cursor.x += advance;
         }
+    }
+
+    /// Attach a zero-width combining mark to the most recently printed base
+    /// cell. Capped so a malicious stream of marks cannot grow a cell unbounded.
+    fn add_combining(&mut self, mark: char) {
+        const MAX_MARKS: usize = 8;
+        let Some((x, y)) = self.last_base else {
+            return;
+        };
+        let Some(cell) = self.lines.get_mut(y).and_then(|l| l.cells.get_mut(x)) else {
+            return;
+        };
+        let mut s: String = cell.combining.take().map(String::from).unwrap_or_default();
+        if s.chars().count() < MAX_MARKS {
+            s.push(mark);
+        }
+        cell.combining = Some(s.into_boxed_str());
     }
 
     fn shift_right(&mut self, n: usize) {
@@ -1139,13 +1170,20 @@ impl Grid {
     /// The characters of an absolute row in `[from, to)`, skipping wide
     /// continuation cells.
     fn row_slice_text(&self, row: usize, from: usize, to: usize) -> String {
-        self.abs_row(row)
+        let mut out = String::new();
+        for cell in self
+            .abs_row(row)
             .get(from..to.min(self.abs_row(row).len()))
             .unwrap_or(&[])
             .iter()
             .filter(|c| !c.flags.contains(Flags::WIDE_CONT))
-            .map(|c| c.c)
-            .collect()
+        {
+            out.push(cell.c);
+            if let Some(marks) = &cell.combining {
+                out.push_str(marks);
+            }
+        }
+        out
     }
 
     // --- scrollback search ---
@@ -1350,6 +1388,24 @@ mod tests {
         assert_eq!(g.row_text(0), "abcd");
         assert_eq!(g.row_text(1), "e");
         assert_eq!(g.cursor(), (1, 1));
+    }
+
+    #[test]
+    fn combining_marks_attach_to_base_cell() {
+        let mut g = Grid::new(8, 1);
+        // "e" + COMBINING ACUTE ACCENT + "x": the mark joins the 'e' cell, the
+        // 'x' lands in the next cell (the mark advanced nothing).
+        for c in "e\u{0301}x".chars() {
+            g.print(c);
+        }
+        assert_eq!(g.cell(0, 0).c, 'e');
+        assert_eq!(g.cell(0, 0).combining.as_deref(), Some("\u{0301}"));
+        assert_eq!(g.cell(1, 0).c, 'x');
+        assert_eq!(g.cursor(), (2, 0));
+        // Copied text round-trips the full grapheme cluster.
+        g.start_selection(0, 0);
+        g.extend_selection(0, 1);
+        assert_eq!(g.selection_text().as_deref(), Some("e\u{0301}x"));
     }
 
     #[test]
