@@ -124,15 +124,13 @@ fn modifier_key(keysym: Keysym) -> Option<u32> {
     })
 }
 
-/// The kitty modifier bitfield (shift=1, alt=2, ctrl=4, super=8, caps=64,
-/// num=128); the wire parameter is `1 + this`.
+/// The kitty modifier bitfield (shift=1, alt=2, ctrl=4, super=8); the wire
+/// parameter is `1 + this`.
 fn kitty_mod_bits(mods: Modifiers) -> u32 {
     u32::from(mods.shift)
         | (u32::from(mods.alt) << 1)
         | (u32::from(mods.ctrl) << 2)
         | (u32::from(mods.logo) << 3)
-        | (u32::from(mods.caps_lock) << 6)
-        | (u32::from(mods.num_lock) << 7)
 }
 
 /// The un-shifted Unicode codepoint of a text key (always the lowercase form,
@@ -562,6 +560,41 @@ mod tests {
         assert_eq!(release(0b11), None);
         // Report-all does: CSI 97 ; 5 : 3 u.
         assert_eq!(release(0b1011), Some(b"\x1b[97;5:3u".to_vec()));
+    }
+
+    #[test]
+    fn kitty_lock_keys_do_not_leak() {
+        let numlock = Modifiers {
+            num_lock: true,
+            ..NONE
+        };
+        // Num lock on must not turn unmodified Enter into a CSI u sequence.
+        assert_eq!(
+            kitty_encode(
+                &key(Keysym::Return, None),
+                numlock,
+                0b1,
+                KeyKind::Press,
+                false
+            ),
+            Some(b"\r".to_vec())
+        );
+        // Nor pollute the modifier parameter of a real chord.
+        let ctrl_numlock = Modifiers {
+            ctrl: true,
+            num_lock: true,
+            ..NONE
+        };
+        assert_eq!(
+            kitty_encode(
+                &key(Keysym::a, None),
+                ctrl_numlock,
+                0b1,
+                KeyKind::Press,
+                false
+            ),
+            Some(b"\x1b[97;5u".to_vec())
+        );
     }
 
     #[test]
