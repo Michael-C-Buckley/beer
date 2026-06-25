@@ -442,35 +442,93 @@ fn is_braille(c: char) -> bool {
     ('\u{2800}'..='\u{28ff}').contains(&c)
 }
 
-/// Draw a braille pattern as a 2×4 grid of dots filling the cell. The low eight
-/// bits of the codepoint select dots, numbered down each column then across:
-/// `0x01 0x08 / 0x02 0x10 / 0x04 0x20 / 0x40 0x80` for (col0,col1) rows 0-3.
+/// Braille dot geometry for a `width`×`height` cell: the square dot side `w`,
+/// the two column origins, and the four row origins. Ported verbatim from
+/// foot's `box-drawing.c` `draw_braille` - base size and spacing from the cell,
+/// then leftover pixels distributed (dot → margin → spacing → margin → dot) so
+/// dots land on exact pixels with no rounding drift.
+fn braille_geometry(width: i32, height: i32) -> (u32, [i32; 2], [i32; 4]) {
+    let mut w = (width / 4).min(height / 8);
+    let mut x_spacing = width / 4;
+    let mut y_spacing = height / 8;
+    let mut x_margin = x_spacing / 2;
+    let mut y_margin = y_spacing / 2;
+
+    let mut x_left = width - 2 * x_margin - x_spacing - 2 * w;
+    let mut y_left = height - 2 * y_margin - 3 * y_spacing - 4 * w;
+
+    // First, try hard to ensure a non-zero dot width.
+    if x_left >= 2 && y_left >= 4 && w == 0 {
+        w += 1;
+        x_left -= 2;
+        y_left -= 4;
+    }
+    // Second, prefer a non-zero margin.
+    if x_left >= 2 && x_margin == 0 {
+        x_margin = 1;
+        x_left -= 2;
+    }
+    if y_left >= 2 && y_margin == 0 {
+        y_margin = 1;
+        y_left -= 2;
+    }
+    // Third, increase spacing.
+    if x_left >= 1 {
+        x_spacing += 1;
+        x_left -= 1;
+    }
+    if y_left >= 3 {
+        y_spacing += 1;
+        y_left -= 3;
+    }
+    // Fourth, the side margins.
+    if x_left >= 2 {
+        x_margin += 1;
+        x_left -= 2;
+    }
+    if y_left >= 2 {
+        y_margin += 1;
+        y_left -= 2;
+    }
+    // Last, increase the dot width.
+    if x_left >= 2 && y_left >= 4 {
+        w += 1;
+    }
+
+    let xs = [x_margin, x_margin + w + x_spacing];
+    let ys = [
+        y_margin,
+        y_margin + w + y_spacing,
+        y_margin + 2 * (w + y_spacing),
+        y_margin + 3 * (w + y_spacing),
+    ];
+    (w.max(0) as u32, xs, ys)
+}
+
+/// Draw a braille pattern as a 2×4 grid of `w`×`w` square dots. Geometry ported
+/// from foot's `box-drawing.c` `draw_braille`: a dot size and base spacing are
+/// derived from the cell, then leftover pixels are distributed (dot width →
+/// margins → spacing → …) so dots land on exact pixels with no rounding drift.
+/// The low eight bits of the codepoint select dots: bits 0-2 are the left
+/// column rows 0-2, bits 3-5 the right column rows 0-2, bits 6-7 the bottom row.
 fn draw_braille(canvas: &mut Canvas, c: char, x0: i32, top: i32, m: CellMetrics, fg: Rgb) {
-    let bits = (c as u32).wrapping_sub(0x2800) as u8;
-    let (w, h) = (m.width as i32, m.height as i32);
-    // Each dot owns a 1/2-width by 1/4-height sub-cell; the dot itself fills
-    // most of it and is kept square so columns and rows look even.
-    let sub_w = w / 2;
-    let sub_h = h / 4;
-    let dot = ((sub_w.min(sub_h) * 7) / 10).max(1);
-    // (mask, column, row) for the eight dots.
-    const DOTS: [(u8, i32, i32); 8] = [
+    let (w, xs, ys) = braille_geometry(m.width as i32, m.height as i32);
+    let sym = ((c as u32) - 0x2800) as u8;
+    // (bit mask, column index, row index).
+    const DOTS: [(u8, usize, usize); 8] = [
         (0x01, 0, 0),
         (0x02, 0, 1),
         (0x04, 0, 2),
-        (0x40, 0, 3),
         (0x08, 1, 0),
         (0x10, 1, 1),
         (0x20, 1, 2),
+        (0x40, 0, 3),
         (0x80, 1, 3),
     ];
     for (mask, col, row) in DOTS {
-        if bits & mask == 0 {
-            continue;
+        if sym & mask != 0 {
+            canvas.fill_rect(x0 + xs[col], top + ys[row], w, w, fg);
         }
-        let cx = x0 + col * sub_w + sub_w / 2;
-        let cy = top + row * sub_h + sub_h / 2;
-        canvas.fill_rect(cx - dot / 2, cy - dot / 2, dot as u32, dot as u32, fg);
     }
 }
 
@@ -523,5 +581,20 @@ fn draw_decorations(
     }
     if cell.flags.contains(Flags::STRIKE) {
         canvas.hline(x0, top + m.ascent as i32 * 2 / 3, w, fg);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::braille_geometry;
+
+    // Pinned to foot box-drawing.c draw_braille output (cross-checked numerically
+    // identical across cell sizes 4..30 x 6..48); guards against drift.
+    #[test]
+    fn braille_geometry_matches_foot() {
+        assert_eq!(braille_geometry(8, 18), (2, [1, 5], [2, 6, 10, 14]));
+        assert_eq!(braille_geometry(10, 20), (2, [1, 6], [1, 6, 11, 16]));
+        assert_eq!(braille_geometry(12, 27), (3, [1, 8], [1, 8, 15, 22]));
+        assert_eq!(braille_geometry(7, 15), (1, [1, 4], [2, 5, 8, 11]));
     }
 }
