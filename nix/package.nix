@@ -4,6 +4,8 @@
   pkg-config,
   makeBinaryWrapper,
   ncurses,
+  scdoc,
+  installShellFiles,
   wayland,
   libxkbcommon,
   freetype,
@@ -24,6 +26,7 @@ rustPlatform.buildRustPackage (finalAttrs: {
         (s + /Cargo.lock)
         (s + /Cargo.toml)
         (s + /terminfo)
+        (s + /doc)
       ];
     };
 
@@ -35,6 +38,8 @@ rustPlatform.buildRustPackage (finalAttrs: {
     pkg-config
     makeBinaryWrapper
     ncurses # tic
+    scdoc # man page generation
+    installShellFiles # installManPage
   ];
 
   buildInputs = [
@@ -49,6 +54,12 @@ rustPlatform.buildRustPackage (finalAttrs: {
   postInstall = ''
     mkdir -p "$out/share/terminfo"
     tic -x -o "$out/share/terminfo" terminfo/beer.info
+
+    # Generate the man pages from their scdoc sources.
+    scdoc < doc/beer.1.scd > beer.1
+    scdoc < doc/beer.toml.5.scd > beer.toml.5
+    installManPage beer.1 beer.toml.5
+
     wrapProgram "$out/bin/beer" \
       --prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath [wayland libxkbcommon]}
   '';

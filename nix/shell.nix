@@ -9,6 +9,7 @@
   cargo-deny,
   pkg-config,
   ncurses,
+  scdoc,
   wayland,
   wayland-protocols,
   wayland-scanner,
@@ -31,6 +32,7 @@ mkShell {
     cargo-deny
     pkg-config
     ncurses # tic, to compile the terminfo entry
+    scdoc # generate man pages from doc/*.scd
   ];
 
   buildInputs = [
