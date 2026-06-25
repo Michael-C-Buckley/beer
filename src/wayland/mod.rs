@@ -1130,6 +1130,28 @@ impl App {
         self.seats.get(self.active_seat)
     }
 
+    /// Attach the seat-scoped clipboard and primary-selection devices to seat
+    /// `i` if not already present. Idempotent, so it can run from either
+    /// `new_seat` or `new_capability` - some compositors surface a pre-existing
+    /// seat's capabilities without ever firing `new_seat`.
+    fn ensure_clipboard_devices(
+        &mut self,
+        qh: &QueueHandle<Self>,
+        seat: &wl_seat::WlSeat,
+        i: usize,
+    ) {
+        if self.seats[i].data_device.is_none() {
+            let dd = self.data_device_manager.get_data_device(qh, seat);
+            self.seats[i].data_device = Some(dd);
+        }
+        if self.seats[i].primary_device.is_none()
+            && let Some(m) = self.primary_manager.as_ref()
+        {
+            let pd = m.get_selection_device(qh, seat);
+            self.seats[i].primary_device = Some(pd);
+        }
+    }
+
     /// The active seat's clipboard device, if any.
     fn data_device(&self) -> Option<&DataDevice> {
         self.active().and_then(|s| s.data_device.as_ref())
@@ -1509,9 +1531,11 @@ impl App {
     /// Paste the CLIPBOARD selection into the shell (Ctrl+Shift+V).
     fn paste_clipboard(&mut self) {
         let Some(offer) = self.data_device().and_then(|d| d.data().selection_offer()) else {
+            tracing::debug!("paste: no clipboard selection offer");
             return;
         };
         let Some(mime) = offer.with_mime_types(pick_mime) else {
+            tracing::debug!("paste: no acceptable text mime type offered");
             return;
         };
         if let Ok(pipe) = offer.receive(mime) {
@@ -1547,6 +1571,7 @@ impl App {
                 let mut tmp = [0u8; 4096];
                 match f.read(&mut tmp) {
                     Ok(0) => {
+                        tracing::debug!("paste: read {} bytes from clipboard", data.len());
                         app.paste_bytes(&data);
                         PostAction::Remove
                     }

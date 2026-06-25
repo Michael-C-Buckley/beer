@@ -92,14 +92,8 @@ impl SeatHandler for App {
 
     fn new_seat(&mut self, _: &Connection, qh: &QueueHandle<Self>, seat: wl_seat::WlSeat) {
         // Clipboard/primary devices are seat-scoped, not capability-scoped.
-        let data_device = Some(self.data_device_manager.get_data_device(qh, &seat));
-        let primary_device = self
-            .primary_manager
-            .as_ref()
-            .map(|m| m.get_selection_device(qh, &seat));
         let i = self.seat_index(&seat);
-        self.seats[i].data_device = data_device;
-        self.seats[i].primary_device = primary_device;
+        self.ensure_clipboard_devices(qh, &seat, i);
     }
 
     fn new_capability(
@@ -110,6 +104,9 @@ impl SeatHandler for App {
         capability: Capability,
     ) {
         let i = self.seat_index(&seat);
+        // A pre-existing seat may reach us via its capabilities without a
+        // `new_seat` call, so make sure the clipboard devices are attached.
+        self.ensure_clipboard_devices(qh, &seat, i);
         if capability == Capability::Keyboard && self.seats[i].keyboard.is_none() {
             // get_keyboard_with_repeat drives key repeat off a calloop timer and
             // delivers each repeat through the callback.
