@@ -50,6 +50,7 @@ dependencies = [
  "unicode-width",
  "vte",
  "wayland-client",
+ "wayland-protocols",
 ]
 
 [[package]]

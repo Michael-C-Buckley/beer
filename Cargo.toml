@@ -31,6 +31,11 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 unicode-width = "0.2.2"
 vte = "0.15.0"
 wayland-client = "0.31.14"
+wayland-protocols = { version = "0.32.13", features = [
+  "client",
+  "staging",
+  "unstable",
+] }
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

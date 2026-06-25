@@ -70,13 +70,20 @@ use smithay_client_toolkit::{
     },
 };
 use wayland_client::{
-    Connection, QueueHandle,
-    globals::registry_queue_init,
+    Connection, Dispatch, Proxy, QueueHandle,
+    globals::{GlobalList, registry_queue_init},
     protocol::{
         wl_data_device::WlDataDevice, wl_data_device_manager::DndAction,
         wl_data_source::WlDataSource, wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm,
         wl_surface,
     },
+};
+use wayland_protocols::wp::fractional_scale::v1::client::{
+    wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1,
+    wp_fractional_scale_v1::{self, WpFractionalScaleV1},
+};
+use wayland_protocols::wp::viewporter::client::{
+    wp_viewport::WpViewport, wp_viewporter::WpViewporter,
 };
 
 /// MIME types beer offers and accepts for clipboard text.
@@ -195,6 +202,20 @@ pub fn run(config: Config, config_path: Option<std::path::PathBuf>) -> anyhow::R
     window.set_title("beer");
     window.set_app_id("dev.notashelf.beer");
     window.set_min_size(Some((1, 1)));
+
+    // Decorrelate buffer pixels from surface size so we can render at the
+    // compositor's preferred fractional scale (crisp glyphs on a 150% output)
+    // and present at the logical size. Both are optional; without them the
+    // window falls back to integer buffer scaling via `scale_factor_changed`.
+    let viewport = bind_global::<WpViewporter>(&globals, &qh)
+        .map(|vp| vp.get_viewport(window.wl_surface(), &qh, ()));
+    // Fractional scaling needs a viewport to present the scaled buffer back at
+    // the logical size; without one we can only do integer buffer scaling.
+    let fractional_scale = viewport.as_ref().and_then(|_| {
+        bind_global::<WpFractionalScaleManagerV1>(&globals, &qh)
+            .map(|mgr| mgr.get_fractional_scale(window.wl_surface(), &qh, ()))
+    });
+
     // First commit with no buffer kicks off the initial configure.
     window.commit();
 
@@ -231,6 +252,9 @@ pub fn run(config: Config, config_path: Option<std::path::PathBuf>) -> anyhow::R
         primary_manager,
         cursor_shape_manager,
         cursor_shape_device: None,
+        viewport,
+        fractional_scale,
+        scale120: 120,
         data_device: None,
         primary_device: None,
         copy_source: None,
@@ -312,6 +336,22 @@ pub fn run(config: Config, config_path: Option<std::path::PathBuf>) -> anyhow::R
     Ok(app.exit_code)
 }
 
+/// Bind a singleton global at version 1 with `()` user-data, or `None` if the
+/// compositor does not advertise it.
+fn bind_global<I>(globals: &GlobalList, qh: &QueueHandle<App>) -> Option<I>
+where
+    I: Proxy + 'static,
+    App: Dispatch<I, ()>,
+{
+    match globals.bind(qh, 1..=1, ()) {
+        Ok(global) => Some(global),
+        Err(err) => {
+            tracing::debug!("bind {}: {err}", I::interface().name);
+            None
+        }
+    }
+}
+
 /// Columns and rows that fit a `width`×`height` px window at `metrics`, after
 /// reserving `2 * pad` pixels of inner padding on each axis.
 fn grid_size(
@@ -363,6 +403,12 @@ struct App {
     /// Sets the pointer to an I-beam over the window (cursor-shape-v1).
     cursor_shape_manager: Option<CursorShapeManager>,
     cursor_shape_device: Option<WpCursorShapeDeviceV1>,
+    /// Presents a scaled buffer at the logical surface size (viewporter).
+    viewport: Option<WpViewport>,
+    /// Per-surface fractional-scale object; kept alive to receive scale events.
+    fractional_scale: Option<WpFractionalScaleV1>,
+    /// Compositor's preferred scale in 120ths (120 = 1.0, 180 = 1.5).
+    scale120: u32,
     data_device: Option<DataDevice>,
     primary_device: Option<PrimarySelectionDevice>,
     /// Held while we own the clipboard / primary selection, serving paste reads.
@@ -432,12 +478,7 @@ struct App {
 impl App {
     /// Spawn the shell at the current window size and start reading its output.
     fn spawn_session(&mut self) {
-        let (cols, rows) = grid_size(
-            self.renderer.metrics(),
-            self.width,
-            self.height,
-            (self.config.main.pad_x, self.config.main.pad_y),
-        );
+        let (cols, rows) = self.grid_dims();
         let pty = match Pty::spawn(cols, rows, &self.config.main.term) {
             Ok(pty) => pty,
             Err(err) => {
@@ -596,13 +637,17 @@ impl App {
         let new = Config::load(self.config_path.as_deref());
         self.bindings =
             crate::bindings::Bindings::from_config(&new.key_bindings, &new.text_bindings);
-        self.renderer.set_padding(new.main.pad_x, new.main.pad_y);
-        if new.main.font != self.config.main.font || new.main.font_size != self.font_size {
-            match self.renderer.set_font(&new.main.font, new.main.font_size) {
-                Ok(()) => self.font_size = new.main.font_size,
-                Err(err) => tracing::warn!("reload font: {err:#}"),
-            }
+        let font_changed = new.main.font != self.config.main.font
+            || new.main.font_size != self.config.main.font_size;
+        if font_changed {
+            self.font_size = new.main.font_size;
         }
+        self.config.main.font = new.main.font.clone();
+        self.config.main.font_size = new.main.font_size;
+        self.config.main.pad_x = new.main.pad_x;
+        self.config.main.pad_y = new.main.pad_y;
+        // Re-rasterize at the active scale and update padding in one place.
+        self.rescale_render();
         if let Some(session) = self.session.as_mut() {
             session
                 .term
@@ -628,11 +673,8 @@ impl App {
         if new_size == self.font_size {
             return;
         }
-        if let Err(err) = self.renderer.set_font(&self.config.main.font, new_size) {
-            tracing::warn!("resize font: {err:#}");
-            return;
-        }
         self.font_size = new_size;
+        self.rescale_render();
         self.frames.clear();
         self.resize_grid();
         self.needs_draw = true;
@@ -687,12 +729,78 @@ impl App {
         self.needs_draw = true;
     }
 
-    /// Inner padding `(x, y)` in pixels.
+    /// Scale a logical pixel length to physical (buffer) pixels at the current
+    /// fractional scale, rounding to nearest.
+    fn to_phys(&self, v: u32) -> u32 {
+        ((u64::from(v) * u64::from(self.scale120) + 60) / 120) as u32
+    }
+
+    /// Physical (buffer) pixel size at the current scale.
+    fn phys_dims(&self) -> (u32, u32) {
+        (
+            self.to_phys(self.width).max(1),
+            self.to_phys(self.height).max(1),
+        )
+    }
+
+    /// Columns and rows for the current physical size, metrics, and padding.
+    /// Scale-invariant: every term scales together so the cell count is stable.
+    fn grid_dims(&self) -> (u16, u16) {
+        let (pw, ph) = self.phys_dims();
+        grid_size(
+            self.renderer.metrics(),
+            pw,
+            ph,
+            (
+                self.to_phys(self.config.main.pad_x),
+                self.to_phys(self.config.main.pad_y),
+            ),
+        )
+    }
+
+    /// Re-rasterize the font and padding at the current scale × the logical
+    /// font size, so glyphs are crisp at fractional scales.
+    fn rescale_render(&mut self) {
+        self.renderer.set_padding(
+            self.to_phys(self.config.main.pad_x),
+            self.to_phys(self.config.main.pad_y),
+        );
+        let px = self.to_phys(self.font_size).max(1);
+        if let Err(err) = self.renderer.set_font(&self.config.main.font, px) {
+            tracing::warn!("rasterize font at scale {}: {err:#}", self.scale120);
+        }
+    }
+
+    /// Adopt a new preferred scale (in 120ths): re-rasterize, re-derive the grid
+    /// geometry, and update the viewport so the logical size stays put.
+    fn set_scale(&mut self, scale120: u32) {
+        let scale120 = scale120.max(1);
+        if scale120 == self.scale120 {
+            return;
+        }
+        self.scale120 = scale120;
+        self.rescale_render();
+        self.frames.clear();
+        self.buf_dims = (0, 0);
+        if let Some(vp) = &self.viewport {
+            vp.set_destination(self.width.max(1) as i32, self.height.max(1) as i32);
+        }
+        self.resize_grid();
+        self.needs_draw = true;
+    }
+
+    /// Inner padding `(x, y)` in physical pixels (pointer coords are converted
+    /// to physical before use).
     fn padding(&self) -> (f64, f64) {
         (
-            f64::from(self.config.main.pad_x),
-            f64::from(self.config.main.pad_y),
+            f64::from(self.to_phys(self.config.main.pad_x)),
+            f64::from(self.to_phys(self.config.main.pad_y)),
         )
+    }
+
+    /// Convert a logical surface coordinate to a physical buffer coordinate.
+    fn to_phys_f(&self, v: f64) -> f64 {
+        v * f64::from(self.scale120) / 120.0
     }
 
     /// Map window pixel coordinates to an absolute `(row, col)` grid point.
@@ -700,6 +808,7 @@ impl App {
         let session = self.session.as_ref()?;
         let m = self.renderer.metrics();
         let (pad_x, pad_y) = self.padding();
+        let (px, py) = (self.to_phys_f(px), self.to_phys_f(py));
         let grid = session.term.grid();
         let col =
             ((px - pad_x).max(0.0) as usize / m.width as usize).min(grid.cols().saturating_sub(1));
@@ -825,10 +934,14 @@ impl App {
         let session = self.session.as_ref()?;
         let m = self.renderer.metrics();
         let (pad_x, pad_y) = self.padding();
+        let (ppx, ppy) = (
+            self.to_phys_f(self.pointer_pos.0),
+            self.to_phys_f(self.pointer_pos.1),
+        );
         let grid = session.term.grid();
-        let col = ((self.pointer_pos.0 - pad_x).max(0.0) as usize / m.width as usize)
-            .min(grid.cols().saturating_sub(1));
-        let row = ((self.pointer_pos.1 - pad_y).max(0.0) as usize / m.height as usize)
+        let col =
+            ((ppx - pad_x).max(0.0) as usize / m.width as usize).min(grid.cols().saturating_sub(1));
+        let row = ((ppy - pad_y).max(0.0) as usize / m.height as usize)
             .min(grid.rows().saturating_sub(1));
         Some((col, row))
     }
@@ -1135,12 +1248,7 @@ impl App {
     /// Recompute the grid size for the current window and tell the grid and the
     /// PTY about it if it changed.
     fn resize_grid(&mut self) {
-        let (cols, rows) = grid_size(
-            self.renderer.metrics(),
-            self.width,
-            self.height,
-            (self.config.main.pad_x, self.config.main.pad_y),
-        );
+        let (cols, rows) = self.grid_dims();
         let Some(session) = self.session.as_mut() else {
             return;
         };
@@ -1213,7 +1321,9 @@ impl App {
     /// them, damage just those rows, and commit with a frame-callback request.
     fn present(&mut self) {
         self.needs_draw = false;
-        let (w, h) = (self.width, self.height);
+        // Render into a buffer sized in physical pixels (logical × scale); the
+        // viewport presents it back at the logical surface size.
+        let (w, h) = self.phys_dims();
         let m = self.renderer.metrics();
         let (focused, blink_on) = (self.focused, self.blink_on);
 
@@ -1299,7 +1409,7 @@ impl App {
         // A buffer used for the first time has uninitialized margins; paint the
         // whole thing (background + padding) once, then damage it in full below.
         let fresh = self.frames[idx].rows.is_empty();
-        let pad_y = self.config.main.pad_y as i32;
+        let pad_y = self.to_phys(self.config.main.pad_y) as i32;
         let Some(canvas) = self.pool.canvas(&self.frames[idx].buffer) else {
             return;
         };
@@ -1329,6 +1439,14 @@ impl App {
             tracing::error!("attach buffer: {err}");
             return;
         }
+        // With a viewport the buffer is presented at the logical destination, so
+        // its own scale stays 1; without one, fall back to integer buffer scale.
+        if let Some(vp) = &self.viewport {
+            surface.set_buffer_scale(1);
+            vp.set_destination(self.width.max(1) as i32, self.height.max(1) as i32);
+        } else {
+            surface.set_buffer_scale((self.scale120 / 120).max(1) as i32);
+        }
         if fresh {
             surface.damage_buffer(0, 0, w as i32, h as i32);
         } else {
@@ -1349,8 +1467,13 @@ impl CompositorHandler for App {
         _: &Connection,
         _: &QueueHandle<Self>,
         _: &wl_surface::WlSurface,
-        _: i32,
+        factor: i32,
     ) {
+        // Integer fallback for compositors without fractional-scale-v1; ignored
+        // when the fractional-scale object drives the scale instead.
+        if self.fractional_scale.is_none() {
+            self.set_scale((factor.max(1) as u32) * 120);
+        }
     }
 
     fn transform_changed(
@@ -1403,6 +1526,9 @@ impl WindowHandler for App {
         if let (Some(w), Some(h)) = configure.new_size {
             self.width = w.get();
             self.height = h.get();
+            if let Some(vp) = &self.viewport {
+                vp.set_destination(self.width.max(1) as i32, self.height.max(1) as i32);
+            }
         }
         self.focused = configure.is_activated();
         if self.session.is_none() {
@@ -1851,6 +1977,59 @@ impl PrimarySelectionSourceHandler for App {
         {
             self.primary_source = None;
         }
+    }
+}
+
+// Fractional-scale and viewporter are not wrapped by sctk, so dispatch them by
+// hand. Only the fractional-scale object carries an event we act on.
+impl Dispatch<WpFractionalScaleV1, ()> for App {
+    fn event(
+        state: &mut Self,
+        _: &WpFractionalScaleV1,
+        event: wp_fractional_scale_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wp_fractional_scale_v1::Event::PreferredScale { scale } = event {
+            state.set_scale(scale);
+        }
+    }
+}
+
+impl Dispatch<WpFractionalScaleManagerV1, ()> for App {
+    fn event(
+        _: &mut Self,
+        _: &WpFractionalScaleManagerV1,
+        _: <WpFractionalScaleManagerV1 as Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<WpViewporter, ()> for App {
+    fn event(
+        _: &mut Self,
+        _: &WpViewporter,
+        _: <WpViewporter as Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<WpViewport, ()> for App {
+    fn event(
+        _: &mut Self,
+        _: &WpViewport,
+        _: <WpViewport as Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
     }
 }
 
