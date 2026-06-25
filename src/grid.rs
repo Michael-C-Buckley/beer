@@ -226,6 +226,10 @@ pub struct Grid {
     focus_events: bool,
     /// Active incremental scrollback search, if any.
     search: Option<SearchState>,
+    /// Characters that break a word for double-click selection.
+    word_delimiters: String,
+    /// History retention cap for the main screen.
+    scrollback_cap: usize,
 }
 
 fn default_tabs(cols: usize) -> Vec<bool> {
@@ -237,9 +241,9 @@ fn default_tabs(cols: usize) -> Vec<bool> {
 /// flags select as one unit.
 const WORD_DELIMITERS: &str = " \t`!@#$%^&*()+=[]{}\\|;'\",<>?";
 
-/// Whether `c` is part of a word (not whitespace, not a delimiter).
-fn is_word(c: char) -> bool {
-    !c.is_whitespace() && !WORD_DELIMITERS.contains(c)
+/// Whether `c` is part of a word (not whitespace, not in `delims`).
+fn is_word(c: char, delims: &str) -> bool {
+    !c.is_whitespace() && !delims.contains(c)
 }
 
 impl Grid {
@@ -276,7 +280,25 @@ impl Grid {
             mouse_encoding: MouseEncoding::X10,
             focus_events: false,
             search: None,
+            word_delimiters: WORD_DELIMITERS.to_string(),
+            scrollback_cap: SCROLLBACK_CAP,
         }
+    }
+
+    /// Override the word-delimiter set; `None` keeps the built-in default.
+    pub fn set_word_delimiters(&mut self, delims: Option<String>) {
+        if let Some(d) = delims {
+            self.word_delimiters = d;
+        }
+    }
+
+    /// Set the scrollback retention cap, trimming history if it shrank.
+    pub fn set_scrollback_cap(&mut self, cap: usize) {
+        self.scrollback_cap = cap;
+        while self.scrollback.len() > cap {
+            self.scrollback.pop_front();
+        }
+        self.view_offset = self.view_offset.min(self.scrollback.len());
     }
 
     pub fn cols(&self) -> usize {
@@ -403,7 +425,7 @@ impl Grid {
         while live.len() < rows {
             live.push(Line::blank(cols));
         }
-        while scrollback.len() > SCROLLBACK_CAP {
+        while scrollback.len() > self.scrollback_cap {
             scrollback.pop_front();
         }
 
@@ -722,7 +744,7 @@ impl Grid {
                 self.scrollback.push_back(line);
             }
             let mut evicted = 0;
-            while self.scrollback.len() > SCROLLBACK_CAP {
+            while self.scrollback.len() > self.scrollback_cap {
                 self.scrollback.pop_front();
                 evicted += 1;
             }
@@ -995,17 +1017,18 @@ impl Grid {
     /// Select the word at an absolute point, breaking on whitespace and the
     /// default delimiter set.
     pub fn select_word(&mut self, row: usize, col: usize) {
+        let delims = &self.word_delimiters;
         let line = self.abs_row(row);
-        if col >= line.len() || !is_word(line[col].c) {
+        if col >= line.len() || !is_word(line[col].c, delims) {
             self.start_selection(row, col);
             return;
         }
         let mut lo = col;
-        while lo > 0 && is_word(line[lo - 1].c) {
+        while lo > 0 && is_word(line[lo - 1].c, delims) {
             lo -= 1;
         }
         let mut hi = col;
-        while hi + 1 < line.len() && is_word(line[hi + 1].c) {
+        while hi + 1 < line.len() && is_word(line[hi + 1].c, delims) {
             hi += 1;
         }
         self.selection = Some((Point { row, col: lo }, Point { row, col: hi }));

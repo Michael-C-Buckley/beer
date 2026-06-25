@@ -17,6 +17,7 @@ use calloop::timer::{TimeoutAction, Timer};
 use calloop::{EventLoop, Interest, LoopHandle, Mode, PostAction, RegistrationToken};
 use calloop_wayland_source::WaylandSource;
 
+use crate::config::Config;
 use crate::font::Fonts;
 use crate::grid::{Cell, CursorShape, Grid, MouseProtocol};
 use crate::pty::Pty;
@@ -161,15 +162,12 @@ fn row_snap(grid: &Grid, y: usize, focused: bool, blink_on: bool) -> RowSnap {
     }
 }
 
-/// Default window size in pixels before the compositor suggests one.
+/// Fallback window size in pixels if the configured geometry yields nothing.
 const DEFAULT_W: u32 = 800;
 const DEFAULT_H: u32 = 600;
-/// Primary font family and pixel size, resolved via fontconfig.
-const FONT_FAMILY: &str = "monospace";
-const FONT_SIZE_PX: u32 = 16;
 
 /// Run a single window until it is closed, returning the shell's exit code.
-pub fn run() -> anyhow::Result<ExitCode> {
+pub fn run(config: Config) -> anyhow::Result<ExitCode> {
     let conn = Connection::connect_to_env().context("connect to Wayland compositor")?;
     let (globals, event_queue) =
         registry_queue_init(&conn).context("initialize Wayland registry")?;
@@ -197,11 +195,19 @@ pub fn run() -> anyhow::Result<ExitCode> {
     // First commit with no buffer kicks off the initial configure.
     window.commit();
 
-    let pool = SlotPool::new(DEFAULT_W as usize * DEFAULT_H as usize * 4, &shm)
-        .context("create shm slot pool")?;
-
-    let fonts = Fonts::new(FONT_FAMILY, FONT_SIZE_PX).context("load font")?;
+    let fonts = Fonts::new(&config.main.font, config.main.font_size).context("load font")?;
     let renderer = Renderer::new(fonts);
+
+    // Start at the configured cell geometry; the compositor may override it on
+    // the first configure.
+    let m = renderer.metrics();
+    let width = (u32::from(config.main.initial_cols) * m.width).max(1);
+    let height = (u32::from(config.main.initial_rows) * m.height).max(1);
+    let pool = SlotPool::new(
+        (width * height * 4).max(DEFAULT_W * DEFAULT_H) as usize,
+        &shm,
+    )
+    .context("create shm slot pool")?;
 
     let mut app = App {
         registry_state: RegistryState::new(&globals),
@@ -239,8 +245,9 @@ pub fn run() -> anyhow::Result<ExitCode> {
         // startup SIGWINCH storm that makes it reprint its prompt.
         session: None,
         title: None,
-        width: DEFAULT_W,
-        height: DEFAULT_H,
+        config,
+        width,
+        height,
         needs_draw: false,
         frame_pending: false,
         frames: Vec::new(),
@@ -352,6 +359,8 @@ struct App {
     session: Option<Session>,
     /// Last title applied to the toplevel, to avoid redundant requests.
     title: Option<String>,
+    /// The active user configuration.
+    config: Config,
     width: u32,
     height: u32,
     /// The grid changed and the window wants repainting on the next frame.
@@ -379,7 +388,7 @@ impl App {
     /// Spawn the shell at the current window size and start reading its output.
     fn spawn_session(&mut self) {
         let (cols, rows) = grid_size(self.renderer.metrics(), self.width, self.height);
-        let pty = match Pty::spawn(cols, rows) {
+        let pty = match Pty::spawn(cols, rows, &self.config.main.term) {
             Ok(pty) => pty,
             Err(err) => {
                 tracing::error!("spawn shell: {err:#}");
@@ -428,10 +437,11 @@ impl App {
             return;
         }
 
-        self.session = Some(Session {
-            pty,
-            term: Term::new(cols as usize, rows as usize),
-        });
+        let mut term = Term::new(cols as usize, rows as usize);
+        let grid = term.grid_mut();
+        grid.set_word_delimiters(self.config.main.word_delimiters.clone());
+        grid.set_scrollback_cap(self.config.scrollback.lines);
+        self.session = Some(Session { pty, term });
     }
 
     /// Handle a key (initial press or repeat): Shift+PageUp/PageDown scroll the

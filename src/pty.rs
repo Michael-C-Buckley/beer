@@ -20,8 +20,8 @@ pub struct Pty {
 
 impl Pty {
     /// Open a PTY, size it to `cols`x`rows`, and exec the user's login shell on
-    /// the slave end with `TERM=beer`.
-    pub fn spawn(cols: u16, rows: u16) -> anyhow::Result<Self> {
+    /// the slave end with `TERM=term`.
+    pub fn spawn(cols: u16, rows: u16, term: &str) -> anyhow::Result<Self> {
         let master = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC)
             .context("open pty master")?;
         grantpt(&master).context("grantpt")?;
@@ -45,7 +45,7 @@ impl Pty {
 
         let mut cmd = Command::new(&shell);
         cmd.arg0(&argv0)
-            .env("TERM", "beer")
+            .env("TERM", term)
             .env_remove("COLUMNS")
             .env_remove("LINES")
             .env_remove("TERMCAP")

@@ -9,7 +9,7 @@ readme = true
 
 [dependencies]
 anyhow = "1.0.102"
-calloop = "0.14.4"
+calloop = { version = "0.14.4", features = ["signals"] }
 calloop-wayland-source = "0.4.1"
 fontconfig = "0.11.0"
 freetype-rs = "0.38.0"
@@ -22,8 +22,10 @@ rustix = { version = "1.1.4", features = [
   "stdio",
   "fs",
 ] }
+serde = { version = "1.0.228", features = ["derive"] }
 smithay-client-toolkit = "0.20.0"
 thiserror = "2.0.18"
+toml = "0.9"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 unicode-width = "0.2.2"
