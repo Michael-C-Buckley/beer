@@ -19,6 +19,7 @@ pub struct Config {
     pub mouse: Mouse,
     pub shell_integration: ShellIntegration,
     pub url: Url,
+    pub notify: Notify,
     /// Chord → action, e.g. `"Ctrl+Shift+C" = "copy"`. Merged over the defaults;
     /// a value of `"none"` unbinds.
     pub key_bindings: std::collections::HashMap<String, String>,
@@ -42,6 +43,27 @@ pub struct Cursor {
 pub struct Bell {
     /// Briefly flash the screen.
     pub visual: bool,
+    /// Command (argv) to run on the bell, e.g. `["paplay", "/usr/share/.../bell.oga"]`.
+    pub command: Vec<String>,
+    /// Request the compositor's attention (xdg-activation) when the bell rings
+    /// while the window is unfocused.
+    pub urgent: bool,
+}
+
+/// `[notify]`: how desktop notifications (OSC 9/777/99) are delivered.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct Notify {
+    /// Notifier argv; the title and body are appended as the last two arguments.
+    pub command: Vec<String>,
+}
+
+impl Default for Notify {
+    fn default() -> Self {
+        Self {
+            command: vec!["notify-send".to_string()],
+        }
+    }
 }
 
 /// `[mouse]`: pointer and wheel behaviour.

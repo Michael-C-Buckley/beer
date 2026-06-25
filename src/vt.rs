@@ -34,6 +34,14 @@ pub enum ClipboardOp {
     Query { primary: bool },
 }
 
+/// A desktop notification an application requested (OSC 9 / 777 / 99), for the
+/// front-end to deliver via the configured notifier.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Notification {
+    pub title: Option<String>,
+    pub body: String,
+}
+
 /// Which dynamic colour an OSC 10/11/17/19 escape targets.
 #[derive(Clone, Copy, Debug)]
 enum Dynamic {
@@ -106,6 +114,8 @@ pub struct Term {
     bell: bool,
     /// Working directory reported by the shell via OSC 7, for new windows.
     cwd: Option<String>,
+    /// Desktop notifications requested via OSC 9/777/99, drained by the front-end.
+    notifications: Vec<Notification>,
 }
 
 impl Term {
@@ -123,12 +133,18 @@ impl Term {
             theme: Theme::default(),
             bell: false,
             cwd: None,
+            notifications: Vec::new(),
         }
     }
 
     /// The working directory last reported by the shell (OSC 7), if any.
     pub fn cwd(&self) -> Option<&str> {
         self.cwd.as_deref()
+    }
+
+    /// Drain the desktop notifications requested since the last call.
+    pub fn take_notifications(&mut self) -> Vec<Notification> {
+        std::mem::take(&mut self.notifications)
     }
 
     /// Take and clear the pending bell flag.
@@ -691,6 +707,27 @@ impl Perform for Term {
                 let uri = std::str::from_utf8(&uri_bytes).unwrap_or("");
                 self.grid.set_link((!uri.is_empty()).then_some(uri));
             }
+            // OSC 9: iTerm2-style notification (`OSC 9 ; body`).
+            Some(&n) if n == b"9" => {
+                if let Some(body) = osc_text(params.get(1)) {
+                    self.notifications.push(Notification { title: None, body });
+                }
+            }
+            // OSC 777: `OSC 777 ; notify ; title ; body`.
+            Some(&n) if n == b"777" && params.get(1) == Some(&&b"notify"[..]) => {
+                let title = osc_text(params.get(2));
+                if let Some(body) = osc_text(params.get(3)) {
+                    self.notifications.push(Notification { title, body });
+                }
+            }
+            // OSC 99: kitty desktop-notification protocol. We honour the common
+            // single-chunk form, taking the payload as the body and ignoring the
+            // metadata key=value field.
+            Some(&n) if n == b"99" => {
+                if let Some(body) = osc_text(params.get(2)).filter(|b| !b.is_empty()) {
+                    self.notifications.push(Notification { title: None, body });
+                }
+            }
             // OSC 4: set/query palette entries (pairs of index;spec).
             Some(&n) if n == b"4" => self.osc_palette(params, bell),
             // OSC 104: reset palette (all, or the listed indices).
@@ -832,6 +869,11 @@ fn base64_decode(data: &[u8]) -> Option<Vec<u8>> {
         }
     }
     Some(out)
+}
+
+/// Decode an OSC string field to UTF-8 (lossy), or `None` if absent.
+fn osc_text(field: Option<&&[u8]>) -> Option<String> {
+    field.map(|b| String::from_utf8_lossy(b).into_owned())
 }
 
 /// Map an OSC 133 mark letter to a [`PromptKind`].
@@ -1156,6 +1198,28 @@ mod tests {
         feed(&mut t, b"\x1b]133;C\x07hi\r\n"); // output start, then output
         feed(&mut t, b"\x1b]133;D\x07"); // command finished
         assert_eq!(t.grid().last_command_output().as_deref(), Some("hi\n"));
+    }
+
+    #[test]
+    fn osc_notifications_collected() {
+        let mut t = Term::new(20, 2);
+        feed(&mut t, b"\x1b]9;hello\x07");
+        feed(&mut t, b"\x1b]777;notify;Title;Body\x07");
+        let n = t.take_notifications();
+        assert_eq!(
+            n,
+            vec![
+                Notification {
+                    title: None,
+                    body: "hello".into()
+                },
+                Notification {
+                    title: Some("Title".into()),
+                    body: "Body".into()
+                },
+            ]
+        );
+        assert!(t.take_notifications().is_empty());
     }
 
     #[test]

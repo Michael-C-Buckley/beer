@@ -32,6 +32,7 @@ use smithay_client_toolkit::reexports::protocols::wp::primary_selection::zv1::cl
     zwp_primary_selection_source_v1::ZwpPrimarySelectionSourceV1,
 };
 use smithay_client_toolkit::{
+    activation::{ActivationHandler, ActivationState, RequestData},
     compositor::{CompositorHandler, CompositorState},
     data_device_manager::{
         DataDeviceManagerState, WritePipe,
@@ -39,7 +40,8 @@ use smithay_client_toolkit::{
         data_offer::{DataOfferHandler, DragOffer},
         data_source::{CopyPasteSource, DataSourceHandler},
     },
-    delegate_compositor, delegate_data_device, delegate_keyboard, delegate_output,
+        delegate_activation, delegate_compositor, delegate_data_device, delegate_keyboard,
+    delegate_output,
     delegate_pointer, delegate_primary_selection, delegate_registry, delegate_seat, delegate_shm,
     delegate_xdg_shell, delegate_xdg_window,
     output::{OutputHandler, OutputState},
@@ -224,6 +226,7 @@ pub fn run(config: Config, config_path: Option<std::path::PathBuf>) -> anyhow::R
             .map(|mgr| mgr.get_fractional_scale(window.wl_surface(), &qh, ()))
     });
     let text_input_manager = bind_global::<ZwpTextInputManagerV3>(&globals, &qh);
+    let activation = ActivationState::bind(&globals, &qh).ok();
 
     // First commit with no buffer kicks off the initial configure.
     window.commit();
@@ -261,6 +264,7 @@ pub fn run(config: Config, config_path: Option<std::path::PathBuf>) -> anyhow::R
         primary_manager,
         cursor_shape_manager,
         text_input_manager,
+        activation,
         preedit: String::new(),
         ime_preedit_pending: String::new(),
         ime_commit_pending: String::new(),
@@ -435,6 +439,8 @@ struct App {
     cursor_shape_manager: Option<CursorShapeManager>,
     /// IME manager (text-input-v3); per-seat handles live in `seats`.
     text_input_manager: Option<ZwpTextInputManagerV3>,
+    /// xdg-activation, used to request attention on an urgent bell.
+    activation: Option<ActivationState>,
     /// Committed IME preedit string shown inline at the cursor while composing.
     preedit: String,
     /// Preedit/commit accumulated since the last text-input `done`.
@@ -1569,13 +1575,76 @@ impl App {
         }
         let rang = session.term.take_bell();
         let ops = session.term.take_clipboard_ops();
+        let notifications = session.term.take_notifications();
         if !ops.is_empty() {
             self.handle_clipboard_ops(ops);
         }
-        if rang && self.config.bell.visual {
-            self.start_flash();
+        for note in notifications {
+            self.send_notification(&note);
+        }
+        if rang {
+            self.ring_bell();
         }
         self.needs_draw = true;
+    }
+
+    /// React to a `BEL`: optionally flash, run the configured bell command, and
+    /// request the compositor's attention when unfocused.
+    fn ring_bell(&mut self) {
+        if self.config.bell.visual {
+            self.start_flash();
+        }
+        if let Some((program, args)) = self.config.bell.command.split_first() {
+            let _ = std::process::Command::new(program)
+                .args(args)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .inspect_err(|err| tracing::warn!("bell command: {err}"));
+        }
+        if self.config.bell.urgent && !self.focused {
+            self.request_attention();
+        }
+    }
+
+    /// Deliver a desktop notification through the configured notifier (default
+    /// `notify-send`), appending the title and body as the final arguments.
+    fn send_notification(&self, note: &crate::vt::Notification) {
+        let Some((program, args)) = self.config.notify.command.split_first() else {
+            return;
+        };
+        let title = note
+            .title
+            .clone()
+            .or_else(|| self.title.clone())
+            .unwrap_or_else(|| "beer".to_string());
+        let _ = std::process::Command::new(program)
+            .args(args)
+            .arg(title)
+            .arg(&note.body)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .inspect_err(|err| tracing::warn!("notify command: {err}"));
+    }
+
+    /// Ask the compositor to draw attention to the window (xdg-activation).
+    fn request_attention(&mut self) {
+        let Some(activation) = self.activation.as_ref() else {
+            return;
+        };
+        let seat_and_serial = self
+            .seats
+            .get(self.active_seat)
+            .map(|s| (s.seat.clone(), self.serial));
+        let data = smithay_client_toolkit::activation::RequestData {
+            app_id: Some("dev.notashelf.beer".to_string()),
+            seat_and_serial,
+            surface: Some(self.window.wl_surface().clone()),
+        };
+        activation.request_token::<App>(&self.qh, data);
     }
 
     /// Begin a visual-bell flash: invert the screen for a moment. Clearing the
@@ -2478,6 +2547,17 @@ impl Dispatch<WpViewport, ()> for App {
     }
 }
 
+impl ActivationHandler for App {
+    type RequestData = RequestData;
+
+    fn new_token(&mut self, token: String, _: &RequestData) {
+        // The compositor granted an activation token; use it to draw attention.
+        if let Some(activation) = self.activation.as_ref() {
+            activation.activate::<App>(self.window.wl_surface(), token);
+        }
+    }
+}
+
 impl Dispatch<ZwpTextInputManagerV3, ()> for App {
     fn event(
         _: &mut Self,
@@ -2542,3 +2622,4 @@ delegate_xdg_window!(App);
 delegate_data_device!(App);
 delegate_primary_selection!(App);
 delegate_registry!(App);
+delegate_activation!(App);
