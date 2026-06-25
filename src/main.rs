@@ -62,5 +62,5 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
 
     let config = Config::load(cli.config.as_deref());
     tracing::info!("starting beer");
-    wayland::run(config)
+    wayland::run(config, cli.config)
 }

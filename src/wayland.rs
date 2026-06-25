@@ -170,7 +170,7 @@ const DEFAULT_W: u32 = 800;
 const DEFAULT_H: u32 = 600;
 
 /// Run a single window until it is closed, returning the shell's exit code.
-pub fn run(config: Config) -> anyhow::Result<ExitCode> {
+pub fn run(config: Config, config_path: Option<std::path::PathBuf>) -> anyhow::Result<ExitCode> {
     let conn = Connection::connect_to_env().context("connect to Wayland compositor")?;
     let (globals, event_queue) =
         registry_queue_init(&conn).context("initialize Wayland registry")?;
@@ -254,6 +254,7 @@ pub fn run(config: Config) -> anyhow::Result<ExitCode> {
         session: None,
         title: None,
         config,
+        config_path,
         bindings,
         font_size,
         fullscreen: false,
@@ -284,6 +285,19 @@ pub fn run(config: Config) -> anyhow::Result<ExitCode> {
         });
     if let Err(err) = blink_registered {
         tracing::warn!("register blink timer: {err}");
+    }
+
+    // SIGUSR1 reloads the config in place.
+    match calloop::signals::Signals::new(&[calloop::signals::Signal::SIGUSR1]) {
+        Ok(signals) => {
+            let registered = event_loop
+                .handle()
+                .insert_source(signals, |_, _, app: &mut App| app.reload_config());
+            if let Err(err) = registered {
+                tracing::warn!("register signal source: {err}");
+            }
+        }
+        Err(err) => tracing::warn!("install SIGUSR1 handler: {err}"),
     }
 
     // Each iteration blocks until an event (PTY output, input, configure, frame
@@ -380,6 +394,8 @@ struct App {
     title: Option<String>,
     /// The active user configuration.
     config: Config,
+    /// Path the config was loaded from, for SIGUSR1 live reload.
+    config_path: Option<std::path::PathBuf>,
     /// Resolved key/text bindings.
     bindings: crate::bindings::Bindings,
     /// Current font size in pixels (changed by font-resize bindings).
@@ -573,6 +589,37 @@ impl App {
         } else {
             self.window.unset_fullscreen();
         }
+    }
+
+    /// Re-read the config file and apply it in place (SIGUSR1).
+    fn reload_config(&mut self) {
+        let new = Config::load(self.config_path.as_deref());
+        self.bindings =
+            crate::bindings::Bindings::from_config(&new.key_bindings, &new.text_bindings);
+        self.renderer.set_padding(new.main.pad_x, new.main.pad_y);
+        if new.main.font != self.config.main.font || new.main.font_size != self.font_size {
+            match self.renderer.set_font(&new.main.font, new.main.font_size) {
+                Ok(()) => self.font_size = new.main.font_size,
+                Err(err) => tracing::warn!("reload font: {err:#}"),
+            }
+        }
+        if let Some(session) = self.session.as_mut() {
+            session
+                .term
+                .set_theme(crate::theme::Theme::from_config(&new.colors));
+            let grid = session.term.grid_mut();
+            grid.set_word_delimiters(new.main.word_delimiters.clone());
+            grid.set_scrollback_cap(new.scrollback.lines);
+            if let Some(shape) = cursor_shape_from(new.cursor.style.as_deref()) {
+                grid.set_cursor_shape(shape);
+            }
+            grid.set_cursor_blink(new.cursor.blink);
+        }
+        self.config = new;
+        self.frames.clear();
+        self.resize_grid();
+        self.needs_draw = true;
+        tracing::info!("config reloaded");
     }
 
     /// Re-rasterize the font at `new_size`, then re-derive the grid geometry.
