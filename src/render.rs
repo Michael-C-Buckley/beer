@@ -201,7 +201,12 @@ impl Renderer {
             }
             let (fg, _) = cell_colors(cell, theme);
             let origin_x = pad_x + x as i32 * m.width as i32;
-            if cell.c != ' ' {
+            if is_braille(cell.c) {
+                // Drawn directly so the dots are crisp and fill the cell, the
+                // way tools like btop expect, rather than however the fallback
+                // font happens to size its braille glyphs.
+                draw_braille(&mut canvas, cell.c, origin_x, row_top, m, fg);
+            } else if cell.c != ' ' {
                 self.draw_glyph(&mut canvas, cell.c, cell_style(cell), origin_x, row_top, fg);
             }
             // Stack any combining marks over the base glyph; their own bearings
@@ -430,6 +435,43 @@ fn cell_colors(cell: &Cell, theme: &Theme) -> (Rgb, Rgb) {
 fn blend_rgb(c: Rgb, toward: Rgb) -> Rgb {
     let mix = |a: u8, b: u8| ((u32::from(a) * 2 + u32::from(b)) / 3) as u8;
     Rgb(mix(c.0, toward.0), mix(c.1, toward.1), mix(c.2, toward.2))
+}
+
+/// Whether `c` is a Braille Patterns codepoint (U+2800-U+28FF).
+fn is_braille(c: char) -> bool {
+    ('\u{2800}'..='\u{28ff}').contains(&c)
+}
+
+/// Draw a braille pattern as a 2×4 grid of dots filling the cell. The low eight
+/// bits of the codepoint select dots, numbered down each column then across:
+/// `0x01 0x08 / 0x02 0x10 / 0x04 0x20 / 0x40 0x80` for (col0,col1) rows 0-3.
+fn draw_braille(canvas: &mut Canvas, c: char, x0: i32, top: i32, m: CellMetrics, fg: Rgb) {
+    let bits = (c as u32).wrapping_sub(0x2800) as u8;
+    let (w, h) = (m.width as i32, m.height as i32);
+    // Each dot owns a 1/2-width by 1/4-height sub-cell; the dot itself fills
+    // most of it and is kept square so columns and rows look even.
+    let sub_w = w / 2;
+    let sub_h = h / 4;
+    let dot = ((sub_w.min(sub_h) * 7) / 10).max(1);
+    // (mask, column, row) for the eight dots.
+    const DOTS: [(u8, i32, i32); 8] = [
+        (0x01, 0, 0),
+        (0x02, 0, 1),
+        (0x04, 0, 2),
+        (0x40, 0, 3),
+        (0x08, 1, 0),
+        (0x10, 1, 1),
+        (0x20, 1, 2),
+        (0x80, 1, 3),
+    ];
+    for (mask, col, row) in DOTS {
+        if bits & mask == 0 {
+            continue;
+        }
+        let cx = x0 + col * sub_w + sub_w / 2;
+        let cy = top + row * sub_h + sub_h / 2;
+        canvas.fill_rect(cx - dot / 2, cy - dot / 2, dot as u32, dot as u32, fg);
+    }
 }
 
 /// Draw underline, strikethrough, and overline for one cell.
