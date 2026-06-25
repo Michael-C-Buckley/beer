@@ -17,6 +17,7 @@ pub struct Config {
     pub scrollback: Scrollback,
     pub bell: Bell,
     pub mouse: Mouse,
+    pub shell_integration: ShellIntegration,
     /// Chord → action, e.g. `"Ctrl+Shift+C" = "copy"`. Merged over the defaults;
     /// a value of `"none"` unbinds.
     pub key_bindings: std::collections::HashMap<String, String>,
@@ -61,6 +62,15 @@ impl Default for Mouse {
             alternate_scroll: true,
         }
     }
+}
+
+/// `[shell-integration]`: behaviour driven by OSC 7 / OSC 133 marks.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct ShellIntegration {
+    /// Command the `pipe-command-output` binding feeds the last command's
+    /// output to on stdin (argv form, e.g. `["less"]`). Empty disables it.
+    pub pipe_command: Vec<String>,
 }
 
 /// `[colors]`: foreground/background, the 16 base palette entries, and accents.

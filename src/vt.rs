@@ -4,7 +4,9 @@ use std::io::Write as _;
 
 use vte::{Params, Perform};
 
-use crate::grid::{Color, CursorShape, Flags, Grid, MouseEncoding, MouseProtocol, Underline};
+use crate::grid::{
+    Color, CursorShape, Flags, Grid, MouseEncoding, MouseProtocol, PromptKind, Underline,
+};
 use crate::theme::{Rgb, Theme};
 
 /// G0/G1 character set designation.
@@ -667,6 +669,17 @@ impl Perform for Term {
                     self.cwd = file_uri_path(uri);
                 }
             }
+            // OSC 133: shell-integration prompt marks (A/B/C/D, with optional
+            // `;key=value` attributes we ignore).
+            Some(&n) if n == b"133" => {
+                if let Some(kind) = params
+                    .get(1)
+                    .and_then(|p| p.first())
+                    .and_then(|&b| prompt_kind(b))
+                {
+                    self.grid.set_prompt_mark(kind);
+                }
+            }
             // OSC 4: set/query palette entries (pairs of index;spec).
             Some(&n) if n == b"4" => self.osc_palette(params, bell),
             // OSC 104: reset palette (all, or the listed indices).
@@ -808,6 +821,17 @@ fn base64_decode(data: &[u8]) -> Option<Vec<u8>> {
         }
     }
     Some(out)
+}
+
+/// Map an OSC 133 mark letter to a [`PromptKind`].
+fn prompt_kind(b: u8) -> Option<PromptKind> {
+    match b {
+        b'A' => Some(PromptKind::PromptStart),
+        b'B' => Some(PromptKind::CmdStart),
+        b'C' => Some(PromptKind::OutputStart),
+        b'D' => Some(PromptKind::CmdEnd),
+        _ => None,
+    }
 }
 
 /// Extract the local path from an OSC 7 `file://host/path` URI, percent-decoding
@@ -1112,6 +1136,15 @@ mod tests {
         let mut t = Term::new(20, 1);
         feed(&mut t, b"\x1b(0qx\x1b(B");
         assert_eq!(t.grid().row_text(0), "─│");
+    }
+
+    #[test]
+    fn osc133_marks_capture_last_command_output() {
+        let mut t = Term::new(12, 6);
+        feed(&mut t, b"\x1b]133;A\x07$ echo hi\r\n"); // prompt + typed command
+        feed(&mut t, b"\x1b]133;C\x07hi\r\n"); // output start, then output
+        feed(&mut t, b"\x1b]133;D\x07"); // command finished
+        assert_eq!(t.grid().last_command_output().as_deref(), Some("hi\n"));
     }
 
     #[test]

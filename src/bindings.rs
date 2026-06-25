@@ -21,6 +21,9 @@ pub enum Action {
     FontReset,
     Fullscreen,
     NewWindow,
+    JumpPromptUp,
+    JumpPromptDown,
+    PipeCommandOutput,
 }
 
 impl Action {
@@ -39,6 +42,9 @@ impl Action {
             "font-reset" => Self::FontReset,
             "fullscreen" => Self::Fullscreen,
             "new-window" => Self::NewWindow,
+            "jump-prompt-up" => Self::JumpPromptUp,
+            "jump-prompt-down" => Self::JumpPromptDown,
+            "pipe-command-output" => Self::PipeCommandOutput,
             _ => return None,
         })
     }
@@ -174,6 +180,8 @@ const DEFAULT_BINDINGS: &[(&str, &str)] = &[
     ("Ctrl+0", "font-reset"),
     ("F11", "fullscreen"),
     ("Ctrl+Shift+N", "new-window"),
+    ("Ctrl+Shift+Up", "jump-prompt-up"),
+    ("Ctrl+Shift+Down", "jump-prompt-down"),
 ];
 
 /// Map a key token to a keysym: a single character, or a named special key.

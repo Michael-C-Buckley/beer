@@ -139,6 +139,17 @@ struct Cursor {
     y: usize,
 }
 
+/// Shell-integration prompt mark on a line (OSC 133): the start of a prompt,
+/// the start of typed command input, the start of command output, or the line
+/// where the command finished.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PromptKind {
+    PromptStart,
+    CmdStart,
+    OutputStart,
+    CmdEnd,
+}
+
 /// One screen/scrollback row: its cells plus whether it soft-wrapped into the
 /// next row (autowrap continuation, as opposed to a hard line break). The flag
 /// is what lets resize rejoin and rewrap paragraphs.
@@ -146,6 +157,8 @@ struct Cursor {
 struct Line {
     cells: Vec<Cell>,
     wrapped: bool,
+    /// OSC 133 mark attached to this (logical) line, if any.
+    prompt: Option<PromptKind>,
 }
 
 impl Line {
@@ -153,6 +166,7 @@ impl Line {
         Self {
             cells: vec![Cell::default(); cols],
             wrapped: false,
+            prompt: None,
         }
     }
 }
@@ -367,7 +381,9 @@ impl Grid {
         // 1. Rejoin soft-wrapped rows into logical lines. Track which logical
         //    line the cursor falls in and its offset within that line.
         let mut logicals: Vec<Vec<Cell>> = Vec::new();
+        let mut logical_marks: Vec<Option<PromptKind>> = Vec::new();
         let mut acc: Vec<Cell> = Vec::new();
+        let mut acc_mark: Option<PromptKind> = None;
         let mut cur_logical = 0usize;
         let mut cur_off = 0usize;
         for abs in 0..total {
@@ -380,13 +396,19 @@ impl Grid {
             } else {
                 &self.lines[abs - self.scrollback.len()]
             };
+            // The mark on the first physical row of a logical line carries over.
+            if acc.is_empty() {
+                acc_mark = line.prompt;
+            }
             acc.extend_from_slice(&line.cells);
             if !line.wrapped {
                 logicals.push(std::mem::take(&mut acc));
+                logical_marks.push(acc_mark.take());
             }
         }
         if !acc.is_empty() {
             logicals.push(acc);
+            logical_marks.push(acc_mark);
         }
         // Drop trailing all-blank lines (empty screen below the content), but
         // never above the cursor's line, so the cursor keeps its row.
@@ -395,6 +417,7 @@ impl Grid {
             .rposition(|l| l.iter().any(|c| *c != Cell::default()))
             .unwrap_or(0);
         logicals.truncate(last_content.max(cur_logical) + 1);
+        logical_marks.truncate(last_content.max(cur_logical) + 1);
 
         // 2. Rewrap each logical line to the new width, recording where the
         //    cursor lands. Trailing blanks are dropped so a hard line does not
@@ -418,6 +441,8 @@ impl Grid {
                 new_lines.push(Line {
                     cells,
                     wrapped: ci + 1 < chunks,
+                    // The mark belongs to the first physical row of the line.
+                    prompt: if ci == 0 { logical_marks[li] } else { None },
                 });
             }
             if li == cur_logical {
@@ -999,6 +1024,81 @@ impl Grid {
         }
     }
 
+    /// Total rows across scrollback and the live screen.
+    fn total_lines(&self) -> usize {
+        self.scrollback.len() + self.lines.len()
+    }
+
+    /// The OSC 133 mark on an absolute row, if any.
+    fn abs_prompt(&self, row: usize) -> Option<PromptKind> {
+        if row < self.scrollback.len() {
+            self.scrollback[row].prompt
+        } else {
+            self.lines
+                .get(row - self.scrollback.len())
+                .and_then(|l| l.prompt)
+        }
+    }
+
+    // --- shell integration (OSC 133) ---
+
+    /// Attach an OSC 133 prompt mark to the live line under the cursor.
+    pub fn set_prompt_mark(&mut self, kind: PromptKind) {
+        let y = self.cursor.y;
+        if let Some(line) = self.lines.get_mut(y) {
+            line.prompt = Some(kind);
+        }
+    }
+
+    /// Scroll the viewport to the previous (`up`) or next prompt, placing that
+    /// prompt line at the top of the window. No-op on the alternate screen or
+    /// when there is no prompt in that direction.
+    pub fn jump_prompt(&mut self, up: bool) {
+        if self.alt_saved.is_some() {
+            return;
+        }
+        let top = self.scrollback.len().saturating_sub(self.view_offset);
+        let total = self.total_lines();
+        let is_prompt = |k: Option<PromptKind>| k == Some(PromptKind::PromptStart);
+        let target = if up {
+            (0..top).rev().find(|&r| is_prompt(self.abs_prompt(r)))
+        } else {
+            ((top + 1)..total).find(|&r| is_prompt(self.abs_prompt(r)))
+        };
+        if let Some(t) = target {
+            let offset = self.scrollback.len() as isize - t as isize;
+            self.view_offset = offset.clamp(0, self.scrollback.len() as isize) as usize;
+        }
+    }
+
+    /// Text of the most recent command's output: the rows from the last
+    /// output-start (OSC 133 C) up to the command-end (D) or next prompt.
+    pub fn last_command_output(&self) -> Option<String> {
+        let total = self.total_lines();
+        let start = (0..total)
+            .rev()
+            .find(|&r| self.abs_prompt(r) == Some(PromptKind::OutputStart))?;
+        let mut lines: Vec<String> = Vec::new();
+        for r in start..total {
+            if r > start
+                && matches!(
+                    self.abs_prompt(r),
+                    Some(PromptKind::CmdEnd | PromptKind::PromptStart)
+                )
+            {
+                break;
+            }
+            lines.push(self.row_slice_text(r, 0, usize::MAX).trim_end().to_string());
+        }
+        // Drop trailing blank rows (e.g. the empty live screen below the output).
+        while lines.last().is_some_and(|l| l.is_empty()) {
+            lines.pop();
+        }
+        let mut out = lines.join("\n");
+        out.push('\n');
+        Some(out)
+    }
+
     /// Slide an active selection up by `n` rows after scrollback eviction,
     /// dropping it if either endpoint scrolled off the top.
     fn shift_selection(&mut self, n: usize) {
@@ -1406,6 +1506,18 @@ mod tests {
         g.start_selection(0, 0);
         g.extend_selection(0, 1);
         assert_eq!(g.selection_text().as_deref(), Some("e\u{0301}x"));
+    }
+
+    #[test]
+    fn prompt_mark_survives_reflow() {
+        let mut g = Grid::new(10, 4);
+        g.set_prompt_mark(PromptKind::OutputStart); // marks line 0
+        for c in "hello".chars() {
+            g.print(c);
+        }
+        g.resize(6, 4); // rewrap to a narrower width
+        // The mark followed its logical line, so the output is still found.
+        assert_eq!(g.last_command_output().as_deref(), Some("hello\n"));
     }
 
     #[test]

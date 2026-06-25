@@ -639,6 +639,50 @@ impl App {
             Action::FontReset => self.change_font_size(self.config.main.font_size),
             Action::Fullscreen => self.toggle_fullscreen(),
             Action::NewWindow => self.spawn_new_window(),
+            Action::JumpPromptUp => self.jump_prompt(true),
+            Action::JumpPromptDown => self.jump_prompt(false),
+            Action::PipeCommandOutput => self.pipe_command_output(),
+        }
+    }
+
+    /// Scroll the viewport to the previous/next shell prompt (OSC 133).
+    fn jump_prompt(&mut self, up: bool) {
+        if let Some(session) = self.session.as_mut() {
+            session.term.grid_mut().jump_prompt(up);
+            self.needs_draw = true;
+        }
+    }
+
+    /// Feed the last command's output (between OSC 133 C and D) to the configured
+    /// command on stdin.
+    fn pipe_command_output(&mut self) {
+        let argv = &self.config.shell_integration.pipe_command;
+        let Some((program, args)) = argv.split_first() else {
+            tracing::warn!("pipe-command-output: no [shell-integration] pipe-command configured");
+            return;
+        };
+        let Some(text) = self
+            .session
+            .as_ref()
+            .and_then(|s| s.term.grid().last_command_output())
+        else {
+            return;
+        };
+        let mut cmd = std::process::Command::new(program);
+        cmd.args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        if let Some(cwd) = self.session.as_ref().and_then(|s| s.term.cwd()) {
+            cmd.current_dir(cwd);
+        }
+        match cmd.spawn() {
+            Ok(mut child) => {
+                if let Some(mut stdin) = child.stdin.take() {
+                    let _ = stdin.write_all(text.as_bytes());
+                }
+            }
+            Err(err) => tracing::warn!("pipe-command-output: spawn failed: {err}"),
         }
     }
 
