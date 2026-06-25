@@ -102,6 +102,8 @@ pub struct Term {
     theme: Theme,
     /// Set when the child rings the bell (`BEL`); cleared by the front-end.
     bell: bool,
+    /// Working directory reported by the shell via OSC 7, for new windows.
+    cwd: Option<String>,
 }
 
 impl Term {
@@ -118,7 +120,13 @@ impl Term {
             clipboard_ops: Vec::new(),
             theme: Theme::default(),
             bell: false,
+            cwd: None,
         }
+    }
+
+    /// The working directory last reported by the shell (OSC 7), if any.
+    pub fn cwd(&self) -> Option<&str> {
+        self.cwd.as_deref()
     }
 
     /// Take and clear the pending bell flag.
@@ -653,6 +661,12 @@ impl Perform for Term {
                     self.title = Some(String::from_utf8_lossy(text).into_owned());
                 }
             }
+            // OSC 7: the shell reports its cwd as a `file://host/path` URI.
+            Some(&n) if n == b"7" => {
+                if let Some(uri) = params.get(1) {
+                    self.cwd = file_uri_path(uri);
+                }
+            }
             // OSC 4: set/query palette entries (pairs of index;spec).
             Some(&n) if n == b"4" => self.osc_palette(params, bell),
             // OSC 104: reset palette (all, or the listed indices).
@@ -794,6 +808,38 @@ fn base64_decode(data: &[u8]) -> Option<Vec<u8>> {
         }
     }
     Some(out)
+}
+
+/// Extract the local path from an OSC 7 `file://host/path` URI, percent-decoding
+/// `%XX` escapes. The host part is ignored (we only spawn locally). Returns
+/// `None` if it is not a usable absolute path.
+fn file_uri_path(uri: &[u8]) -> Option<String> {
+    let rest = uri.strip_prefix(b"file://").unwrap_or(uri);
+    // Skip the authority (host) up to the first '/', which begins the path.
+    let slash = rest.iter().position(|&b| b == b'/')?;
+    let path_bytes = percent_decode(&rest[slash..]);
+    let path = String::from_utf8(path_bytes).ok()?;
+    path.starts_with('/').then_some(path)
+}
+
+/// Percent-decode `%XX` byte escapes in a URI path, passing other bytes through.
+fn percent_decode(s: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(s.len());
+    let mut i = 0;
+    while i < s.len() {
+        if s[i] == b'%' && i + 2 < s.len() {
+            let hi = (s[i + 1] as char).to_digit(16);
+            let lo = (s[i + 2] as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(s[i]);
+        i += 1;
+    }
+    out
 }
 
 /// Decode an even-length lowercase/uppercase hex string into bytes.
@@ -1066,6 +1112,18 @@ mod tests {
         let mut t = Term::new(20, 1);
         feed(&mut t, b"\x1b(0qx\x1b(B");
         assert_eq!(t.grid().row_text(0), "─│");
+    }
+
+    #[test]
+    fn osc7_tracks_cwd_and_decodes_percent() {
+        let mut t = Term::new(20, 1);
+        feed(&mut t, b"\x1b]7;file://hermes/home/user/my%20dir\x07");
+        assert_eq!(t.cwd(), Some("/home/user/my dir"));
+        // A non-file or relative URI leaves the previous value untouched? It
+        // simply does not match a path, so cwd stays None here.
+        let mut t2 = Term::new(20, 1);
+        feed(&mut t2, b"\x1b]7;file://host\x07");
+        assert_eq!(t2.cwd(), None);
     }
 
     #[test]

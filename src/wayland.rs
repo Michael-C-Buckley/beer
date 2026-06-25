@@ -638,6 +638,32 @@ impl App {
             Action::FontDecrease => self.change_font_size(self.font_size.saturating_sub(1)),
             Action::FontReset => self.change_font_size(self.config.main.font_size),
             Action::Fullscreen => self.toggle_fullscreen(),
+            Action::NewWindow => self.spawn_new_window(),
+        }
+    }
+
+    /// Launch another beer process in the shell's reported working directory
+    /// (OSC 7), inheriting the same config. The child is fully detached.
+    fn spawn_new_window(&mut self) {
+        let exe = match std::env::current_exe() {
+            Ok(exe) => exe,
+            Err(err) => {
+                tracing::warn!("locate beer executable: {err}");
+                return;
+            }
+        };
+        let mut cmd = std::process::Command::new(exe);
+        if let Some(path) = self.config_path.as_ref() {
+            cmd.arg("--config").arg(path);
+        }
+        if let Some(cwd) = self.session.as_ref().and_then(|s| s.term.cwd()) {
+            cmd.current_dir(cwd);
+        }
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        if let Err(err) = cmd.spawn() {
+            tracing::warn!("spawn new window: {err}");
         }
     }
 

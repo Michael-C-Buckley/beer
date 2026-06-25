@@ -20,6 +20,7 @@ pub enum Action {
     FontDecrease,
     FontReset,
     Fullscreen,
+    NewWindow,
 }
 
 impl Action {
@@ -37,6 +38,7 @@ impl Action {
             "font-decrease" => Self::FontDecrease,
             "font-reset" => Self::FontReset,
             "fullscreen" => Self::Fullscreen,
+            "new-window" => Self::NewWindow,
             _ => return None,
         })
     }
@@ -171,6 +173,7 @@ const DEFAULT_BINDINGS: &[(&str, &str)] = &[
     ("Ctrl+minus", "font-decrease"),
     ("Ctrl+0", "font-reset"),
     ("F11", "fullscreen"),
+    ("Ctrl+Shift+N", "new-window"),
 ];
 
 /// Map a key token to a keysym: a single character, or a named special key.
