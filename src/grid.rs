@@ -177,6 +177,8 @@ pub struct Grid {
     cursor_color: Option<(u8, u8, u8)>,
     /// Active mouse selection as (anchor, head) in absolute coordinates.
     selection: Option<(Point, Point)>,
+    /// Whether the selection is a rectangular block rather than linear flow.
+    selection_block: bool,
     /// Bracketed paste mode (DECSET 2004): wrap pasted text in `ESC[200~`/`201~`.
     bracketed_paste: bool,
     /// Synchronized output (DECSET 2026): hold presentation while a frame is
@@ -192,6 +194,16 @@ pub struct Grid {
 
 fn default_tabs(cols: usize) -> Vec<bool> {
     (0..cols).map(|i| i % 8 == 0 && i != 0).collect()
+}
+
+/// Characters that terminate a word for double-click selection. `_`, `-`, `.`,
+/// `/`, `:`, `~` are deliberately *not* delimiters so paths, URLs, and option
+/// flags select as one unit.
+const WORD_DELIMITERS: &str = " \t`!@#$%^&*()+=[]{}\\|;'\",<>?";
+
+/// Whether `c` is part of a word (not whitespace, not a delimiter).
+fn is_word(c: char) -> bool {
+    !c.is_whitespace() && !WORD_DELIMITERS.contains(c)
 }
 
 impl Grid {
@@ -221,6 +233,7 @@ impl Grid {
             cursor_color: None,
             app_cursor: false,
             selection: None,
+            selection_block: false,
             bracketed_paste: false,
             sync: false,
             mouse_protocol: MouseProtocol::Off,
@@ -809,10 +822,18 @@ impl Grid {
         self.selection = None;
     }
 
-    /// Begin a selection at an absolute point (drag anchor).
+    /// Begin a linear selection at an absolute point (drag anchor).
     pub fn start_selection(&mut self, row: usize, col: usize) {
         let p = Point { row, col };
         self.selection = Some((p, p));
+        self.selection_block = false;
+    }
+
+    /// Begin a rectangular (block) selection at an absolute point.
+    pub fn start_block_selection(&mut self, row: usize, col: usize) {
+        let p = Point { row, col };
+        self.selection = Some((p, p));
+        self.selection_block = true;
     }
 
     /// Move the selection head (drag), keeping the anchor fixed.
@@ -822,29 +843,43 @@ impl Grid {
         }
     }
 
-    /// Select the whitespace-delimited word at an absolute point.
+    /// Select the word at an absolute point, breaking on whitespace and the
+    /// default delimiter set.
     pub fn select_word(&mut self, row: usize, col: usize) {
         let line = self.abs_row(row);
-        let word = |c: char| !c.is_whitespace();
-        if col >= line.len() || !word(line[col].c) {
+        if col >= line.len() || !is_word(line[col].c) {
             self.start_selection(row, col);
             return;
         }
         let mut lo = col;
-        while lo > 0 && word(line[lo - 1].c) {
+        while lo > 0 && is_word(line[lo - 1].c) {
             lo -= 1;
         }
         let mut hi = col;
-        while hi + 1 < line.len() && word(line[hi + 1].c) {
+        while hi + 1 < line.len() && is_word(line[hi + 1].c) {
             hi += 1;
         }
         self.selection = Some((Point { row, col: lo }, Point { row, col: hi }));
+        self.selection_block = false;
     }
 
     /// Select the whole line at an absolute row.
     pub fn select_line(&mut self, row: usize) {
         let last = self.abs_row(row).len().saturating_sub(1);
         self.selection = Some((Point { row, col: 0 }, Point { row, col: last }));
+        self.selection_block = false;
+    }
+
+    /// The rectangle `(top_row, bottom_row, left_col, right_col)` of a block
+    /// selection.
+    fn block_rect(&self) -> Option<(usize, usize, usize, usize)> {
+        let (a, b) = self.selection?;
+        Some((
+            a.row.min(b.row),
+            a.row.max(b.row),
+            a.col.min(b.col),
+            a.col.max(b.col),
+        ))
     }
 
     /// Normalized selection (start <= end in reading order), if any.
@@ -860,6 +895,12 @@ impl Grid {
 
     /// Whether the cell at an absolute `(row, col)` falls inside the selection.
     pub fn is_selected(&self, row: usize, col: usize) -> bool {
+        if self.selection_block {
+            let Some((r0, r1, c0, c1)) = self.block_rect() else {
+                return false;
+            };
+            return row >= r0 && row <= r1 && col >= c0 && col <= c1;
+        }
         let Some((start, end)) = self.ordered_selection() else {
             return false;
         };
@@ -874,6 +915,10 @@ impl Grid {
     /// The inclusive `(lo, hi)` column span selected on absolute row `row`, if
     /// any part of that row is selected.
     pub fn selection_span_on(&self, row: usize) -> Option<(usize, usize)> {
+        if self.selection_block {
+            let (r0, r1, c0, c1) = self.block_rect()?;
+            return (row >= r0 && row <= r1).then_some((c0, c1));
+        }
         let (start, end) = self.ordered_selection()?;
         if row < start.row || row > end.row {
             return None;
@@ -890,6 +935,17 @@ impl Grid {
     /// The selected text, with trailing blanks trimmed per line and rows joined
     /// by newlines. `None` if there is no selection.
     pub fn selection_text(&self) -> Option<String> {
+        if self.selection_block {
+            let (r0, r1, c0, c1) = self.block_rect()?;
+            let mut out = String::new();
+            for row in r0..=r1 {
+                out.push_str(self.row_slice_text(row, c0, c1 + 1).trim_end());
+                if row != r1 {
+                    out.push('\n');
+                }
+            }
+            return Some(out);
+        }
         let (start, end) = self.ordered_selection()?;
         let mut out = String::new();
         for row in start.row..=end.row {
@@ -900,19 +956,24 @@ impl Grid {
             } else {
                 line.len()
             };
-            let text: String = line
-                .get(lo..hi)
-                .unwrap_or(&[])
-                .iter()
-                .filter(|c| !c.flags.contains(Flags::WIDE_CONT))
-                .map(|c| c.c)
-                .collect();
-            out.push_str(text.trim_end());
+            out.push_str(self.row_slice_text(row, lo, hi).trim_end());
             if row != end.row {
                 out.push('\n');
             }
         }
         Some(out)
+    }
+
+    /// The characters of an absolute row in `[from, to)`, skipping wide
+    /// continuation cells.
+    fn row_slice_text(&self, row: usize, from: usize, to: usize) -> String {
+        self.abs_row(row)
+            .get(from..to.min(self.abs_row(row).len()))
+            .unwrap_or(&[])
+            .iter()
+            .filter(|c| !c.flags.contains(Flags::WIDE_CONT))
+            .map(|c| c.c)
+            .collect()
     }
 
     pub fn set_bracketed_paste(&mut self, on: bool) {
@@ -1097,6 +1158,44 @@ mod tests {
         }
         g.select_word(0, 5); // inside "bar"
         assert_eq!(g.selection_text().as_deref(), Some("bar"));
+    }
+
+    #[test]
+    fn select_word_breaks_on_delimiters_but_keeps_paths() {
+        let mut g = Grid::new(32, 1);
+        for c in "run /usr/bin:next".chars() {
+            g.print(c);
+        }
+        // '/' and ':' are not delimiters, so the path selects whole.
+        g.select_word(0, 7); // inside "/usr/bin:next"
+        assert_eq!(g.selection_text().as_deref(), Some("/usr/bin:next"));
+        // '(' is a delimiter.
+        let mut g = Grid::new(16, 1);
+        for c in "f(arg)".chars() {
+            g.print(c);
+        }
+        g.select_word(0, 2); // inside "arg"
+        assert_eq!(g.selection_text().as_deref(), Some("arg"));
+    }
+
+    #[test]
+    fn block_selection_is_rectangular() {
+        let mut g = Grid::new(8, 3);
+        for line in ["abcd", "efgh", "ijkl"] {
+            for c in line.chars() {
+                g.print(c);
+            }
+            g.carriage_return();
+            g.line_feed();
+        }
+        // A block from (row0,col1) to (row2,col2) takes columns 1..=2 each row.
+        g.start_block_selection(0, 1);
+        g.extend_selection(2, 2);
+        assert!(g.is_selected(0, 1));
+        assert!(g.is_selected(2, 2));
+        assert!(!g.is_selected(1, 3));
+        assert!(!g.is_selected(1, 0));
+        assert_eq!(g.selection_text().as_deref(), Some("bc\nfg\njk"));
     }
 
     #[test]

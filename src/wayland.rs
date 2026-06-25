@@ -109,6 +109,9 @@ const MAX_BUFFERS: usize = 3;
 /// present anyway, so a misbehaving app cannot freeze the window.
 const SYNC_TIMEOUT_MS: u64 = 150;
 
+/// Interval between autoscroll steps while a drag selection runs off an edge.
+const AUTOSCROLL_MS: u64 = 40;
+
 /// What determines one rendered row's pixels: its cells, the cursor on it, the
 /// selection span over it, and the blink phase. Two equal `RowSnap`s render
 /// identically, so a buffer holding an equal snapshot needs no repaint.
@@ -217,6 +220,8 @@ pub fn run() -> anyhow::Result<ExitCode> {
         selecting: false,
         pressed_button: None,
         last_report_cell: None,
+        autoscroll: 0,
+        autoscroll_timer: None,
         pointer_pos: (0.0, 0.0),
         last_click: None,
         serial: 0,
@@ -324,6 +329,10 @@ struct App {
     pressed_button: Option<u8>,
     /// Last cell a motion report was emitted for, to suppress duplicates.
     last_report_cell: Option<(usize, usize)>,
+    /// Autoscroll direction while dragging past an edge: +1 back, -1 toward live.
+    autoscroll: isize,
+    /// Calloop token for the repeating autoscroll timer, when armed.
+    autoscroll_timer: Option<RegistrationToken>,
     pointer_pos: (f64, f64),
     /// Last click (time ms, abs row, col, count) for double/triple detection.
     last_click: Option<(u32, usize, usize, u32)>,
@@ -493,17 +502,21 @@ impl App {
         let Some(session) = self.session.as_mut() else {
             return;
         };
+        let ctrl = self.modifiers.ctrl;
         let grid = session.term.grid_mut();
         match count {
             2 => grid.select_word(row, col),
             3 => grid.select_line(row),
+            // Holding Ctrl starts a rectangular (block) selection.
+            _ if ctrl => grid.start_block_selection(row, col),
             _ => grid.start_selection(row, col),
         }
         self.selecting = true;
         self.needs_draw = true;
     }
 
-    /// Pointer motion during a drag: extend the selection head.
+    /// Pointer motion during a drag: extend the selection head and, if the
+    /// pointer has left the top/bottom edge, start autoscrolling.
     fn pointer_drag(&mut self) {
         if !self.selecting {
             return;
@@ -515,14 +528,63 @@ impl App {
             session.term.grid_mut().extend_selection(row, col);
             self.needs_draw = true;
         }
+        self.update_autoscroll();
     }
 
-    /// Left-button release: a completed selection becomes the primary selection.
+    /// Arm or disarm edge autoscroll based on the pointer's vertical position.
+    fn update_autoscroll(&mut self) {
+        let dir = if self.pointer_pos.1 < 0.0 {
+            1 // above the top: reveal older lines
+        } else if self.pointer_pos.1 >= f64::from(self.height) {
+            -1 // below the bottom: advance toward the live screen
+        } else {
+            0
+        };
+        self.autoscroll = dir;
+        if dir != 0 && self.autoscroll_timer.is_none() {
+            let timer = Timer::immediate();
+            self.autoscroll_timer = self
+                .loop_handle
+                .insert_source(timer, |_, _, app: &mut App| app.autoscroll_step())
+                .ok();
+        }
+    }
+
+    /// One autoscroll step: scroll the viewport and drag the selection head to
+    /// the edge cell under the pointer. Reschedules until the drag ends or the
+    /// pointer returns inside the window.
+    fn autoscroll_step(&mut self) -> TimeoutAction {
+        if !self.selecting || self.autoscroll == 0 {
+            self.autoscroll_timer = None;
+            return TimeoutAction::Drop;
+        }
+        if let Some(session) = self.session.as_mut() {
+            session.term.scroll_view(self.autoscroll);
+        }
+        let edge_y = if self.autoscroll > 0 {
+            0.0
+        } else {
+            f64::from(self.height) - 1.0
+        };
+        if let Some((row, col)) = self.cell_at(self.pointer_pos.0, edge_y)
+            && let Some(session) = self.session.as_mut()
+        {
+            session.term.grid_mut().extend_selection(row, col);
+        }
+        self.needs_draw = true;
+        TimeoutAction::ToDuration(Duration::from_millis(AUTOSCROLL_MS))
+    }
+
+    /// Left-button release: stop autoscrolling and publish the primary selection.
     fn pointer_release(&mut self, qh: &QueueHandle<App>) {
         if !self.selecting {
             return;
         }
         self.selecting = false;
+        self.autoscroll = 0;
+        if let Some(token) = self.autoscroll_timer.take() {
+            self.loop_handle.remove(token);
+        }
         self.set_primary(qh);
     }
 
