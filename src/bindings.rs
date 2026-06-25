@@ -25,6 +25,7 @@ pub enum Action {
     JumpPromptDown,
     PipeCommandOutput,
     UrlMode,
+    UnicodeInput,
 }
 
 impl Action {
@@ -47,6 +48,7 @@ impl Action {
             "jump-prompt-down" => Self::JumpPromptDown,
             "pipe-command-output" => Self::PipeCommandOutput,
             "url-mode" => Self::UrlMode,
+            "unicode-input" => Self::UnicodeInput,
             _ => return None,
         })
     }
@@ -185,6 +187,7 @@ const DEFAULT_BINDINGS: &[(&str, &str)] = &[
     ("Ctrl+Shift+Up", "jump-prompt-up"),
     ("Ctrl+Shift+Down", "jump-prompt-down"),
     ("Ctrl+Shift+O", "url-mode"),
+    ("Ctrl+Shift+U", "unicode-input"),
 ];
 
 /// Map a key token to a keysym: a single character, or a named special key.

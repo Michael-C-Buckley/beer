@@ -249,6 +249,10 @@ pub struct Grid {
     last_base: Option<(usize, usize)>,
     /// OSC 8 hyperlink URIs; a cell's `link` is a 1-based index into this.
     links: Vec<Box<str>>,
+    /// Active kitty-keyboard progressive-enhancement flags (0 = legacy mode).
+    kitty_current: u8,
+    /// Saved flag values for the kitty push/pop stack.
+    kitty_stack: Vec<u8>,
 }
 
 fn default_tabs(cols: usize) -> Vec<bool> {
@@ -260,6 +264,10 @@ fn default_tabs(cols: usize) -> Vec<bool> {
 /// are deliberately *not* delimiters so paths, URLs, and option flags select as
 /// one unit.
 const WORD_DELIMITERS: &str = " \t`!@#$%^&*()+=[]{}\\|;'\",<>?";
+
+/// Mask of the kitty-keyboard flags we implement (disambiguate, report events,
+/// alternate keys, all-keys-as-escapes, associated text).
+const KITTY_ALL: u8 = 0b1_1111;
 
 /// Whether `c` is part of a word (not whitespace, not in `delims`).
 fn is_word(c: char, delims: &str) -> bool {
@@ -304,6 +312,38 @@ impl Grid {
             scrollback_cap: SCROLLBACK_CAP,
             last_base: None,
             links: Vec::new(),
+            kitty_current: 0,
+            kitty_stack: Vec::new(),
+        }
+    }
+
+    /// The active kitty-keyboard flags (0 means legacy encoding).
+    pub fn kitty_flags(&self) -> u8 {
+        self.kitty_current
+    }
+
+    /// Apply `CSI = flags ; mode u`: mode 1 replaces, 2 sets bits, 3 clears bits.
+    pub fn kitty_set(&mut self, flags: u8, mode: u8) {
+        self.kitty_current = match mode {
+            2 => self.kitty_current | flags,
+            3 => self.kitty_current & !flags,
+            _ => flags,
+        } & KITTY_ALL;
+    }
+
+    /// Apply `CSI > flags u`: push the current flags and switch to `flags`.
+    pub fn kitty_push(&mut self, flags: u8) {
+        if self.kitty_stack.len() >= 32 {
+            self.kitty_stack.remove(0);
+        }
+        self.kitty_stack.push(self.kitty_current);
+        self.kitty_current = flags & KITTY_ALL;
+    }
+
+    /// Apply `CSI < n u`: pop `n` saved flag values, restoring the last one.
+    pub fn kitty_pop(&mut self, n: usize) {
+        for _ in 0..n.max(1) {
+            self.kitty_current = self.kitty_stack.pop().unwrap_or(0);
         }
     }
 
@@ -1169,6 +1209,24 @@ impl Grid {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kitty_flag_stack() {
+        let mut g = Grid::new(4, 2);
+        assert_eq!(g.kitty_flags(), 0);
+        g.kitty_set(0b1, 1); // replace
+        assert_eq!(g.kitty_flags(), 0b1);
+        g.kitty_set(0b100, 2); // set bits
+        assert_eq!(g.kitty_flags(), 0b101);
+        g.kitty_set(0b1, 3); // clear bits
+        assert_eq!(g.kitty_flags(), 0b100);
+        g.kitty_push(0b11); // push current, switch
+        assert_eq!(g.kitty_flags(), 0b11);
+        g.kitty_pop(1); // restore
+        assert_eq!(g.kitty_flags(), 0b100);
+        g.kitty_pop(5); // underflow is harmless
+        assert_eq!(g.kitty_flags(), 0);
+    }
 
     #[test]
     fn prints_and_wraps() {

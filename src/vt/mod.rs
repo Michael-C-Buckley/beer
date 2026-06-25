@@ -340,6 +340,11 @@ impl Term {
         }
     }
 
+    /// Reply to a kitty-keyboard flags query (`CSI ? u`) with `CSI ? flags u`.
+    fn report_kitty_flags(&mut self) {
+        let _ = write!(self.response, "\x1b[?{}u", self.grid.kitty_flags());
+    }
+
     /// XTVERSION (`CSI > q`): report the terminal name and version.
     fn report_version(&mut self) {
         let _ = write!(

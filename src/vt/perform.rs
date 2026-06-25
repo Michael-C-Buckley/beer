@@ -82,7 +82,17 @@ impl Perform for Term {
             'p' if intermediates.contains(&b'$') => self.report_mode(params, private),
             'n' => self.device_status(params),
             's' => self.grid.save_cursor(),
-            'u' => self.grid.restore_cursor(),
+            // `CSI u` is SCORC, but the kitty keyboard protocol overloads it with
+            // private prefixes: `?` query, `>` push, `<` pop, `=` set flags.
+            'u' => match intermediates.first() {
+                Some(b'?') => self.report_kitty_flags(),
+                Some(b'>') => self.grid.kitty_push(n(params, 0, 0) as u8),
+                Some(b'<') => self.grid.kitty_pop(n(params, 0, 1)),
+                Some(b'=') => self
+                    .grid
+                    .kitty_set(n(params, 0, 0) as u8, n(params, 1, 1) as u8),
+                _ => self.grid.restore_cursor(),
+            },
             't' => self.title_stack_op(params),
             'g' => match raw(params, 0) {
                 3 => self.grid.clear_all_tabs(),

@@ -268,6 +268,8 @@ pub fn run(config: Config, config_path: Option<std::path::PathBuf>) -> anyhow::R
         url_hits: Vec::new(),
         url_labels: Vec::new(),
         url_input: String::new(),
+        unicode_input: None,
+        keys_down: std::collections::HashSet::new(),
         focused: true,
         exit: false,
         exit_code: ExitCode::SUCCESS,
@@ -477,6 +479,11 @@ struct App {
     url_labels: Vec<String>,
     /// Label characters typed so far in URL mode.
     url_input: String,
+    /// Hex digits typed so far in Unicode codepoint-input mode; `None` when off.
+    unicode_input: Option<String>,
+    /// Raw key codes currently held, to tell press from repeat for the kitty
+    /// keyboard protocol's event-type reporting.
+    keys_down: std::collections::HashSet<u32>,
     /// Whether the toplevel currently has keyboard focus (drives the cursor).
     focused: bool,
     exit: bool,
@@ -553,7 +560,19 @@ impl App {
     /// text bindings, else the byte encoding sent to the shell (which snaps the
     /// viewport back to the live screen).
     fn handle_key(&mut self, event: &KeyEvent) {
-        // URL hint mode and search both capture the keyboard while active.
+        // A new arrival of a held key is a repeat; otherwise a fresh press.
+        let kind = if self.keys_down.insert(event.raw_code) {
+            crate::input::KeyKind::Press
+        } else {
+            crate::input::KeyKind::Repeat
+        };
+
+        // The Unicode-input prompt, URL hint mode, and search each capture the
+        // keyboard while active.
+        if self.unicode_input.is_some() {
+            self.unicode_key(event);
+            return;
+        }
         if self.url_mode {
             self.url_key(event);
             return;
@@ -572,11 +591,36 @@ impl App {
             return;
         }
 
-        let app_cursor = self
-            .session
-            .as_ref()
-            .is_some_and(|s| s.term.grid().app_cursor());
-        if let Some(bytes) = crate::input::encode(event, self.modifiers, app_cursor) {
+        let (app_cursor, kitty) = self.session.as_ref().map_or((false, 0), |s| {
+            (s.term.grid().app_cursor(), s.term.grid().kitty_flags())
+        });
+        let bytes = if kitty != 0 {
+            crate::input::kitty_encode(event, self.modifiers, kitty, kind, app_cursor)
+        } else {
+            crate::input::encode(event, self.modifiers, app_cursor)
+        };
+        if let Some(bytes) = bytes {
+            self.send_to_shell(&bytes);
+        }
+    }
+
+    /// Handle a key release: only the kitty keyboard protocol cares, and only
+    /// when it has asked for event reporting.
+    fn handle_key_release(&mut self, event: &KeyEvent) {
+        self.keys_down.remove(&event.raw_code);
+        let (app_cursor, kitty) = self.session.as_ref().map_or((false, 0), |s| {
+            (s.term.grid().app_cursor(), s.term.grid().kitty_flags())
+        });
+        if kitty == 0 {
+            return;
+        }
+        if let Some(bytes) = crate::input::kitty_encode(
+            event,
+            self.modifiers,
+            kitty,
+            crate::input::KeyKind::Release,
+            app_cursor,
+        ) {
             self.send_to_shell(&bytes);
         }
     }
@@ -628,6 +672,51 @@ impl App {
             Action::JumpPromptDown => self.jump_prompt(false),
             Action::PipeCommandOutput => self.pipe_command_output(),
             Action::UrlMode => self.enter_url_mode(),
+            Action::UnicodeInput => {
+                self.unicode_input = Some(String::new());
+                self.needs_draw = true;
+            }
+        }
+    }
+
+    /// Handle a key while Unicode codepoint-input mode is active: accumulate hex
+    /// digits, then commit the codepoint as UTF-8 on Enter/Space.
+    fn unicode_key(&mut self, event: &KeyEvent) {
+        match event.keysym {
+            Keysym::Escape => {
+                self.unicode_input = None;
+                self.needs_draw = true;
+            }
+            Keysym::BackSpace => {
+                if let Some(buf) = self.unicode_input.as_mut() {
+                    buf.pop();
+                }
+                self.needs_draw = true;
+            }
+            Keysym::Return | Keysym::KP_Enter | Keysym::space => {
+                let buf = self.unicode_input.take().unwrap_or_default();
+                if let Some(c) = u32::from_str_radix(buf.trim(), 16)
+                    .ok()
+                    .and_then(char::from_u32)
+                {
+                    let mut bytes = [0u8; 4];
+                    let s = c.encode_utf8(&mut bytes).as_bytes().to_vec();
+                    self.send_to_shell(&s);
+                }
+                self.needs_draw = true;
+            }
+            _ => {
+                if let Some(text) = event.utf8.as_ref() {
+                    let hex: String = text.chars().filter(char::is_ascii_hexdigit).collect();
+                    // Cap at 6 hex digits - the widest valid codepoint (U+10FFFF) fits.
+                    if let Some(buf) = self.unicode_input.as_mut()
+                        && buf.len() + hex.len() <= 6
+                    {
+                        buf.push_str(&hex);
+                    }
+                    self.needs_draw = true;
+                }
+            }
         }
     }
 

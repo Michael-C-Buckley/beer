@@ -87,13 +87,17 @@ impl App {
 
         // The search prompt occupies the bottom row while search mode is active.
         // Recording it in the snapshot keeps the row's damage/diff correct.
-        let bar_text = self.searching.then(|| {
-            let (n, total) = grid.search_count();
-            format!(
-                "search: {}  [{n}/{total}]",
-                grid.search_query().unwrap_or("")
-            )
-        });
+        let bar_text = if let Some(hex) = &self.unicode_input {
+            Some(format!("unicode: U+{}", hex.to_uppercase()))
+        } else {
+            self.searching.then(|| {
+                let (n, total) = grid.search_count();
+                format!(
+                    "search: {}  [{n}/{total}]",
+                    grid.search_query().unwrap_or("")
+                )
+            })
+        };
         if let Some(text) = &bar_text
             && rows > 0
         {

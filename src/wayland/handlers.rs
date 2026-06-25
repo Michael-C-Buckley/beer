@@ -204,6 +204,9 @@ impl KeyboardHandler for App {
         _: u32,
     ) {
         self.focused = false;
+        // Drop held-key state so a key released while unfocused can't leak a
+        // stale kitty release event later.
+        self.keys_down.clear();
         self.report_focus(false);
         self.needs_draw = true;
     }
@@ -239,8 +242,9 @@ impl KeyboardHandler for App {
         _: &QueueHandle<Self>,
         _: &wl_keyboard::WlKeyboard,
         _: u32,
-        _: KeyEvent,
+        event: KeyEvent,
     ) {
+        self.handle_key_release(&event);
     }
 
     fn update_modifiers(
