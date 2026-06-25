@@ -59,6 +59,8 @@ table of _beer.toml_(5).
 :  Jump to the previous / next shell prompt (OSC 133)
 |  Ctrl+Shift+O
 :  Enter URL hint mode
+|  Ctrl+Shift+U
+:  Enter a Unicode codepoint by hex value
 
 The *pipe-command-output* action (unbound by default) feeds the last command's
 output to the configured command; see *shell-integration* in _beer.toml_(5).
@@ -68,6 +70,14 @@ previous match, *Down* to the next, and *Escape* exits.
 
 In URL hint mode each visible URL is tagged with a label; type the label to open
 the URL in the configured launcher, or press *Escape* to cancel.
+
+In Unicode codepoint-input mode, type the hexadecimal value of a codepoint (e.g.
+_2603_ for a snowman) and press *Return* or *Space* to insert it; *Escape*
+cancels.
+
+*beer* implements the kitty keyboard protocol (progressive enhancement via
+*CSI u*), so applications that request it receive disambiguated keys, key
+release and repeat events, alternate keys, and associated text.
 
 # MOUSE
 

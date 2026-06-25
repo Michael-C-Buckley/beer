@@ -109,7 +109,8 @@ _"none"_ unbinds the chord.
 Recognized actions: _copy_, _paste_, _paste-primary_, _scrollback-up_,
 _scrollback-down_, _scrollback-top_, _scrollback-bottom_, _search_,
 _font-increase_, _font-decrease_, _font-reset_, _fullscreen_, _new-window_,
-_jump-prompt-up_, _jump-prompt-down_, _pipe-command-output_, _url-mode_.
+_jump-prompt-up_, _jump-prompt-down_, _pipe-command-output_, _url-mode_,
+_unicode-input_.
 
 ```
 [key-bindings]
