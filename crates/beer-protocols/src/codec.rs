@@ -75,10 +75,15 @@ pub fn decode_hex(s: &[u8]) -> Option<Vec<u8>> {
     if s.is_empty() || !s.len().is_multiple_of(2) {
         return None;
     }
-    let nibble = |b: u8| (b as char).to_digit(16).map(|d| d as u8);
+
     s.chunks_exact(2)
-        .map(|pair| Some((nibble(pair[0])? << 4) | nibble(pair[1])?))
+        .map(|pair| Some((hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?))
         .collect()
+}
+
+/// Turn a hexadecimal character into its numerical value.
+fn hex_nibble(b: u8) -> Option<u8> {
+    (b as char).to_digit(16).map(|d| d as u8)
 }
 
 /// Percent-decode `%XX` byte escapes in a URI path, passing other bytes through.
@@ -87,10 +92,10 @@ pub fn percent_decode(s: &[u8]) -> Vec<u8> {
     let mut i = 0;
     while i < s.len() {
         if s[i] == b'%' && i + 2 < s.len() {
-            let hi = (s[i + 1] as char).to_digit(16);
-            let lo = (s[i + 2] as char).to_digit(16);
+            let hi = hex_nibble(s[i + 1]);
+            let lo = hex_nibble(s[i + 2]);
             if let (Some(hi), Some(lo)) = (hi, lo) {
-                out.push((hi * 16 + lo) as u8);
+                out.push(hi << 4 | lo);
                 i += 3;
                 continue;
             }
