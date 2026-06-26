@@ -195,19 +195,32 @@ impl Config {
         if !path.exists() {
             return Self::default();
         }
-        match std::fs::read_to_string(&path) {
-            Ok(text) => match toml::from_str(&text) {
-                Ok(config) => {
-                    tracing::info!("loaded config from {}", path.display());
-                    config
-                }
-                Err(err) => {
-                    tracing::warn!("config {}: {err}; using defaults", path.display());
-                    Self::default()
-                }
-            },
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
             Err(err) => {
                 tracing::warn!("read config {}: {err}; using defaults", path.display());
+                return Self::default();
+            }
+        };
+        // Deserialize through serde_ignored so a typo'd key (`font-sze`) is
+        // reported instead of silently dropped, while still loading: unknown
+        // keys stay tolerated, keeping forward-compatibility with newer configs.
+        let de = match toml::Deserializer::parse(&text) {
+            Ok(de) => de,
+            Err(err) => {
+                tracing::warn!("config {}: {err}; using defaults", path.display());
+                return Self::default();
+            }
+        };
+        match serde_ignored::deserialize(de, |key| {
+            tracing::warn!("config {}: unknown key `{key}` ignored", path.display());
+        }) {
+            Ok(config) => {
+                tracing::info!("loaded config from {}", path.display());
+                config
+            }
+            Err(err) => {
+                tracing::warn!("config {}: {err}; using defaults", path.display());
                 Self::default()
             }
         }
@@ -252,5 +265,26 @@ mod tests {
         // Unset keys keep defaults; unknown tables/keys are ignored.
         assert_eq!(c.main.term, "beer");
         assert_eq!(c.scrollback.lines, 10_000);
+    }
+
+    #[test]
+    fn unknown_keys_are_reported_but_still_load() {
+        let toml = r##"
+            [main]
+            font-sze = 14
+            font = "JetBrains Mono"
+
+            [made-up]
+            x = 1
+        "##;
+        let mut unknown = Vec::new();
+        let de = toml::Deserializer::parse(toml).unwrap();
+        let c: Config =
+            serde_ignored::deserialize(de, |key| unknown.push(key.to_string())).unwrap();
+        // The typo and the bogus table are both surfaced...
+        assert!(unknown.iter().any(|k| k == "main.font-sze"), "{unknown:?}");
+        assert!(unknown.iter().any(|k| k == "made-up"), "{unknown:?}");
+        // ...yet the valid key still loaded.
+        assert_eq!(c.main.font, "JetBrains Mono");
     }
 }
