@@ -501,6 +501,19 @@ mod tests {
     }
 
     #[test]
+    fn text_sizing_osc66_lays_out_a_scaled_block() {
+        // `OSC 66 ; s=2 ; X BEL`: a 2x2 scaled block, cursor advances two cells.
+        let mut t = Term::new(20, 4);
+        feed(&mut t, b"\x1b]66;s=2;X\x07");
+        let g = t.grid();
+        assert_eq!(g.cell(0, 0).c, 'X');
+        let s = g.cell(0, 0).sized.as_ref().expect("leading cell is scaled");
+        assert_eq!((s.cols, s.rows), (2, 2));
+        assert!(g.cell(1, 1).flags.contains(crate::grid::Flags::SIZED_CONT));
+        assert_eq!(g.cursor(), (2, 0));
+    }
+
+    #[test]
     fn device_attributes_levels() {
         let mut t = Term::new(20, 4);
         feed(&mut t, b"\x1b[c");

@@ -19,6 +19,7 @@ const SCROLLBACK_CAP: usize = 10_000;
 /// The protocol vocabulary an SGR/DECSET stream selects lives in
 /// `beer-protocols` and is re-exported here so the grid and renderer keep
 /// referring to it as `grid::Color`, `grid::Underline`, and so on.
+pub use beer_protocols::text_size::TextSize;
 pub use beer_protocols::{Color, CursorShape, MouseEncoding, MouseProtocol, PromptKind, Underline};
 
 /// Per-cell style flags, packed into a `u16`.
@@ -36,6 +37,9 @@ impl Flags {
     /// Trailing column of a double-width glyph; holds no character of its own.
     pub const WIDE_CONT: Self = Self(1 << 8);
     pub const OVERLINE: Self = Self(1 << 9);
+    /// A cell of a text-sizing (`OSC 66`) block that is not the block's leading
+    /// cell; it holds no character of its own and is drawn by the leading cell.
+    pub const SIZED_CONT: Self = Self(1 << 10);
 
     pub const fn empty() -> Self {
         Self(0)
@@ -58,6 +62,31 @@ impl Flags {
     }
 }
 
+/// The text-sizing (`OSC 66`) descriptor a scaled cell carries. A run is drawn
+/// as a block `cols` cells wide and `rows` high; this cell sits at `(dx, dy)`
+/// within it. The leading cell (`dx == 0, dy == 0`) carries the run text and is
+/// what the renderer draws; the rest are flagged [`Flags::SIZED_CONT`].
+///
+/// Boxed on the cell so the common, unscaled path keeps `Cell` lean: only the
+/// rare scaled cell pays an allocation.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Sized {
+    /// Scale, fractional scale, and alignment parsed from the metadata.
+    pub size: TextSize,
+    /// Block width in cells: `s * w`, or `s * grapheme_width` when `w == 0`.
+    pub cols: u8,
+    /// Block height in cells: `s`.
+    pub rows: u8,
+    /// This cell's column within the block.
+    pub dx: u8,
+    /// This cell's row within the block.
+    pub dy: u8,
+    /// The run text, on the leading cell only. For the per-grapheme (`w == 0`)
+    /// form this is `None` and the grapheme lives in the cell's `c`/`combining`;
+    /// for the packed (`w > 0`) form it holds the whole run.
+    pub run: Option<Box<str>>,
+}
+
 /// One grid cell: a character plus its rendering style.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Cell {
@@ -74,6 +103,8 @@ pub struct Cell {
     pub combining: Option<Box<str>>,
     /// OSC 8 hyperlink: a 1-based index into the grid's link table, or `None`.
     pub link: Option<NonZeroU16>,
+    /// Text-sizing block membership (`OSC 66`), or `None` for ordinary cells.
+    pub sized: Option<Box<Sized>>,
 }
 
 impl Default for Cell {
@@ -87,6 +118,7 @@ impl Default for Cell {
             underline_color: Color::Default,
             combining: None,
             link: None,
+            sized: None,
         }
     }
 }
@@ -210,6 +242,24 @@ fn is_word(c: char, delims: &str) -> bool {
     !c.is_whitespace() && !delims.contains(c)
 }
 
+/// Split text into grapheme-ish units for `OSC 66 w=0` layout: each base
+/// character with its trailing zero-width combining marks and display width.
+/// Leading combining marks with no base are dropped, as in normal printing.
+fn graphemes(text: &str) -> Vec<(char, String, usize)> {
+    let mut out: Vec<(char, String, usize)> = Vec::new();
+    for c in text.chars() {
+        match c.width().unwrap_or(0) {
+            0 => {
+                if let Some(last) = out.last_mut() {
+                    last.1.push(c);
+                }
+            }
+            w => out.push((c, String::new(), w)),
+        }
+    }
+    out
+}
+
 impl Grid {
     pub fn new(cols: usize, rows: usize) -> Self {
         let cols = cols.max(1);
@@ -314,6 +364,7 @@ impl Grid {
     pub fn resize(&mut self, cols: usize, rows: usize) {
         let cols = cols.max(1);
         let rows = rows.max(1);
+        self.clear_sized_runs();
         if self.alt_saved.is_some() {
             self.clip_resize(cols, rows);
         } else {
@@ -560,9 +611,16 @@ impl Grid {
         }
 
         let (x, y) = (self.cursor.x, self.cursor.y);
+        // Overwriting any cell of a text-sizing block dissolves the whole block,
+        // so no orphaned continuation cells are left for the renderer to draw.
+        self.clear_sized_at(x, y);
+        if width == 2 && x + 1 < self.cols {
+            self.clear_sized_at(x + 1, y);
+        }
         let mut cell = self.pen.clone();
         cell.c = c;
         cell.combining = None;
+        cell.sized = None;
         cell.flags.remove(Flags::WIDE_CONT);
         self.lines[y].cells[x] = cell;
         self.last_base = Some((x, y));
@@ -570,6 +628,7 @@ impl Grid {
             let mut cont = self.pen.clone();
             cont.c = ' ';
             cont.combining = None;
+            cont.sized = None;
             cont.flags.insert(Flags::WIDE_CONT);
             self.lines[y].cells[x + 1] = cont;
         }
@@ -602,6 +661,137 @@ impl Grid {
             s.push(mark);
         }
         cell.combining = Some(s.into_boxed_str());
+    }
+
+    /// Lay out a text-sizing run (`OSC 66`) as scaled multicell blocks at the
+    /// cursor, advancing it on the same row by the total block width, as the
+    /// protocol requires. With `width == 0` each grapheme gets its own `s` by `s`
+    /// block (the font scaled by `s`); with `width > 0` the whole run is packed
+    /// into one block `s * width` cells wide and `s` high. A plain descriptor
+    /// (scale 1, no width, no fraction) falls back to ordinary printing.
+    pub fn print_sized(&mut self, text: &str, size: TextSize) {
+        if size.is_plain() {
+            for c in text.chars() {
+                self.print(c);
+            }
+            return;
+        }
+        let rows = size.cell_height().clamp(1, self.rows);
+        if size.width == 0 {
+            for (base, marks, w) in graphemes(text) {
+                let cols = (rows * w).clamp(1, self.cols);
+                self.place_block(base, marks, None, size, cols, rows);
+            }
+        } else {
+            let cols = (rows * size.width as usize).clamp(1, self.cols);
+            self.place_block(' ', String::new(), Some(text.into()), size, cols, rows);
+        }
+    }
+
+    /// Write one scaled block of `cols` by `rows` cells at the cursor and
+    /// advance past it. The leading cell carries the text; the rest are flagged
+    /// [`Flags::SIZED_CONT`]. A block that will not fit wraps to the next line.
+    fn place_block(
+        &mut self,
+        lead: char,
+        marks: String,
+        run: Option<Box<str>>,
+        size: TextSize,
+        cols: usize,
+        rows: usize,
+    ) {
+        if self.wrap_pending || (self.autowrap && self.cursor.x + cols > self.cols) {
+            self.cursor.x = 0;
+            self.lines[self.cursor.y].wrapped = true;
+            self.line_feed();
+            self.wrap_pending = false;
+        }
+        let (x0, y0) = (self.cursor.x, self.cursor.y);
+        let marks = (!marks.is_empty()).then(|| marks.into_boxed_str());
+        for dy in 0..rows {
+            let cy = y0 + dy;
+            if cy >= self.rows {
+                break;
+            }
+            for dx in 0..cols {
+                let cx = x0 + dx;
+                if cx >= self.cols {
+                    break;
+                }
+                // Dissolve any block already occupying this cell before reusing it.
+                self.clear_sized_at(cx, cy);
+                let lead_cell = dx == 0 && dy == 0;
+                let mut cell = self.pen.clone();
+                cell.c = if lead_cell { lead } else { ' ' };
+                cell.combining = if lead_cell { marks.clone() } else { None };
+                cell.flags.remove(Flags::WIDE_CONT);
+                if !lead_cell {
+                    cell.flags.insert(Flags::SIZED_CONT);
+                }
+                cell.sized = Some(Box::new(Sized {
+                    size,
+                    cols: cols as u8,
+                    rows: rows as u8,
+                    dx: dx as u8,
+                    dy: dy as u8,
+                    run: if lead_cell { run.clone() } else { None },
+                }));
+                self.lines[cy].cells[cx] = cell;
+            }
+        }
+        self.last_base = None;
+        if self.cursor.x + cols >= self.cols {
+            self.cursor.x = self.cols - 1;
+            self.wrap_pending = self.autowrap;
+        } else {
+            self.cursor.x += cols;
+        }
+    }
+
+    /// If `(x, y)` belongs to a text-sizing block, blank every cell of that
+    /// block so a write into it cannot orphan continuation cells.
+    fn clear_sized_at(&mut self, x: usize, y: usize) {
+        let Some(s) = self
+            .lines
+            .get(y)
+            .and_then(|l| l.cells.get(x))
+            .and_then(|c| c.sized.as_deref())
+        else {
+            return;
+        };
+        let (dx, dy, cols, rows) = (
+            s.dx as usize,
+            s.dy as usize,
+            s.cols as usize,
+            s.rows as usize,
+        );
+        let x0 = x.saturating_sub(dx);
+        let y0 = y.saturating_sub(dy);
+        let blank = self.pen_blank();
+        let x_end = (x0 + cols).min(self.cols);
+        for by in y0..(y0 + rows).min(self.rows) {
+            for cell in &mut self.lines[by].cells[x0..x_end] {
+                *cell = blank.clone();
+            }
+        }
+    }
+
+    /// Drop all text-sizing blocks: their cells become plain characters. Used
+    /// before a resize, since a scaled block must not be split across a rewrap;
+    /// applications using `OSC 66` repaint on resize regardless.
+    fn clear_sized_runs(&mut self) {
+        let strip = |line: &mut Line| {
+            for cell in &mut line.cells {
+                if cell.sized.take().is_some() {
+                    cell.flags.remove(Flags::SIZED_CONT);
+                }
+            }
+        };
+        self.lines.iter_mut().for_each(strip);
+        self.scrollback.iter_mut().for_each(strip);
+        if let Some(alt) = self.alt_saved.as_mut() {
+            alt.iter_mut().for_each(strip);
+        }
     }
 
     fn shift_right(&mut self, n: usize) {
@@ -982,6 +1172,29 @@ impl Grid {
         }
     }
 
+    /// For a viewport cell `(y, x)` that is the left edge of a text-sizing block
+    /// (its `dx == 0`), return the block's leading cell - which holds the text
+    /// and the full descriptor - together with this row's `dy` within the block.
+    /// `None` if `(y, x)` is not a left-edge sized cell, or the leading row is
+    /// scrolled above the viewport top (the block is then clipped, not drawn).
+    pub fn sized_lead(&self, y: usize, x: usize) -> Option<(&Cell, usize)> {
+        let dy = {
+            let s = self.view_row(y).get(x)?.sized.as_ref()?;
+            if s.dx != 0 {
+                return None;
+            }
+            s.dy as usize
+        };
+        if dy > y {
+            return None;
+        }
+        let lead = self.view_row(y - dy).get(x)?;
+        lead.sized
+            .as_ref()
+            .filter(|ls| ls.dx == 0 && ls.dy == 0)
+            .map(|_| (lead, dy))
+    }
+
     // --- selection ---
 
     /// The absolute row currently shown at viewport row `y`.
@@ -1130,7 +1343,7 @@ impl Grid {
         self.lines[y]
             .cells
             .iter()
-            .filter(|c| !c.flags.contains(Flags::WIDE_CONT))
+            .filter(|c| !c.flags.contains(Flags::WIDE_CONT) && !c.flags.contains(Flags::SIZED_CONT))
             .map(|c| c.c)
             .collect::<String>()
             .trim_end()
@@ -1297,6 +1510,61 @@ mod tests {
         assert_eq!(g.view_row(1)[0].c, '2');
         g.scroll_to_bottom();
         assert_eq!(g.view_row(0)[0].c, '3');
+    }
+
+    #[test]
+    fn sized_scale_lays_out_a_block_and_advances() {
+        // `s=2` with width 0: 'X' fills a 2x2 block, cursor advances 2 cells.
+        let mut g = Grid::new(8, 4);
+        g.print_sized("X", TextSize::parse_str("s=2"));
+        let lead = g.cell(0, 0);
+        assert_eq!(lead.c, 'X');
+        assert!(!lead.flags.contains(Flags::SIZED_CONT));
+        let s = lead.sized.as_ref().expect("leading cell is sized");
+        assert_eq!((s.cols, s.rows, s.dx, s.dy), (2, 2, 0, 0));
+        // The other three cells of the block are continuations.
+        for (x, y) in [(1, 0), (0, 1), (1, 1)] {
+            assert!(g.cell(x, y).flags.contains(Flags::SIZED_CONT));
+        }
+        assert_eq!(g.cursor(), (2, 0));
+    }
+
+    #[test]
+    fn sized_packed_run_round_trips_as_text() {
+        // `w=1` packs the whole run into one cell; selection yields it whole.
+        let mut g = Grid::new(8, 2);
+        g.print_sized("ab", TextSize::parse_str("n=1:d=2:w=1"));
+        assert!(g.cell(0, 0).sized.as_ref().unwrap().run.is_some());
+        g.start_selection(0, 0);
+        g.extend_selection(0, 0);
+        assert_eq!(g.selection_text().as_deref(), Some("ab"));
+        assert_eq!(g.cursor(), (1, 0));
+    }
+
+    #[test]
+    fn overwriting_a_sized_block_dissolves_it() {
+        let mut g = Grid::new(8, 4);
+        g.print_sized("X", TextSize::parse_str("s=2"));
+        // Print a normal char into a continuation cell of the block.
+        g.move_to(1, 1);
+        g.print('z');
+        // The whole block is gone: no cell still claims to be sized.
+        for y in 0..2 {
+            for x in 0..2 {
+                assert!(g.cell(x, y).sized.is_none(), "({x},{y}) still sized");
+                assert!(!g.cell(x, y).flags.contains(Flags::SIZED_CONT));
+            }
+        }
+        assert_eq!(g.cell(1, 1).c, 'z');
+    }
+
+    #[test]
+    fn resize_dissolves_sized_runs() {
+        let mut g = Grid::new(8, 4);
+        g.print_sized("X", TextSize::parse_str("s=2"));
+        g.resize(6, 4);
+        assert!(g.cell(0, 0).sized.is_none());
+        assert!(!g.cell(1, 0).flags.contains(Flags::SIZED_CONT));
     }
 
     #[test]

@@ -221,6 +221,21 @@ impl Fonts {
         Ok(self.gcache.get(&key).expect("glyph was just inserted"))
     }
 
+    /// Rasterize `c` in `style` at `scale` times the base size, uncached.
+    ///
+    /// Scaled glyphs come from the text-sizing protocol (`OSC 66`); they are
+    /// rare and transient, so they bypass the glyph cache. The scale is applied
+    /// as an outline transform, which leaves the face's configured pixel size -
+    /// and therefore the cell metrics every other glyph depends on - untouched.
+    /// Embedded-bitmap (colour) glyphs ignore the transform; the caller scales
+    /// those at blit time instead.
+    pub fn glyph_scaled(&mut self, c: char, style: Style, scale: f32) -> Result<Glyph, FontError> {
+        let idx = self.face_for(c, style)?;
+        let face = &self.faces[idx].face;
+        let (synth_bold, synth_italic) = synth_flags(face, style);
+        rasterize_scaled(face, c, scale.max(0.01), synth_bold, synth_italic)
+    }
+
     /// Shape `base` plus its combining `marks` into positioned glyphs using
     /// HarfBuzz, so marks land where the font's GPOS table wants them rather
     /// than stacked at the origin. Returns `None` when shaping is unavailable or
@@ -470,6 +485,58 @@ fn rasterize_index(
 ) -> Result<Glyph, FontError> {
     rasterize_with(face, synth_bold, synth_italic, |face| {
         face.load_glyph(gid, LoadFlag::RENDER | LoadFlag::COLOR)
+    })
+}
+
+/// Rasterize `c` with the outline scaled by `scale` (and sheared if italic is
+/// synthesized). The transform is reset before returning so the face is left as
+/// it was found.
+fn rasterize_scaled(
+    face: &Face,
+    c: char,
+    scale: f32,
+    synth_bold: bool,
+    synth_italic: bool,
+) -> Result<Glyph, FontError> {
+    // A scale matrix on the diagonal, in 16.16 fixed point; the off-diagonal
+    // `xy` term shears for a synthetic italic (~0.2 of the glyph height). `as _`
+    // takes the field's `FT_Fixed` type, as the identity/shear matrices do.
+    let mut matrix = Matrix {
+        xx: (scale * 65536.0).round() as _,
+        xy: if synth_italic {
+            (scale * 0.2 * 65536.0).round() as _
+        } else {
+            0
+        },
+        yx: 0,
+        yy: (scale * 65536.0).round() as _,
+    };
+    face.set_transform(&mut matrix, &mut Vector { x: 0, y: 0 });
+    let result = face.load_char(c as usize, LoadFlag::RENDER | LoadFlag::COLOR);
+    face.set_transform(&mut identity_matrix(), &mut Vector { x: 0, y: 0 });
+    result?;
+
+    let slot = face.glyph();
+    let bitmap = slot.bitmap();
+    let width = bitmap.width().max(0) as usize;
+    let height = bitmap.rows().max(0) as usize;
+    let pitch = bitmap.pitch();
+    let src = bitmap.buffer();
+    let mut data = match bitmap.pixel_mode()? {
+        PixelMode::Gray => GlyphData::Mask(pack_rows(src, width, pitch, height)),
+        PixelMode::Bgra => GlyphData::Color(pack_rows(src, width * 4, pitch, height)),
+        PixelMode::Mono => GlyphData::Mask(expand_mono(src, width, pitch, height)),
+        _ => GlyphData::Mask(vec![0; width * height]),
+    };
+    if synth_bold && let GlyphData::Mask(mask) = &mut data {
+        embolden(mask, width, height);
+    }
+    Ok(Glyph {
+        left: slot.bitmap_left(),
+        top: slot.bitmap_top(),
+        width: width as u32,
+        height: height as u32,
+        data,
     })
 }
 

@@ -225,6 +225,19 @@ impl Perform for Term {
                     self.clipboard_ops.push(ClipboardOp::Set { primary, text });
                 }
             }
+            // OSC 66: kitty text-sizing protocol. `OSC 66 ; metadata ; text`,
+            // where metadata is a colon-separated key=value list and the text
+            // (which may itself contain ';') is rejoined and laid out scaled.
+            Some(&n) if n == b"66" => {
+                let size = beer_protocols::text_size::parse(params.get(1).copied().unwrap_or(b""));
+                let text = params
+                    .get(2..)
+                    .map(|parts| parts.join(&b';'))
+                    .unwrap_or_default();
+                if let Ok(text) = std::str::from_utf8(&text) {
+                    self.grid.print_sized(text, size);
+                }
+            }
             _ => {}
         }
     }

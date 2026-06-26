@@ -7,6 +7,8 @@
 
 use std::num::NonZeroU16;
 
+use beer_protocols::text_size::{HAlign, VAlign};
+
 use crate::font::{CellMetrics, Fonts, Glyph, GlyphData, Style};
 use crate::grid::{Cell, CursorShape, Flags, Grid, Underline};
 use crate::theme::{Plane, Rgb, Theme};
@@ -198,6 +200,18 @@ impl Renderer {
 
         for (x, cell) in cells.iter().take(cols).enumerate() {
             if cell.flags.contains(Flags::WIDE_CONT) {
+                continue;
+            }
+            // Text-sizing (OSC 66) blocks are drawn from their per-row left edge,
+            // clipped to this row's band; every other block cell is skipped.
+            if let Some(sized) = &cell.sized {
+                if sized.dx == 0
+                    && let Some((lead, dy)) = grid.sized_lead(y, x)
+                {
+                    let origin_x = pad_x + x as i32 * m.width as i32;
+                    let (fg, _) = cell_colors(lead, theme);
+                    self.draw_sized(&mut canvas, lead, dy, (origin_x, row_top), m, fg);
+                }
                 continue;
             }
             if cell.flags.contains(Flags::BLINK) && !blink_on {
@@ -443,6 +457,125 @@ impl Renderer {
             }
         };
         blit_glyph(canvas, glyph, m, origin_x, cell_top, 0, fg);
+    }
+
+    /// Draw the slice of a text-sizing (`OSC 66`) block that falls in one row.
+    ///
+    /// `lead` is the block's leading cell (holding the run text); `dy` is this
+    /// row's offset within the block; `pos` is this row's left edge and top in
+    /// pixels. The full block is `cols * width` by `rows * height` pixels,
+    /// starting `dy` rows above the row top; glyphs are rasterized at the block's
+    /// font scale and clipped to this row's band, so the block paints correctly
+    /// across its several per-row repaints.
+    fn draw_sized(
+        &mut self,
+        canvas: &mut Canvas,
+        lead: &Cell,
+        dy: usize,
+        pos: (i32, i32),
+        m: CellMetrics,
+        fg: Rgb,
+    ) {
+        let (block_left_x, row_top) = pos;
+        let Some(s) = lead.sized.as_deref() else {
+            return;
+        };
+        let scale = s.size.font_scale();
+        let (cols, rows) = (s.cols as i32, s.rows as i32);
+        let block_top = row_top - dy as i32 * m.height as i32;
+        let (block_w, block_h) = (cols * m.width as i32, rows * m.height as i32);
+        let clip = (row_top, row_top + m.height as i32);
+
+        let advance = (m.width as f32 * scale).round().max(1.0) as i32;
+        let render_h = (m.height as f32 * scale).round().max(1.0) as i32;
+
+        // The run: a packed string (w>0) or the leading grapheme (w==0).
+        let run: Vec<char> = match s.run.as_deref() {
+            Some(text) => text.chars().collect(),
+            None => vec![lead.c],
+        };
+        let render_w = advance * run.len() as i32;
+
+        // A fractional scale renders into an area smaller than the block, placed
+        // by the v/h alignment; a whole scale fills the block (offsets zero).
+        let (ox, oy) = if s.size.has_fraction() {
+            let ox = match s.size.halign {
+                HAlign::Left => 0,
+                HAlign::Right => block_w - render_w,
+                HAlign::Center => (block_w - render_w) / 2,
+            };
+            let oy = match s.size.valign {
+                VAlign::Top => 0,
+                VAlign::Bottom => block_h - render_h,
+                VAlign::Middle => (block_h - render_h) / 2,
+            };
+            (ox.max(0), oy.max(0))
+        } else {
+            (0, 0)
+        };
+
+        let baseline = block_top + oy + (m.ascent as f32 * scale).round() as i32;
+        let style = cell_style(lead);
+        let mut pen_x = block_left_x + ox;
+        for c in run {
+            if c != ' '
+                && let Ok(glyph) = self.fonts.glyph_scaled(c, style, scale)
+            {
+                blit_glyph_clipped(canvas, &glyph, pen_x, baseline, clip, fg, render_h);
+            }
+            pen_x += advance;
+        }
+    }
+}
+
+/// Composite a rasterized glyph, clipping to the vertical band `clip = (y0, y1)`
+/// so a tall text-sizing glyph paints only the part belonging to the current
+/// row. Mask glyphs are tinted with `fg`; colour glyphs are scaled to
+/// `target_h` (the outline transform does not scale embedded bitmaps).
+fn blit_glyph_clipped(
+    canvas: &mut Canvas,
+    glyph: &Glyph,
+    pen_x: i32,
+    baseline: i32,
+    clip: (i32, i32),
+    fg: Rgb,
+    target_h: i32,
+) {
+    let (gw, gh) = (glyph.width as i32, glyph.height as i32);
+    match &glyph.data {
+        GlyphData::Mask(mask) => {
+            for gy in 0..gh {
+                let py = baseline - glyph.top + gy;
+                if py < clip.0 || py >= clip.1 {
+                    continue;
+                }
+                for gx in 0..gw {
+                    let a = mask[(gy * gw + gx) as usize];
+                    if a != 0 {
+                        canvas.blend(pen_x + glyph.left + gx, py, fg, a);
+                    }
+                }
+            }
+        }
+        GlyphData::Color(bgra) if gh > 0 => {
+            let sc = target_h as f32 / gh as f32;
+            let tw = (gw as f32 * sc).round() as i32;
+            // Place the scaled bitmap so most of it sits above the baseline.
+            let top = baseline - target_h * 4 / 5;
+            for ty in 0..target_h {
+                let py = top + ty;
+                if py < clip.0 || py >= clip.1 {
+                    continue;
+                }
+                let sy = ((ty as f32 / sc) as i32).min(gh - 1);
+                for tx in 0..tw {
+                    let sx = ((tx as f32 / sc) as i32).min(gw - 1);
+                    let i = ((sy * gw + sx) * 4) as usize;
+                    canvas.over(pen_x + tx, py, &bgra[i..i + 4]);
+                }
+            }
+        }
+        GlyphData::Color(_) => {}
     }
 }
 

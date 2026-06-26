@@ -169,8 +169,9 @@ impl Grid {
         Some(out)
     }
 
-    /// The characters of an absolute row in `[from, to)`, skipping wide
-    /// continuation cells.
+    /// The characters of an absolute row in `[from, to)`, skipping wide and
+    /// text-sizing continuation cells. A leading text-sizing cell that holds a
+    /// packed run (`OSC 66 w>0`) contributes that whole run.
     pub(super) fn row_slice_text(&self, row: usize, from: usize, to: usize) -> String {
         let mut out = String::new();
         for cell in self
@@ -178,8 +179,12 @@ impl Grid {
             .get(from..to.min(self.abs_row(row).len()))
             .unwrap_or(&[])
             .iter()
-            .filter(|c| !c.flags.contains(Flags::WIDE_CONT))
+            .filter(|c| !c.flags.contains(Flags::WIDE_CONT) && !c.flags.contains(Flags::SIZED_CONT))
         {
+            if let Some(run) = cell.sized.as_ref().and_then(|s| s.run.as_ref()) {
+                out.push_str(run);
+                continue;
+            }
             out.push(cell.c);
             if let Some(marks) = &cell.combining {
                 out.push_str(marks);
