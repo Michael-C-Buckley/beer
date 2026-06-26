@@ -12,6 +12,7 @@
 //!
 //! - [`codec`] - base64 (OSC 52 clipboard), hex (XTGETTCAP), and `file://` URI
 //!   percent-decoding (OSC 7).
+//! - [`graphics`] - the kitty graphics protocol APC control-data parse.
 //! - [`caps`] - the terminfo capabilities answered over XTGETTCAP.
 //! - [`charset`] - G0/G1 designation and DEC special-graphics line drawing.
 //! - [`sgr`] - the multi-parameter SGR colour and underline forms.
@@ -27,6 +28,7 @@
 pub mod caps;
 pub mod charset;
 pub mod codec;
+pub mod graphics;
 pub mod key;
 pub mod mouse;
 pub mod sgr;
