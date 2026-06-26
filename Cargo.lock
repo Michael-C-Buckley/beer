@@ -31,7 +31,7 @@ checksum = "f02882884d3e1bc524fb12c79f107f6ad0e1cfd498c536ffb494301740995dfe"
 
 [[package]]
 name = "beer"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "calloop",
