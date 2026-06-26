@@ -233,7 +233,9 @@ impl Graphics {
     /// displays.
     fn transmit(&mut self, cmd: GraphicsCommand, payload: &[u8], cell_px: (u32, u32)) -> Outcome {
         // Continuation chunk: append to the in-flight transmission.
-        if self.pending.is_some() && is_continuation(&cmd) {
+        if let Some(pending) = &self.pending
+            && is_continuation(&cmd, pending)
+        {
             return self.accumulate(cmd, payload, cell_px);
         }
         if cmd.more {
@@ -591,13 +593,17 @@ impl Graphics {
 }
 
 /// Whether a command is a continuation chunk of the in-flight transmission
-/// rather than a fresh command: it carries no id, number, or geometry, only the
-/// `m`/`q` (and, for frames, `a=f`) keys. Both image and animation-frame
+/// rather than a fresh command: it carries no geometry or format keys, only
+/// `m`/`q` (and, for frames, `a=f`). Both image and animation-frame
 /// transmissions chunk this way.
-fn is_continuation(cmd: &GraphicsCommand) -> bool {
+///
+/// The spec says continuation chunks omit `i`/`I`, but some senders (e.g.
+/// kitty's icat) repeat the image id on every chunk. Accept those too, as
+/// long as the id matches the in-flight transmission.
+fn is_continuation(cmd: &GraphicsCommand, pending: &Pending) -> bool {
     matches!(cmd.action, Action::Transmit | Action::Frame)
-        && cmd.id == 0
-        && cmd.number == 0
+        && (cmd.id == 0 || cmd.id == pending.cmd.id)
+        && (cmd.number == 0 || cmd.number == pending.cmd.number)
         && cmd.format == Format::Rgba
         && cmd.width == 0
         && cmd.height == 0
