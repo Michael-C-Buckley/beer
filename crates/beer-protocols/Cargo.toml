@@ -1,0 +1,17 @@
+[package]
+name = "beer-protocols"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Terminal protocol codecs and key/mouse wire encoders used by beer"
+readme = "README.md"
+
+[dependencies]
+# Provides the keyboard vocabulary (Keysym, Modifiers, KeyEvent) the key
+# encoder consumes; the version is kept in lockstep with beer so the types
+# unify to a single definition across the workspace.
+smithay-client-toolkit = "0.20.0"
+
+[lints]
+workspace = true

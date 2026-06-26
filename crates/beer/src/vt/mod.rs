@@ -6,17 +6,14 @@ use std::io::Write as _;
 
 use vte::Params;
 
-use crate::grid::{
-    Color, CursorShape, Flags, Grid, MouseEncoding, MouseProtocol, PromptKind, Underline,
-};
-use crate::theme::{Rgb, Theme};
+use beer_protocols::caps::cap_value;
+use beer_protocols::charset::{Charset, charset, dec_special};
+use beer_protocols::codec::{base64_decode, decode_hex, file_uri_path};
+use beer_protocols::sgr::{ext_color, underline_from};
+use beer_protocols::style::prompt_kind;
 
-/// G0/G1 character set designation.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Charset {
-    Ascii,
-    DecSpecial,
-}
+use crate::grid::{Color, CursorShape, Flags, Grid, MouseEncoding, MouseProtocol, Underline};
+use crate::theme::{Rgb, Theme};
 
 /// Which device-attributes query is being answered.
 #[derive(Clone, Copy, Debug)]
@@ -82,18 +79,6 @@ fn proto(on: bool, protocol: MouseProtocol) -> MouseProtocol {
 /// Select `encoding` when its mode is set, else fall back to the default form.
 fn enc(on: bool, encoding: MouseEncoding) -> MouseEncoding {
     if on { encoding } else { MouseEncoding::X10 }
-}
-
-/// Map an SGR 4 param (`4` or `4:x`) to an underline style.
-fn underline_from(param: &[u16]) -> Underline {
-    match param.get(1).copied().unwrap_or(1) {
-        0 => Underline::None,
-        2 => Underline::Double,
-        3 => Underline::Curly,
-        4 => Underline::Dotted,
-        5 => Underline::Dashed,
-        _ => Underline::Single,
-    }
 }
 
 /// The terminal model: a grid plus the escape-sequence state around it.
@@ -478,226 +463,9 @@ fn raw(params: &Params, idx: usize) -> u16 {
         .unwrap_or(0)
 }
 
-/// Parse an SGR 38/48 extended colour, returning the colour and how many
-/// top-level params it consumed (1 for colon form, more for semicolon form).
-fn ext_color(items: &[&[u16]], i: usize) -> (Option<Color>, usize) {
-    let head = items[i];
-    if head.len() >= 2 {
-        return (color_from_subparams(&head[1..]), 1);
-    }
-    match items.get(i + 1).and_then(|s| s.first().copied()) {
-        Some(5) => {
-            let idx = items
-                .get(i + 2)
-                .and_then(|s| s.first().copied())
-                .unwrap_or(0);
-            (Some(Color::Indexed(idx as u8)), 3)
-        }
-        Some(2) => {
-            let get = |k: usize| {
-                items
-                    .get(i + k)
-                    .and_then(|s| s.first().copied())
-                    .unwrap_or(0)
-            };
-            (
-                Some(Color::Rgb(get(2) as u8, get(3) as u8, get(4) as u8)),
-                5,
-            )
-        }
-        _ => (None, 1),
-    }
-}
-
-fn color_from_subparams(sub: &[u16]) -> Option<Color> {
-    match sub.first().copied() {
-        Some(5) => sub.get(1).map(|&i| Color::Indexed(i as u8)),
-        Some(2) => {
-            // Either `2:r:g:b` or `2:colorspace:r:g:b`.
-            let rgb = if sub.len() >= 5 {
-                &sub[2..5]
-            } else {
-                &sub[1..]
-            };
-            match rgb {
-                [r, g, b, ..] => Some(Color::Rgb(*r as u8, *g as u8, *b as u8)),
-                _ => None,
-            }
-        }
-        _ => None,
-    }
-}
-
-fn charset(byte: u8) -> Charset {
-    match byte {
-        b'0' => Charset::DecSpecial,
-        _ => Charset::Ascii,
-    }
-}
-
-/// Translate a byte under the DEC special graphics set (line drawing).
-fn dec_special(c: char) -> char {
-    match c {
-        '`' => '◆',
-        'a' => '▒',
-        'f' => '°',
-        'g' => '±',
-        'j' => '┘',
-        'k' => '┐',
-        'l' => '┌',
-        'm' => '└',
-        'n' => '┼',
-        'o' => '⎺',
-        'p' => '⎻',
-        'q' => '─',
-        'r' => '⎼',
-        's' => '⎽',
-        't' => '├',
-        'u' => '┤',
-        'v' => '┴',
-        'w' => '┬',
-        'x' => '│',
-        'y' => '≤',
-        'z' => '≥',
-        '~' => '·',
-        _ => c,
-    }
-}
-
-/// Look up a terminfo capability beer reports via XTGETTCAP.
-fn cap_value(name: &[u8]) -> Option<&'static str> {
-    match name {
-        b"TN" => Some("beer"),
-        b"Co" | b"colors" => Some("256"),
-        b"RGB" => Some("8/8/8"),
-        _ => None,
-    }
-}
-
-const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-/// Standard base64 encode (used for OSC 52 query replies).
-pub fn base64_encode(data: &[u8]) -> String {
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    for chunk in data.chunks(3) {
-        let b = [
-            chunk[0],
-            *chunk.get(1).unwrap_or(&0),
-            *chunk.get(2).unwrap_or(&0),
-        ];
-        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
-        out.push(B64[(n >> 18 & 63) as usize] as char);
-        out.push(B64[(n >> 12 & 63) as usize] as char);
-        out.push(if chunk.len() > 1 {
-            B64[(n >> 6 & 63) as usize] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            B64[(n & 63) as usize] as char
-        } else {
-            '='
-        });
-    }
-    out
-}
-
-/// Standard base64 decode, ignoring padding and whitespace; `None` on a bad
-/// character.
-fn base64_decode(data: &[u8]) -> Option<Vec<u8>> {
-    let val = |c: u8| -> Option<u32> {
-        match c {
-            b'A'..=b'Z' => Some(u32::from(c - b'A')),
-            b'a'..=b'z' => Some(u32::from(c - b'a') + 26),
-            b'0'..=b'9' => Some(u32::from(c - b'0') + 52),
-            b'+' => Some(62),
-            b'/' => Some(63),
-            _ => None,
-        }
-    };
-    let filtered: Vec<u8> = data
-        .iter()
-        .copied()
-        .filter(|&c| c != b'=' && !c.is_ascii_whitespace())
-        .collect();
-    let mut out = Vec::with_capacity(filtered.len() / 4 * 3);
-    for chunk in filtered.chunks(4) {
-        if chunk.len() == 1 {
-            return None; // a lone sextet cannot form a byte
-        }
-        let mut n = 0u32;
-        for &c in chunk {
-            n = (n << 6) | val(c)?;
-        }
-        n <<= 6 * (4 - chunk.len() as u32);
-        out.push((n >> 16) as u8);
-        if chunk.len() >= 3 {
-            out.push((n >> 8) as u8);
-        }
-        if chunk.len() >= 4 {
-            out.push(n as u8);
-        }
-    }
-    Some(out)
-}
-
 /// Decode an OSC string field to UTF-8 (lossy), or `None` if absent.
 fn osc_text(field: Option<&&[u8]>) -> Option<String> {
     field.map(|b| String::from_utf8_lossy(b).into_owned())
-}
-
-/// Map an OSC 133 mark letter to a [`PromptKind`].
-fn prompt_kind(b: u8) -> Option<PromptKind> {
-    match b {
-        b'A' => Some(PromptKind::PromptStart),
-        b'B' => Some(PromptKind::CmdStart),
-        b'C' => Some(PromptKind::OutputStart),
-        b'D' => Some(PromptKind::CmdEnd),
-        _ => None,
-    }
-}
-
-/// Extract the local path from an OSC 7 `file://host/path` URI, percent-decoding
-/// `%XX` escapes. The host part is ignored (we only spawn locally). Returns
-/// `None` if it is not a usable absolute path.
-fn file_uri_path(uri: &[u8]) -> Option<String> {
-    let rest = uri.strip_prefix(b"file://").unwrap_or(uri);
-    // Skip the authority (host) up to the first '/', which begins the path.
-    let slash = rest.iter().position(|&b| b == b'/')?;
-    let path_bytes = percent_decode(&rest[slash..]);
-    let path = String::from_utf8(path_bytes).ok()?;
-    path.starts_with('/').then_some(path)
-}
-
-/// Percent-decode `%XX` byte escapes in a URI path, passing other bytes through.
-fn percent_decode(s: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(s.len());
-    let mut i = 0;
-    while i < s.len() {
-        if s[i] == b'%' && i + 2 < s.len() {
-            let hi = (s[i + 1] as char).to_digit(16);
-            let lo = (s[i + 2] as char).to_digit(16);
-            if let (Some(hi), Some(lo)) = (hi, lo) {
-                out.push((hi * 16 + lo) as u8);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(s[i]);
-        i += 1;
-    }
-    out
-}
-
-/// Decode an even-length lowercase/uppercase hex string into bytes.
-fn decode_hex(s: &[u8]) -> Option<Vec<u8>> {
-    if s.is_empty() || !s.len().is_multiple_of(2) {
-        return None;
-    }
-    let nibble = |b: u8| (b as char).to_digit(16).map(|d| d as u8);
-    s.chunks_exact(2)
-        .map(|pair| Some((nibble(pair[0])? << 4) | nibble(pair[1])?))
-        .collect()
 }
 
 #[cfg(test)]
@@ -857,25 +625,6 @@ mod tests {
         feed(&mut t, b"\x1b[?2026l\x1b[?2026$p");
         assert!(!t.grid().sync_active());
         assert_eq!(t.take_response(), b"\x1b[?2026;2$y");
-    }
-
-    #[test]
-    fn base64_round_trips() {
-        for s in [
-            "",
-            "f",
-            "fo",
-            "foo",
-            "foob",
-            "fooba",
-            "foobar",
-            "hi there\n",
-        ] {
-            let enc = base64_encode(s.as_bytes());
-            assert_eq!(base64_decode(enc.as_bytes()).as_deref(), Some(s.as_bytes()));
-        }
-        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
-        assert_eq!(base64_decode(b"Zm9vYmFy").as_deref(), Some(&b"foobar"[..]));
     }
 
     #[test]

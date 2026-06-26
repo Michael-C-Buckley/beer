@@ -12,11 +12,11 @@
   fontconfig,
   harfbuzz,
 }: let
-  cargoTOML = (lib.importTOML ../Cargo.toml).package.version;
+  cargoTOML = lib.importTOML ../Cargo.toml;
 in
   rustPlatform.buildRustPackage (finalAttrs: {
     pname = "beer";
-    version = cargoTOML.package.version;
+    version = cargoTOML.workspace.package.version;
 
     src = let
       fs = lib.fileset;
@@ -25,7 +25,7 @@ in
       fs.toSource {
         root = s;
         fileset = fs.unions [
-          (s + /src)
+          (s + /crates)
           (s + /Cargo.lock)
           (s + /Cargo.toml)
           (s + /terminfo)

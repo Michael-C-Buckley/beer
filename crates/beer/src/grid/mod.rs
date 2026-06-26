@@ -16,14 +16,10 @@ use search::SearchState;
 /// Maximum scrollback lines retained for the main screen.
 const SCROLLBACK_CAP: usize = 10_000;
 
-/// A cell colour: terminal default, a palette index, or direct RGB.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub enum Color {
-    #[default]
-    Default,
-    Indexed(u8),
-    Rgb(u8, u8, u8),
-}
+/// The protocol vocabulary an SGR/DECSET stream selects lives in
+/// `beer-protocols` and is re-exported here so the grid and renderer keep
+/// referring to it as `grid::Color`, `grid::Underline`, and so on.
+pub use beer_protocols::{Color, CursorShape, MouseEncoding, MouseProtocol, PromptKind, Underline};
 
 /// Per-cell style flags, packed into a `u16`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -60,55 +56,6 @@ impl Flags {
     pub fn remove(&mut self, other: Self) {
         self.0 &= !other.0;
     }
-}
-
-/// Underline style (SGR 4 / 4:x / 21).
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub enum Underline {
-    #[default]
-    None,
-    Single,
-    Double,
-    Curly,
-    Dotted,
-    Dashed,
-}
-
-/// Cursor shape (DECSCUSR).
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub enum CursorShape {
-    #[default]
-    Block,
-    Underline,
-    Beam,
-}
-
-/// Which mouse events the application has asked to receive (DECSET 9/1000-1003).
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub enum MouseProtocol {
-    /// No reporting; the pointer drives local selection/scroll.
-    #[default]
-    Off,
-    /// X10 (9): button presses only.
-    X10,
-    /// Normal (1000): button press and release.
-    Normal,
-    /// Button-event (1002): press, release, and motion while a button is held.
-    Button,
-    /// Any-event (1003): press, release, and all pointer motion.
-    Any,
-}
-
-/// How mouse events are framed on the wire (default byte form, UTF-8, or SGR).
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub enum MouseEncoding {
-    /// Legacy `CSI M Cb Cx Cy`, each value a byte offset by 32 (≤ 223).
-    #[default]
-    X10,
-    /// As X10 but coordinates above 95 are UTF-8 encoded (DECSET 1005).
-    Utf8,
-    /// `CSI < Cb ; Cx ; Cy M/m`, decimal and unbounded (DECSET 1006).
-    Sgr,
 }
 
 /// One grid cell: a character plus its rendering style.
@@ -148,17 +95,6 @@ impl Default for Cell {
 struct Cursor {
     x: usize,
     y: usize,
-}
-
-/// Shell-integration prompt mark on a line (OSC 133): the start of a prompt,
-/// the start of typed command input, the start of command output, or the line
-/// where the command finished.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum PromptKind {
-    PromptStart,
-    CmdStart,
-    OutputStart,
-    CmdEnd,
 }
 
 /// One screen/scrollback row: its cells plus whether it soft-wrapped into the

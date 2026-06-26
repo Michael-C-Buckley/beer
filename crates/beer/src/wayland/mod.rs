@@ -611,9 +611,9 @@ impl App {
     fn handle_key(&mut self, event: &KeyEvent) {
         // A new arrival of a held key is a repeat; otherwise a fresh press.
         let kind = if self.keys_down.insert(event.raw_code) {
-            crate::input::KeyKind::Press
+            beer_protocols::key::KeyKind::Press
         } else {
-            crate::input::KeyKind::Repeat
+            beer_protocols::key::KeyKind::Repeat
         };
 
         // The Unicode-input prompt, URL hint mode, and search each capture the
@@ -644,9 +644,9 @@ impl App {
             (s.term.grid().app_cursor(), s.term.grid().kitty_flags())
         });
         let bytes = if kitty != 0 {
-            crate::input::kitty_encode(event, self.modifiers, kitty, kind, app_cursor)
+            beer_protocols::key::kitty_encode(event, self.modifiers, kitty, kind, app_cursor)
         } else {
-            crate::input::encode(event, self.modifiers, app_cursor)
+            beer_protocols::key::encode(event, self.modifiers, app_cursor)
         };
         if let Some(bytes) = bytes {
             self.send_to_shell(&bytes);
@@ -663,11 +663,11 @@ impl App {
         if kitty == 0 {
             return;
         }
-        if let Some(bytes) = crate::input::kitty_encode(
+        if let Some(bytes) = beer_protocols::key::kitty_encode(
             event,
             self.modifiers,
             kitty,
-            crate::input::KeyKind::Release,
+            beer_protocols::key::KeyKind::Release,
             app_cursor,
         ) {
             self.send_to_shell(&bytes);
@@ -1413,8 +1413,15 @@ impl App {
         if (pressed || proto != MouseProtocol::X10)
             && let Some((col, row)) = self.report_screen_cell()
         {
-            let bytes =
-                crate::input::encode_mouse(enc, code, col, row, pressed, false, self.modifiers);
+            let bytes = beer_protocols::mouse::encode_mouse(
+                enc,
+                code,
+                col,
+                row,
+                pressed,
+                false,
+                self.modifiers,
+            );
             self.write_to_pty(&bytes);
             self.last_report_cell = Some((col, row));
         }
@@ -1444,7 +1451,15 @@ impl App {
         {
             // Any-event motion with no button held uses the "no button" code 3.
             let code = self.pressed_button.unwrap_or(3);
-            let bytes = crate::input::encode_mouse(enc, code, col, row, true, true, self.modifiers);
+            let bytes = beer_protocols::mouse::encode_mouse(
+                enc,
+                code,
+                col,
+                row,
+                true,
+                true,
+                self.modifiers,
+            );
             self.write_to_pty(&bytes);
             self.last_report_cell = Some((col, row));
         }
@@ -1588,7 +1603,7 @@ impl App {
                     let kind = if primary { 'p' } else { 'c' };
                     let reply = format!(
                         "\x1b]52;{kind};{}\x07",
-                        crate::vt::base64_encode(text.as_bytes())
+                        beer_protocols::codec::base64_encode(text.as_bytes())
                     );
                     self.write_to_pty(reply.as_bytes());
                 }

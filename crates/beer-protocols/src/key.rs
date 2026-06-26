@@ -1,13 +1,12 @@
 //! Keyboard encoding: translate decoded key events into the byte sequences a
-//! terminal application expects (xterm/VT-style).
-
-use std::io::Write as _;
+//! terminal application expects, in both the legacy xterm/VT form and the kitty
+//! keyboard progressive-enhancement form.
 
 use smithay_client_toolkit::seat::keyboard::{KeyEvent, Keysym, Modifiers};
 
-use crate::grid::MouseEncoding;
-
-/// Encode a key press into bytes for the PTY, or `None` if it produces no input.
+/// Encode a key press into bytes for the PTY in the legacy xterm/VT form, or
+/// `None` if it produces no input. `app_cursor` selects the SS3 cursor-key form
+/// (DECCKM).
 pub fn encode(event: &KeyEvent, mods: Modifiers, app_cursor: bool) -> Option<Vec<u8>> {
     let seq = match event.keysym {
         Keysym::Return | Keysym::KP_Enter => prefix_alt(b"\r".to_vec(), mods),
@@ -56,7 +55,7 @@ pub fn encode(event: &KeyEvent, mods: Modifiers, app_cursor: bool) -> Option<Vec
 }
 
 /// A key event's kind, for the kitty keyboard protocol's event-type sub-field.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum KeyKind {
     Press = 1,
     Repeat = 2,
@@ -280,58 +279,6 @@ fn alt_field(cp: u32, keysym: Keysym, mods: Modifiers, report_alt: bool) -> Stri
     cp.to_string()
 }
 
-/// Encode a mouse event for the application. `button` is the base code (0/1/2
-/// for left/middle/right, 64/65 for wheel up/down); `col`/`row` are 0-based
-/// screen cells; `motion` marks a drag/move report. Returns the bytes to send.
-pub fn encode_mouse(
-    encoding: MouseEncoding,
-    button: u8,
-    col: usize,
-    row: usize,
-    pressed: bool,
-    motion: bool,
-    mods: Modifiers,
-) -> Vec<u8> {
-    let mod_bits =
-        (u8::from(mods.shift) << 2) | (u8::from(mods.alt) << 3) | (u8::from(mods.ctrl) << 4);
-    let motion_bit = if motion { 32 } else { 0 };
-    let mut out = Vec::new();
-    match encoding {
-        MouseEncoding::Sgr => {
-            let cb = u32::from(button) + u32::from(motion_bit) + u32::from(mod_bits);
-            let final_byte = if pressed { 'M' } else { 'm' };
-            let _ = write!(out, "\x1b[<{cb};{};{}{final_byte}", col + 1, row + 1);
-        }
-        enc => {
-            // Legacy form collapses every button release to code 3.
-            let base = if !pressed && button <= 2 { 3 } else { button };
-            let cb = 32 + base + motion_bit + mod_bits;
-            out.extend_from_slice(b"\x1b[M");
-            push_coord(&mut out, u32::from(cb), false);
-            let utf8 = enc == MouseEncoding::Utf8;
-            push_coord(&mut out, col as u32 + 33, utf8);
-            push_coord(&mut out, row as u32 + 33, utf8);
-        }
-    }
-    out
-}
-
-/// Push one legacy mouse coordinate byte, UTF-8 encoding values above 127 when
-/// the extended (1005) mode is active, and clamping otherwise.
-fn push_coord(out: &mut Vec<u8>, value: u32, utf8: bool) {
-    if utf8 {
-        let v = value.min(0x7ff);
-        if v >= 0x80 {
-            out.push(0xc0 | (v >> 6) as u8);
-            out.push(0x80 | (v & 0x3f) as u8);
-        } else {
-            out.push(v as u8);
-        }
-    } else {
-        out.push(value.min(255) as u8);
-    }
-}
-
 fn prefix_alt(bytes: Vec<u8>, mods: Modifiers) -> Vec<u8> {
     if mods.alt {
         let mut out = Vec::with_capacity(bytes.len() + 1);
@@ -407,6 +354,15 @@ mod tests {
         num_lock: false,
     };
 
+    fn mods(ctrl: bool, shift: bool, alt: bool) -> Modifiers {
+        Modifiers {
+            ctrl,
+            shift,
+            alt,
+            ..NONE
+        }
+    }
+
     #[test]
     fn plain_text_passes_through() {
         assert_eq!(
@@ -417,9 +373,9 @@ mod tests {
 
     #[test]
     fn alt_prefixes_escape() {
-        let mods = Modifiers { alt: true, ..NONE };
+        let m = Modifiers { alt: true, ..NONE };
         assert_eq!(
-            encode(&key(Keysym::a, Some("a")), mods, false),
+            encode(&key(Keysym::a, Some("a")), m, false),
             Some(b"\x1ba".to_vec())
         );
     }
@@ -438,52 +394,11 @@ mod tests {
 
     #[test]
     fn modified_arrow_uses_csi_param() {
-        let mods = Modifiers { ctrl: true, ..NONE };
+        let m = Modifiers { ctrl: true, ..NONE };
         assert_eq!(
-            encode(&key(Keysym::Right, None), mods, false),
+            encode(&key(Keysym::Right, None), m, false),
             Some(b"\x1b[1;5C".to_vec())
         );
-    }
-
-    #[test]
-    fn mouse_sgr_press_and_release() {
-        // Left press at column 3, row 5 (0-based) → SGR with 1-based coords.
-        assert_eq!(
-            encode_mouse(MouseEncoding::Sgr, 0, 3, 5, true, false, NONE),
-            b"\x1b[<0;4;6M".to_vec()
-        );
-        assert_eq!(
-            encode_mouse(MouseEncoding::Sgr, 0, 3, 5, false, false, NONE),
-            b"\x1b[<0;4;6m".to_vec()
-        );
-    }
-
-    #[test]
-    fn mouse_legacy_release_collapses_to_three() {
-        // Legacy release: button bits become 3; values offset by 32.
-        assert_eq!(
-            encode_mouse(MouseEncoding::X10, 0, 0, 0, false, false, NONE),
-            vec![0x1b, b'[', b'M', 32 + 3, 33, 33]
-        );
-    }
-
-    #[test]
-    fn mouse_motion_and_modifiers_set_bits() {
-        let mods = Modifiers { ctrl: true, ..NONE };
-        // Drag with the left button and ctrl held: 0 + 32(motion) + 16(ctrl).
-        assert_eq!(
-            encode_mouse(MouseEncoding::Sgr, 0, 0, 0, true, true, mods),
-            b"\x1b[<48;1;1M".to_vec()
-        );
-    }
-
-    fn mods(ctrl: bool, shift: bool, alt: bool) -> Modifiers {
-        Modifiers {
-            ctrl,
-            shift,
-            alt,
-            ..NONE
-        }
     }
 
     #[test]

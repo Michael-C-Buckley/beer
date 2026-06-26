@@ -4,7 +4,6 @@ mod bindings;
 mod config;
 mod font;
 mod grid;
-mod input;
 mod pty;
 mod render;
 mod theme;

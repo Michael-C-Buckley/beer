@@ -31,9 +31,10 @@ checksum = "f02882884d3e1bc524fb12c79f107f6ad0e1cfd498c536ffb494301740995dfe"
 
 [[package]]
 name = "beer"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
+ "beer-protocols",
  "calloop",
  "calloop-wayland-source",
  "fontconfig",
@@ -53,6 +54,13 @@ dependencies = [
  "vte",
  "wayland-client",
  "wayland-protocols",
+]
+
+[[package]]
+name = "beer-protocols"
+version = "0.4.0"
+dependencies = [
+ "smithay-client-toolkit",
 ]
 
 [[package]]

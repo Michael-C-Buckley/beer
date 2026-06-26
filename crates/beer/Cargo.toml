@@ -1,0 +1,44 @@
+[package]
+name = "beer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "A fast, software-rendered, Wayland-native terminal emulator"
+readme = true
+
+[dependencies]
+anyhow = "1.0.102"
+beer-protocols = { path = "../beer-protocols" }
+calloop = { version = "0.14.4", features = ["signals"] }
+calloop-wayland-source = "0.4.1"
+fontconfig = "0.11.0"
+freetype-rs = "0.38.0"
+harfbuzz_rs_now = "2.3.2"
+lru = "0.18.0"
+pound = "0.1.6"
+rustix = { version = "1.1.4", features = [
+  "pty",
+  "process",
+  "termios",
+  "stdio",
+  "fs",
+] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_ignored = "0.1.14"
+smithay-client-toolkit = "0.20.0"
+thiserror = "2.0.18"
+toml = "1.1.2"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+unicode-width = "0.2.2"
+vte = "0.15.0"
+wayland-client = "0.31.14"
+wayland-protocols = { version = "0.32.13", features = [
+  "client",
+  "staging",
+  "unstable",
+] }
+
+[lints]
+workspace = true
