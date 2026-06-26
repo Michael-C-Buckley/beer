@@ -17,6 +17,7 @@
 //! - [`sgr`] - the multi-parameter SGR colour and underline forms.
 //! - [`key`] - legacy xterm/VT and kitty keyboard-protocol key encoding.
 //! - [`mouse`] - X10/UTF-8/SGR mouse-report encoding.
+//! - [`text_size`] - the kitty text-sizing protocol (`OSC 66`) metadata.
 //! - [`style`] - the enums an SGR/DECSET stream selects (colour, underline,
 //!   cursor shape, mouse protocol/encoding, shell-integration prompt marks).
 //!
@@ -30,6 +31,7 @@ pub mod key;
 pub mod mouse;
 pub mod sgr;
 pub mod style;
+pub mod text_size;
 
 pub use style::{
     Color, CursorShape, MouseEncoding, MouseProtocol, PromptKind, Underline, prompt_kind,
