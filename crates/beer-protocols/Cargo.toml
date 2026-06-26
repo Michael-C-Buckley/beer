@@ -9,9 +9,9 @@ readme = "README.md"
 
 [dependencies]
 # Provides the keyboard vocabulary (Keysym, Modifiers, KeyEvent) the key
-# encoder consumes; the version is kept in lockstep with beer so the types
-# unify to a single definition across the workspace.
-smithay-client-toolkit = "0.20.0"
+# encoder consumes. The version comes from [workspace.dependencies] so it is
+# always the same as beer's and the types unify to a single definition.
+smithay-client-toolkit.workspace = true
 
 [lints]
 workspace = true
