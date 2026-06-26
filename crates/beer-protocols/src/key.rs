@@ -9,8 +9,8 @@ use smithay_client_toolkit::seat::keyboard::{KeyEvent, Keysym, Modifiers};
 /// (DECCKM).
 pub fn encode(event: &KeyEvent, mods: Modifiers, app_cursor: bool) -> Option<Vec<u8>> {
     let seq = match event.keysym {
-        Keysym::Return | Keysym::KP_Enter => prefix_alt(b"\r".to_vec(), mods),
-        Keysym::BackSpace => prefix_alt(b"\x7f".to_vec(), mods),
+        Keysym::Return | Keysym::KP_Enter => prefix_alt(b"\r", mods),
+        Keysym::BackSpace => prefix_alt(b"\x7f", mods),
         Keysym::Tab if mods.shift => b"\x1b[Z".to_vec(),
         Keysym::Tab => b"\t".to_vec(),
         Keysym::Escape => b"\x1b".to_vec(),
@@ -48,7 +48,7 @@ pub fn encode(event: &KeyEvent, mods: Modifiers, app_cursor: bool) -> Option<Vec
             if text.is_empty() {
                 return None;
             }
-            prefix_alt(text.as_bytes().to_vec(), mods)
+            prefix_alt(text.as_bytes(), mods)
         }
     };
     Some(seq)
@@ -285,14 +285,14 @@ fn alt_field(cp: u32, keysym: Keysym, mods: Modifiers, report_alt: bool) -> Stri
     cp.to_string()
 }
 
-fn prefix_alt(bytes: Vec<u8>, mods: Modifiers) -> Vec<u8> {
+fn prefix_alt(bytes: &[u8], mods: Modifiers) -> Vec<u8> {
     if mods.alt {
         let mut out = Vec::with_capacity(bytes.len() + 1);
         out.push(0x1b);
-        out.extend_from_slice(&bytes);
+        out.extend_from_slice(bytes);
         out
     } else {
-        bytes
+        bytes.to_vec()
     }
 }
 
