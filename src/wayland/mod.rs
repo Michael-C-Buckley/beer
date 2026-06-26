@@ -46,7 +46,7 @@ use smithay_client_toolkit::{
         delegate_activation, delegate_compositor, delegate_data_device, delegate_keyboard,
     delegate_output,
     delegate_pointer, delegate_primary_selection, delegate_registry, delegate_seat, delegate_shm,
-    delegate_xdg_shell, delegate_xdg_window,
+    delegate_touch, delegate_xdg_shell, delegate_xdg_window,
     output::{OutputHandler, OutputState},
     primary_selection::{
         PrimarySelectionManagerState,
@@ -62,6 +62,7 @@ use smithay_client_toolkit::{
             BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, PointerEvent, PointerEventKind, PointerHandler,
             cursor_shape::CursorShapeManager,
         },
+        touch::TouchHandler,
     },
     shell::{
         WaylandSurface,
@@ -81,7 +82,7 @@ use wayland_client::{
     protocol::{
         wl_data_device::WlDataDevice, wl_data_device_manager::DndAction,
         wl_data_source::WlDataSource, wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm,
-        wl_surface,
+        wl_surface, wl_touch,
     },
 };
 use wayland_protocols::wp::content_type::v1::client::{
@@ -289,6 +290,7 @@ pub fn run(config: Config, config_path: Option<std::path::PathBuf>) -> anyhow::R
         url_input: String::new(),
         unicode_input: None,
         keys_down: std::collections::HashSet::new(),
+        touch_scroll: None,
         focused: true,
         exit: false,
         exit_code: ExitCode::SUCCESS,
@@ -394,6 +396,18 @@ struct SeatData {
     primary_device: Option<PrimarySelectionDevice>,
     /// text-input-v3 handle for IME preedit/commit, if the compositor offers it.
     text_input: Option<ZwpTextInputV3>,
+    touch: Option<wl_touch::WlTouch>,
+}
+
+/// A single-finger touch drag in progress, used to scroll the viewport.
+#[derive(Debug)]
+struct TouchScroll {
+    /// Touch point id we are tracking (the first finger down).
+    id: i32,
+    /// Surface-local y of the last motion, to take per-event deltas.
+    last_y: f64,
+    /// Sub-cell pixel remainder carried between motions.
+    acc: f64,
 }
 
 /// Window + Wayland client state shared across all protocol handlers.
@@ -514,6 +528,8 @@ struct App {
     /// Raw key codes currently held, to tell press from repeat for the kitty
     /// keyboard protocol's event-type reporting.
     keys_down: std::collections::HashSet<u32>,
+    /// A single-finger touch drag in progress (scrolls the viewport).
+    touch_scroll: Option<TouchScroll>,
     /// Whether the toplevel currently has keyboard focus (drives the cursor).
     focused: bool,
     exit: bool,
@@ -1205,6 +1221,7 @@ impl App {
             data_device: None,
             primary_device: None,
             text_input: None,
+            touch: None,
         });
         self.seats.len() - 1
     }

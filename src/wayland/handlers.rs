@@ -141,6 +141,12 @@ impl SeatHandler for App {
                 Err(err) => tracing::warn!("get pointer: {err}"),
             }
         }
+        if capability == Capability::Touch && self.seats[i].touch.is_none() {
+            match self.seat_state.get_touch(qh, &seat) {
+                Ok(touch) => self.seats[i].touch = Some(touch),
+                Err(err) => tracing::warn!("get touch: {err}"),
+            }
+        }
     }
 
     fn remove_capability(
@@ -164,6 +170,12 @@ impl SeatHandler for App {
                 if let Some(pointer) = s.pointer.take() {
                     pointer.release();
                 }
+            }
+            Capability::Touch => {
+                if let Some(touch) = s.touch.take() {
+                    touch.release();
+                }
+                self.touch_scroll = None;
             }
             _ => {}
         }
@@ -434,6 +446,96 @@ impl PointerHandler for App {
                 _ => {}
             }
         }
+    }
+}
+
+// Touch drives one-finger drag-to-scroll of the scrollback viewport. Taps and
+// multi-finger gestures are ignored; only the first touch point is tracked.
+impl TouchHandler for App {
+    fn down(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_touch::WlTouch,
+        _serial: u32,
+        _time: u32,
+        _surface: wl_surface::WlSurface,
+        id: i32,
+        position: (f64, f64),
+    ) {
+        if self.touch_scroll.is_none() {
+            self.touch_scroll = Some(TouchScroll {
+                id,
+                last_y: position.1,
+                acc: 0.0,
+            });
+        }
+    }
+
+    fn up(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_touch::WlTouch,
+        _serial: u32,
+        _time: u32,
+        id: i32,
+    ) {
+        if self.touch_scroll.as_ref().is_some_and(|t| t.id == id) {
+            self.touch_scroll = None;
+        }
+    }
+
+    fn motion(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_touch::WlTouch,
+        _time: u32,
+        id: i32,
+        position: (f64, f64),
+    ) {
+        let cell_h = self.renderer.metrics().height as f64;
+        let Some(touch) = self.touch_scroll.as_mut().filter(|t| t.id == id) else {
+            return;
+        };
+        touch.acc += position.1 - touch.last_y;
+        touch.last_y = position.1;
+        // Dragging down (positive delta) reveals older lines, matching the
+        // viewport's "positive scrolls back" convention.
+        let lines = (touch.acc / cell_h) as isize;
+        if lines != 0 {
+            touch.acc -= lines as f64 * cell_h;
+            if let Some(session) = self.session.as_mut() {
+                session.term.scroll_view(lines);
+                self.needs_draw = true;
+            }
+        }
+    }
+
+    fn shape(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_touch::WlTouch,
+        _: i32,
+        _: f64,
+        _: f64,
+    ) {
+    }
+
+    fn orientation(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_touch::WlTouch,
+        _: i32,
+        _: f64,
+    ) {
+    }
+
+    fn cancel(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_touch::WlTouch) {
+        self.touch_scroll = None;
     }
 }
 
@@ -757,6 +859,7 @@ delegate_shm!(App);
 delegate_seat!(App);
 delegate_keyboard!(App);
 delegate_pointer!(App);
+delegate_touch!(App);
 delegate_xdg_shell!(App);
 delegate_xdg_window!(App);
 delegate_data_device!(App);
