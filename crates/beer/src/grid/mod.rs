@@ -782,7 +782,25 @@ impl Grid {
         rows: usize,
         keep_cursor: bool,
     ) {
-        let (x0, y0) = (self.cursor.x, self.cursor.y);
+        let x0 = self.cursor.x;
+        // Scroll the screen to make vertical room for the image. Only scroll
+        // when the full screen is the active scroll region; a DECSTBM region
+        // or the alternate screen keeps the image clipped as before.
+        let y0 = if self.top == 0
+            && self.bottom == self.rows - 1
+            && self.alt_saved.is_none()
+        {
+            let y0_initial = self.cursor.y;
+            let scroll_n = (y0_initial + rows)
+                .saturating_sub(self.rows)
+                .min(y0_initial);
+            if scroll_n > 0 {
+                self.scroll_up(scroll_n);
+            }
+            y0_initial - scroll_n
+        } else {
+            self.cursor.y
+        };
         for dy in 0..rows {
             let cy = y0 + dy;
             if cy >= self.rows {
