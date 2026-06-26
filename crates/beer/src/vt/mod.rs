@@ -697,6 +697,38 @@ mod tests {
     }
 
     #[test]
+    fn kitty_graphics_scrolls_to_fit_image() {
+        // 20x4 terminal, cursor at the last row. An image 3 cells tall needs
+        // 3 rows; only 1 is available, so the grid should scroll up 2 rows to
+        // make room, then place the image in the bottom 3 rows.
+        let mut t = Term::new(20, 4);
+        // Move cursor to last row.
+        feed(&mut t, b"\x1b[4;1H"); // CSI 4;1 H = row 4, col 1 (1-based)
+        assert_eq!(t.grid().cursor(), (0, 3));
+
+        // A 16x48 RGBA image: 2 cells wide, 3 cells tall at 8x16 cell size.
+        let px = vec![0xffu8; 16 * 48 * 4];
+        let b64 = beer_protocols::codec::base64_encode(&px);
+        let seq = format!("\x1b_Ga=T,f=32,s=16,v=48,i=2;{b64}\x1b\\");
+        feed(&mut t, seq.as_bytes());
+
+        // The grid should have scrolled 2 rows; cursor is now on row 3 (last),
+        // and image rows start at row 1 (dy=0 there, dy=2 at row 3).
+        let top_cell = t.grid().cell(0, 1);
+        assert_eq!(
+            top_cell.image.map(|r| (r.image, r.dy)),
+            Some((2, 0)),
+            "top row of image should be at grid row 1 after scroll"
+        );
+        let bot_cell = t.grid().cell(0, 3);
+        assert_eq!(
+            bot_cell.image.map(|r| (r.image, r.dy)),
+            Some((2, 2)),
+            "bottom row of image should be at grid row 3"
+        );
+    }
+
+    #[test]
     fn reports_pixel_geometry_for_graphics_clients() {
         // The test harness feeds with an 8x16 cell. A 20x4 grid is then 160x64
         // pixels. These answers are what an image client needs to size images.
