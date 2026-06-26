@@ -5,7 +5,7 @@ use std::io;
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{self, Child, Command, ExitStatus, Stdio};
 
 use anyhow::Context;
 use rustix::pty::{OpenptFlags, grantpt, ioctl_tiocgptpeer, openpt, unlockpt};
@@ -47,6 +47,10 @@ impl Pty {
         let mut cmd = Command::new(&shell);
         cmd.arg0(&argv0)
             .env("TERM", term)
+            // Advertise Kitty graphics protocol compatibility. Yazi (and other
+            // clients) gate `kgp` vs `kgp_old` on recognising the terminal
+            // brand; KITTY_WINDOW_ID is the env check they use for Kitty.
+            .env("KITTY_WINDOW_ID", process::id().to_string())
             .env_remove("COLUMNS")
             .env_remove("LINES")
             .env_remove("TERMCAP")
