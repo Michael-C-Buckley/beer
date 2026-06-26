@@ -154,6 +154,9 @@ pub struct Main {
     /// Characters that break a word for double-click selection. Empty/unset
     /// keeps the built-in default.
     pub word_delimiters: Option<String>,
+    /// Hold an idle inhibitor while the window is focused, so the compositor
+    /// does not blank the screen or start the screensaver. Default off.
+    pub idle_inhibit: bool,
 }
 
 impl Default for Main {
@@ -167,6 +170,7 @@ impl Default for Main {
             pad_x: 2,
             pad_y: 2,
             word_delimiters: None,
+            idle_inhibit: false,
         }
     }
 }

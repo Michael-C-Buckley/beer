@@ -84,9 +84,17 @@ use wayland_client::{
         wl_surface,
     },
 };
+use wayland_protocols::wp::content_type::v1::client::{
+    wp_content_type_manager_v1::WpContentTypeManagerV1,
+    wp_content_type_v1::{self, WpContentTypeV1},
+};
 use wayland_protocols::wp::fractional_scale::v1::client::{
     wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1,
     wp_fractional_scale_v1::{self, WpFractionalScaleV1},
+};
+use wayland_protocols::wp::idle_inhibit::zv1::client::{
+    zwp_idle_inhibit_manager_v1::ZwpIdleInhibitManagerV1,
+    zwp_idle_inhibitor_v1::{self, ZwpIdleInhibitorV1},
 };
 use wayland_protocols::wp::text_input::zv3::client::{
     zwp_text_input_manager_v3::ZwpTextInputManagerV3,
@@ -181,6 +189,14 @@ pub fn run(config: Config, config_path: Option<std::path::PathBuf>) -> anyhow::R
     });
     let text_input_manager = bind_global::<ZwpTextInputManagerV3>(&globals, &qh);
     let activation = ActivationState::bind(&globals, &qh).ok();
+    let idle_inhibit_manager = bind_global::<ZwpIdleInhibitManagerV1>(&globals, &qh);
+    // Tag the surface as plain content (a terminal is none of photo/video/game)
+    // so the compositor applies no media-specific treatment. Applies on commit.
+    let content_type = bind_global::<WpContentTypeManagerV1>(&globals, &qh)
+        .map(|mgr| mgr.get_surface_content_type(window.wl_surface(), &qh, ()));
+    if let Some(ct) = &content_type {
+        ct.set_content_type(wp_content_type_v1::Type::None);
+    }
 
     // First commit with no buffer kicks off the initial configure.
     window.commit();
@@ -219,6 +235,9 @@ pub fn run(config: Config, config_path: Option<std::path::PathBuf>) -> anyhow::R
         cursor_shape_manager,
         text_input_manager,
         activation,
+        idle_inhibit_manager,
+        idle_inhibitor: None,
+        content_type,
         preedit: String::new(),
         ime_preedit_pending: String::new(),
         ime_commit_pending: String::new(),
@@ -397,6 +416,17 @@ struct App {
     text_input_manager: Option<ZwpTextInputManagerV3>,
     /// xdg-activation, used to request attention on an urgent bell.
     activation: Option<ActivationState>,
+    /// idle-inhibit-v1 manager; an inhibitor is held while focused when the
+    /// `[main] idle-inhibit` config is on, so the screen does not blank.
+    idle_inhibit_manager: Option<ZwpIdleInhibitManagerV1>,
+    idle_inhibitor: Option<ZwpIdleInhibitorV1>,
+    /// content-type-v1 hint object. Set once at startup; held only so the
+    /// object (and thus the hint) outlives construction.
+    #[allow(
+        dead_code,
+        reason = "kept alive to preserve the surface content-type hint"
+    )]
+    content_type: Option<WpContentTypeV1>,
     /// Committed IME preedit string shown inline at the cursor while composing.
     preedit: String,
     /// Preedit/commit accumulated since the last text-input `done`.
@@ -1406,6 +1436,21 @@ impl App {
             .is_some_and(|s| s.term.grid().focus_events())
         {
             self.write_to_pty(if focused { b"\x1b[I" } else { b"\x1b[O" });
+        }
+    }
+
+    /// Create or drop the idle inhibitor to match `[main] idle-inhibit` and the
+    /// current focus: inhibit only while focused, so a backgrounded terminal
+    /// still lets the screen blank. Idempotent; called on every focus change.
+    fn sync_idle_inhibit(&mut self) {
+        let want = self.config.main.idle_inhibit && self.focused;
+        if want && self.idle_inhibitor.is_none() {
+            if let Some(mgr) = &self.idle_inhibit_manager {
+                self.idle_inhibitor =
+                    Some(mgr.create_inhibitor(self.window.wl_surface(), &self.qh, ()));
+            }
+        } else if !want && let Some(inhibitor) = self.idle_inhibitor.take() {
+            inhibitor.destroy();
         }
     }
 

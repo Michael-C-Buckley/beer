@@ -70,6 +70,7 @@ impl WindowHandler for App {
             }
         }
         self.focused = configure.is_activated();
+        self.sync_idle_inhibit();
         if self.session.is_none() {
             self.spawn_session();
         } else {
@@ -188,6 +189,7 @@ impl KeyboardHandler for App {
         self.activate_keyboard(keyboard);
         self.serial = serial;
         self.focused = true;
+        self.sync_idle_inhibit();
         self.report_focus(true);
         self.needs_draw = true;
     }
@@ -201,6 +203,7 @@ impl KeyboardHandler for App {
         _: u32,
     ) {
         self.focused = false;
+        self.sync_idle_inhibit();
         // Drop held-key state so a key released while unfocused can't leak a
         // stale kitty release event later.
         self.keys_down.clear();
@@ -627,6 +630,56 @@ impl Dispatch<WpViewport, ()> for App {
         _: &mut Self,
         _: &WpViewport,
         _: <WpViewport as Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+// idle-inhibit and content-type are likewise raw protocol objects; none of them
+// emit events we act on.
+impl Dispatch<ZwpIdleInhibitManagerV1, ()> for App {
+    fn event(
+        _: &mut Self,
+        _: &ZwpIdleInhibitManagerV1,
+        _: <ZwpIdleInhibitManagerV1 as Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<ZwpIdleInhibitorV1, ()> for App {
+    fn event(
+        _: &mut Self,
+        _: &ZwpIdleInhibitorV1,
+        _: zwp_idle_inhibitor_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<WpContentTypeManagerV1, ()> for App {
+    fn event(
+        _: &mut Self,
+        _: &WpContentTypeManagerV1,
+        _: <WpContentTypeManagerV1 as Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<WpContentTypeV1, ()> for App {
+    fn event(
+        _: &mut Self,
+        _: &WpContentTypeV1,
+        _: wp_content_type_v1::Event,
         _: &(),
         _: &Connection,
         _: &QueueHandle<Self>,

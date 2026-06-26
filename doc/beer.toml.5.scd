@@ -39,6 +39,11 @@ channel).
 	built-in set (whitespace and common punctuation, keeping _.-/:~\__ inside
 	words).
 
+*idle-inhibit* = _bool_
+	While the window is focused, ask the compositor not to blank the screen or
+	start the screensaver (idle-inhibit-v1). A backgrounded window stops
+	inhibiting. Default _false_.
+
 # [colors]
 
 *foreground* = _color_, *background* = _color_
