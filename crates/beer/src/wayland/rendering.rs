@@ -171,6 +171,7 @@ impl App {
             focused,
             blink_on,
             hovered_link: self.hovered_link,
+            images: session.term.graphics(),
         };
         if fresh {
             self.renderer.clear(canvas, dims, theme);

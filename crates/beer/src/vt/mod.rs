@@ -12,6 +12,7 @@ use beer_protocols::codec::{base64_decode, decode_hex, file_uri_path};
 use beer_protocols::sgr::{ext_color, underline_from};
 use beer_protocols::style::prompt_kind;
 
+use crate::graphics::Graphics;
 use crate::grid::{Color, CursorShape, Flags, Grid, MouseEncoding, MouseProtocol, Underline};
 use crate::theme::{Rgb, Theme};
 
@@ -103,7 +104,34 @@ pub struct Term {
     cwd: Option<String>,
     /// Desktop notifications requested via OSC 9/777/99, drained by the front-end.
     notifications: Vec<Notification>,
+    /// Kitty graphics protocol state (images, placements, transmissions).
+    graphics: Graphics,
+    /// APC capture state, since `vte` does not surface APC sequences.
+    apc: ApcScan,
+    /// Payload of an APC being captured, between `ESC _` and its terminator.
+    apc_buf: Vec<u8>,
+    /// Current cell size in pixels, for translating image sizes into cells.
+    cell_px: (u32, u32),
 }
+
+/// Where the APC capture splitter is in the byte stream. `vte` consumes APC
+/// (`ESC _ ... ST`) silently, so [`Term::feed`] runs this small machine in front
+/// of it: graphics payloads are diverted, everything else flows to `vte`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum ApcScan {
+    /// Forwarding bytes to `vte`.
+    #[default]
+    Normal,
+    /// Saw `ESC`; the next byte decides APC vs an ordinary escape.
+    Esc,
+    /// Collecting an APC payload.
+    Apc,
+    /// Saw `ESC` inside an APC; `\` ends it (ST), else it stays in the payload.
+    ApcEsc,
+}
+
+/// Cap on a captured APC payload (one chunk is at most ~4 KiB of base64).
+const APC_MAX: usize = 1 << 20;
 
 impl Term {
     pub fn new(cols: usize, rows: usize) -> Self {
@@ -121,7 +149,133 @@ impl Term {
             bell: false,
             cwd: None,
             notifications: Vec::new(),
+            graphics: Graphics::new(),
+            apc: ApcScan::default(),
+            apc_buf: Vec::new(),
+            cell_px: (1, 1),
         }
+    }
+
+    /// Feed PTY bytes to the terminal. Graphics APC sequences (`ESC _ G ... ST`)
+    /// are split out and handled here; all other bytes go to the `vte` parser.
+    /// `cell_px` is the current cell size, recorded for graphics layout.
+    pub fn feed(&mut self, parser: &mut vte::Parser, bytes: &[u8], cell_px: (u32, u32)) {
+        self.cell_px = cell_px;
+        let mut i = 0;
+        while i < bytes.len() {
+            match self.apc {
+                ApcScan::Normal => {
+                    let start = i;
+                    while i < bytes.len() && bytes[i] != 0x1b {
+                        i += 1;
+                    }
+                    if i > start {
+                        parser.advance(self, &bytes[start..i]);
+                    }
+                    if i < bytes.len() {
+                        self.apc = ApcScan::Esc;
+                        i += 1;
+                    }
+                }
+                ApcScan::Esc => {
+                    if bytes[i] == b'_' {
+                        self.apc = ApcScan::Apc;
+                        self.apc_buf.clear();
+                        i += 1;
+                    } else {
+                        // Not APC: hand the lone ESC to vte and let it pair with
+                        // the following bytes as an ordinary escape sequence.
+                        parser.advance(self, &[0x1b]);
+                        self.apc = ApcScan::Normal;
+                    }
+                }
+                ApcScan::Apc => match bytes[i] {
+                    0x07 => {
+                        self.finish_apc();
+                        self.apc = ApcScan::Normal;
+                        i += 1;
+                    }
+                    0x1b => {
+                        self.apc = ApcScan::ApcEsc;
+                        i += 1;
+                    }
+                    b => {
+                        if self.apc_buf.len() < APC_MAX {
+                            self.apc_buf.push(b);
+                        }
+                        i += 1;
+                    }
+                },
+                ApcScan::ApcEsc => {
+                    if bytes[i] == b'\\' {
+                        self.finish_apc();
+                        self.apc = ApcScan::Normal;
+                        i += 1;
+                    } else {
+                        // A stray ESC inside the payload: keep it and re-read this
+                        // byte in APC state.
+                        if self.apc_buf.len() < APC_MAX {
+                            self.apc_buf.push(0x1b);
+                        }
+                        self.apc = ApcScan::Apc;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Dispatch a captured APC payload. Only graphics commands (`G...`) are
+    /// handled; other APC strings are ignored as `vte` would have.
+    fn finish_apc(&mut self) {
+        let buf = std::mem::take(&mut self.apc_buf);
+        let Some((&b'G', body)) = buf.split_first() else {
+            return;
+        };
+        let (control, payload) = match body.iter().position(|&b| b == b';') {
+            Some(p) => (&body[..p], &body[p + 1..]),
+            None => (body, &[][..]),
+        };
+        let cmd = beer_protocols::graphics::parse(control);
+        let outcome = self.graphics.handle(cmd, payload, self.cell_px);
+        if let Some(resp) = outcome.response {
+            self.response.extend_from_slice(&resp);
+        }
+        if let Some(op) = outcome.grid_op {
+            self.apply_grid_op(op);
+        }
+    }
+
+    /// Apply a graphics grid mutation: stamp a placement or clear image cells.
+    fn apply_grid_op(&mut self, op: crate::graphics::GridOp) {
+        use crate::graphics::{ClearSpec, GridOp};
+        match op {
+            GridOp::Place {
+                image,
+                placement,
+                cols,
+                rows,
+                keep_cursor,
+            } => self
+                .grid
+                .place_image(image, placement, cols, rows, keep_cursor),
+            GridOp::Clear(spec) => match spec {
+                ClearSpec::All => self.grid.clear_images(|_| true),
+                ClearSpec::Image(id) => self.grid.clear_images(|r| r.image == id),
+                ClearSpec::Placement(id, p) => self
+                    .grid
+                    .clear_images(|r| r.image == id && r.placement == p),
+                ClearSpec::AtCursor => {
+                    let targets = self.grid.images_at_cursor();
+                    self.grid
+                        .clear_images(|r| targets.contains(&(r.image, r.placement)));
+                }
+            },
+        }
+    }
+
+    /// The graphics engine, for the renderer to read images and placements from.
+    pub fn graphics(&self) -> &Graphics {
+        &self.graphics
     }
 
     /// The working directory last reported by the shell (OSC 7), if any.
@@ -475,7 +629,7 @@ mod tests {
 
     fn feed(term: &mut Term, bytes: &[u8]) {
         let mut parser = vte::Parser::new();
-        parser.advance(term, bytes);
+        term.feed(&mut parser, bytes, (8, 16));
     }
 
     #[test]
@@ -498,6 +652,33 @@ mod tests {
         feed(&mut t, b"one\r\ntwo");
         assert_eq!(t.grid().row_text(0), "one");
         assert_eq!(t.grid().row_text(1), "two");
+    }
+
+    #[test]
+    fn kitty_graphics_apc_transmits_and_displays() {
+        // ESC _ G a=T,f=32,s=2,v=2,i=1 ; <base64 RGBA> ESC \: a 2x2 image,
+        // transmitted and displayed at the cursor.
+        let mut t = Term::new(20, 4);
+        let px = vec![0xffu8; 2 * 2 * 4];
+        let b64 = beer_protocols::codec::base64_encode(&px);
+        let seq = format!("\x1b_Ga=T,f=32,s=2,v=2,i=1;{b64}\x1b\\");
+        feed(&mut t, seq.as_bytes());
+        // With an 8x16 cell the 2x2 image occupies one cell, stamped at (0,0).
+        let cell = t.grid().cell(0, 0);
+        assert_eq!(cell.image.map(|r| r.image), Some(1));
+        let resp = t.take_response();
+        assert!(resp.windows(2).any(|w| w == b"OK"), "expected OK response");
+    }
+
+    #[test]
+    fn apc_does_not_disturb_surrounding_text() {
+        // Text, then a graphics query APC, then more text: the text is intact and
+        // the APC did not leak bytes into the grid.
+        let mut t = Term::new(20, 2);
+        let px = beer_protocols::codec::base64_encode(&[0u8; 4]);
+        let seq = format!("ab\x1b_Ga=q,f=32,s=1,v=1,i=2;{px}\x1b\\cd");
+        feed(&mut t, seq.as_bytes());
+        assert_eq!(t.grid().row_text(0), "abcd");
     }
 
     #[test]

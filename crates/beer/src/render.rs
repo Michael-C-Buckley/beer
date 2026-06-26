@@ -79,6 +79,21 @@ impl Canvas<'_> {
         self.fill_rect(x0, y, w, 1, c);
     }
 
+    /// Composite one straight-alpha RGBA source pixel over the destination.
+    fn blend_rgba(&mut self, x: i32, y: i32, rgba: [u8; 4]) {
+        let a = u32::from(rgba[3]);
+        if a == 0 {
+            return;
+        }
+        let Some(i) = self.index(x, y) else { return };
+        let inv = 255 - a;
+        let mix = |src: u8, dst: u8| ((u32::from(src) * a + u32::from(dst) * inv) / 255) as u8;
+        self.pixels[i] = mix(rgba[2], self.pixels[i]);
+        self.pixels[i + 1] = mix(rgba[1], self.pixels[i + 1]);
+        self.pixels[i + 2] = mix(rgba[0], self.pixels[i + 2]);
+        self.pixels[i + 3] = 0xff;
+    }
+
     /// Composite one pre-multiplied BGRA source pixel over the destination.
     fn over(&mut self, x: i32, y: i32, src: &[u8]) {
         let Some(i) = self.index(x, y) else { return };
@@ -100,6 +115,8 @@ pub struct Frame<'a> {
     pub blink_on: bool,
     /// Hyperlink currently under the pointer; its cells get a hover underline.
     pub hovered_link: Option<NonZeroU16>,
+    /// The graphics engine, source of image pixels and placement geometry.
+    pub images: &'a crate::graphics::Graphics,
 }
 
 #[derive(Debug)]
@@ -198,6 +215,18 @@ impl Renderer {
             }
         }
 
+        // Graphics images stacked below the text (negative z-index).
+        draw_image_cells(
+            &mut canvas,
+            frame.images,
+            cells,
+            cols,
+            pad_x,
+            row_top,
+            m,
+            |z| z < 0,
+        );
+
         for (x, cell) in cells.iter().take(cols).enumerate() {
             if cell.flags.contains(Flags::WIDE_CONT) {
                 continue;
@@ -268,6 +297,18 @@ impl Renderer {
                 canvas.hline(origin_x, row_top + m.height as i32 - 2, m.width, fg);
             }
         }
+
+        // Graphics images stacked above the text (z-index >= 0).
+        draw_image_cells(
+            &mut canvas,
+            frame.images,
+            cells,
+            cols,
+            pad_x,
+            row_top,
+            m,
+            |z| z >= 0,
+        );
 
         // The cursor belongs to the live screen; hide it while scrolled back.
         if grid.view_at_bottom() && grid.cursor().1 == y {
@@ -576,6 +617,93 @@ fn blit_glyph_clipped(
             }
         }
         GlyphData::Color(_) => {}
+    }
+}
+
+/// Composite the graphics-image cells of one row whose placement z-index passes
+/// `z_filter` (one call below the text, one above). Each cell carries its
+/// `(dx, dy)` in the placement; the engine supplies the pixels and geometry.
+#[allow(clippy::too_many_arguments)]
+fn draw_image_cells(
+    canvas: &mut Canvas,
+    images: &crate::graphics::Graphics,
+    cells: &[Cell],
+    cols: usize,
+    pad_x: i32,
+    row_top: i32,
+    m: CellMetrics,
+    z_filter: impl Fn(i32) -> bool,
+) {
+    for (x, cell) in cells.iter().take(cols).enumerate() {
+        let Some(r) = cell.image else { continue };
+        let Some(p) = images.placement(r.image, r.placement) else {
+            continue;
+        };
+        if !z_filter(p.z) {
+            continue;
+        }
+        let Some(img) = images.image(p.image) else {
+            continue;
+        };
+        let origin_x = pad_x + x as i32 * m.width as i32;
+        blit_image_cell(
+            canvas,
+            img,
+            p,
+            r.dx as i32,
+            r.dy as i32,
+            origin_x,
+            row_top,
+            m,
+        );
+    }
+}
+
+/// Composite one cell's slice of an image placement. The placement's source
+/// rectangle is scaled to its full cell-pixel area; this cell shows the
+/// sub-rectangle for its `(dx, dy)`, sampled nearest-neighbour and alpha-blended.
+#[allow(clippy::too_many_arguments)]
+fn blit_image_cell(
+    canvas: &mut Canvas,
+    img: &crate::graphics::Image,
+    p: &crate::graphics::Placement,
+    dx: i32,
+    dy: i32,
+    origin_x: i32,
+    row_top: i32,
+    m: CellMetrics,
+) {
+    let (cell_w, cell_h) = (m.width as i32, m.height as i32);
+    // The source rectangle is scaled to the cell area less the first-cell pixel
+    // offset, so a non-zero X/Y shifts the image inward from the top-left cell.
+    let span_w = (p.cols as i32 * cell_w - p.off_x as i32).max(1);
+    let span_h = (p.rows as i32 * cell_h - p.off_y as i32).max(1);
+    let src_w = if p.src_w == 0 { img.width } else { p.src_w } as i32;
+    let src_h = if p.src_h == 0 { img.height } else { p.src_h } as i32;
+    let (iw, ih) = (img.width as i32, img.height as i32);
+    for cy in 0..cell_h {
+        // Map this cell row to a source row through the placement's scale.
+        let placed_y = dy * cell_h + cy - p.off_y as i32;
+        if placed_y < 0 {
+            continue;
+        }
+        let sy = p.src_y as i32 + placed_y * src_h / span_h;
+        if sy < 0 || sy >= ih {
+            continue;
+        }
+        for cx in 0..cell_w {
+            let placed_x = dx * cell_w + cx - p.off_x as i32;
+            if placed_x < 0 {
+                continue;
+            }
+            let sx = p.src_x as i32 + placed_x * src_w / span_w;
+            if sx < 0 || sx >= iw {
+                continue;
+            }
+            let i = ((sy * iw + sx) * 4) as usize;
+            let px = &img.rgba[i..i + 4];
+            canvas.blend_rgba(origin_x + cx, row_top + cy, [px[0], px[1], px[2], px[3]]);
+        }
     }
 }
 

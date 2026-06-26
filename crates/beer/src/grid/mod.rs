@@ -87,6 +87,24 @@ pub struct Sized {
     pub run: Option<Box<str>>,
 }
 
+/// A cell's membership in a displayed graphics-protocol image. The image pixels
+/// and the placement geometry live in the graphics engine, keyed by
+/// `(image, placement)`; the cell records only which placement it belongs to and
+/// its `(dx, dy)` position within that placement's cell rectangle, so the
+/// renderer can composite the matching slice. Carrying the reference on the cell
+/// is what makes images scroll, clear, and erase with the text for free.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ImageRef {
+    /// Image id in the graphics store.
+    pub image: u32,
+    /// Placement id under that image.
+    pub placement: u32,
+    /// This cell's column within the placement rectangle.
+    pub dx: u16,
+    /// This cell's row within the placement rectangle.
+    pub dy: u16,
+}
+
 /// One grid cell: a character plus its rendering style.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Cell {
@@ -105,6 +123,8 @@ pub struct Cell {
     pub link: Option<NonZeroU16>,
     /// Text-sizing block membership (`OSC 66`), or `None` for ordinary cells.
     pub sized: Option<Box<Sized>>,
+    /// Graphics-protocol image membership, or `None` for ordinary cells.
+    pub image: Option<ImageRef>,
 }
 
 impl Default for Cell {
@@ -119,6 +139,7 @@ impl Default for Cell {
             combining: None,
             link: None,
             sized: None,
+            image: None,
         }
     }
 }
@@ -746,6 +767,77 @@ impl Grid {
         } else {
             self.cursor.x += cols;
         }
+    }
+
+    /// Stamp a graphics-protocol placement as a `cols` by `rows` cell rectangle
+    /// with its top-left at the cursor, then move the cursor unless `keep_cursor`
+    /// (the `C=1` policy) is set. Each cell records its `(dx, dy)` in the
+    /// placement so the renderer composites the right image slice; the pixels and
+    /// geometry live in the graphics engine. Cells beyond the screen are clipped.
+    pub fn place_image(
+        &mut self,
+        image: u32,
+        placement: u32,
+        cols: usize,
+        rows: usize,
+        keep_cursor: bool,
+    ) {
+        let (x0, y0) = (self.cursor.x, self.cursor.y);
+        for dy in 0..rows {
+            let cy = y0 + dy;
+            if cy >= self.rows {
+                break;
+            }
+            for dx in 0..cols {
+                let cx = x0 + dx;
+                if cx >= self.cols {
+                    break;
+                }
+                let cell = &mut self.lines[cy].cells[cx];
+                cell.image = Some(ImageRef {
+                    image,
+                    placement,
+                    dx: dx as u16,
+                    dy: dy as u16,
+                });
+            }
+        }
+        if keep_cursor {
+            return;
+        }
+        // Land the cursor just past the image on its bottom row, the way kitty
+        // leaves it, clamped to the screen.
+        self.cursor.y = (y0 + rows.saturating_sub(1)).min(self.rows - 1);
+        self.cursor.x = (x0 + cols).min(self.cols - 1);
+        self.wrap_pending = false;
+    }
+
+    /// Remove image placements: every cell whose reference matches `pred` is
+    /// cleared back to a blank. With `pred` always true this erases all images.
+    pub fn clear_images(&mut self, pred: impl Fn(&ImageRef) -> bool) {
+        let blank = Cell::default();
+        let touch = |line: &mut Line| {
+            for cell in &mut line.cells {
+                if cell.image.is_some_and(|r| pred(&r)) {
+                    *cell = blank.clone();
+                }
+            }
+        };
+        self.lines.iter_mut().for_each(touch);
+        self.scrollback.iter_mut().for_each(touch);
+        if let Some(alt) = self.alt_saved.as_mut() {
+            alt.iter_mut().for_each(touch);
+        }
+    }
+
+    /// The image placements intersecting the current cursor cell, for `d=c`
+    /// deletes: returns each `(image, placement)` found there.
+    pub fn images_at_cursor(&self) -> Vec<(u32, u32)> {
+        let mut out = Vec::new();
+        if let Some(r) = self.lines[self.cursor.y].cells[self.cursor.x].image {
+            out.push((r.image, r.placement));
+        }
+        out
     }
 
     /// If `(x, y)` belongs to a text-sizing block, blank every cell of that

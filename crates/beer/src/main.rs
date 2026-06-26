@@ -3,6 +3,7 @@
 mod bindings;
 mod config;
 mod font;
+mod graphics;
 mod grid;
 mod pty;
 mod render;

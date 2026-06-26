@@ -16,9 +16,17 @@ beer-protocols = { path = "crates/beer-protocols", version = "0.4.0" }
 anyhow = "1.0.102"
 calloop = { version = "0.14.4", features = ["signals"] }
 calloop-wayland-source = "0.4.1"
+flate2 = "1.0.35"
 fontconfig = "0.11.0"
 freetype-rs = "0.38.0"
 harfbuzz_rs_now = "2.3.2"
+image = { version = "0.25.5", default-features = false, features = [
+  "png",
+  "jpeg",
+  "gif",
+  "bmp",
+  "webp",
+] }
 lru = "0.18.0"
 pound = "0.1.6"
 rustix = { version = "1.1.4", features = [
@@ -27,6 +35,8 @@ rustix = { version = "1.1.4", features = [
   "termios",
   "stdio",
   "fs",
+  "shm",
+  "mm",
 ] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_ignored = "0.1.14"

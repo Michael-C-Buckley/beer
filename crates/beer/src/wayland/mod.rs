@@ -581,8 +581,11 @@ impl App {
                         return Ok(PostAction::Remove);
                     }
                 };
+                let cell = app.renderer.metrics();
                 if let Some(session) = app.session.as_mut() {
-                    parser.advance(&mut session.term, &buf[..n]);
+                    session
+                        .term
+                        .feed(&mut parser, &buf[..n], (cell.width, cell.height));
                 }
                 app.after_feed();
                 Ok(PostAction::Continue)
