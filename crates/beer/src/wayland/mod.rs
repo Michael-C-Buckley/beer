@@ -145,6 +145,11 @@ const AUTOSCROLL_MS: u64 = 40;
 /// How long the visual bell inverts the screen.
 const FLASH_MS: u64 = 80;
 
+/// Frame interval while a graphics-protocol animation is playing; when none is,
+/// the timer idles at a slower beat so it does not wake the loop needlessly.
+const ANIM_MS: u64 = 40;
+const ANIM_IDLE_MS: u64 = 250;
+
 /// Fallback window size in pixels if the configured geometry yields nothing.
 const DEFAULT_W: u32 = 800;
 const DEFAULT_H: u32 = 600;
@@ -310,6 +315,32 @@ pub fn run(config: Config, config_path: Option<std::path::PathBuf>) -> anyhow::R
         });
     if let Err(err) = blink_registered {
         tracing::warn!("register blink timer: {err}");
+    }
+
+    // Advance graphics-protocol animations. A frame change does not alter the
+    // grid cells (only the image pixels), so the buffer ring is dropped to force
+    // a repaint of the image rows. The timer slows to an idle beat when nothing
+    // is animating.
+    let anim = Timer::from_duration(Duration::from_millis(ANIM_IDLE_MS));
+    let anim_registered = event_loop
+        .handle()
+        .insert_source(anim, |_, _, app: &mut App| {
+            let (changed, animating) = match app.session.as_mut() {
+                Some(session) => (
+                    session.term.animation_tick(ANIM_MS as u32),
+                    session.term.is_animating(),
+                ),
+                None => (false, false),
+            };
+            if changed {
+                app.frames.clear();
+                app.needs_draw = true;
+            }
+            let next = if animating { ANIM_MS } else { ANIM_IDLE_MS };
+            TimeoutAction::ToDuration(Duration::from_millis(next))
+        });
+    if let Err(err) = anim_registered {
+        tracing::warn!("register animation timer: {err}");
     }
 
     // SIGUSR1 reloads the config in place.

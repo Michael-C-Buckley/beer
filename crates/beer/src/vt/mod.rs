@@ -278,6 +278,18 @@ impl Term {
         &self.graphics
     }
 
+    /// Advance any playing graphics-protocol animations by `dt_ms`; returns
+    /// whether a frame changed and the screen needs repainting.
+    pub fn animation_tick(&mut self, dt_ms: u32) -> bool {
+        self.graphics.tick(dt_ms)
+    }
+
+    /// Whether any image is currently playing a multi-frame animation, so the
+    /// front-end knows to keep ticking quickly.
+    pub fn is_animating(&self) -> bool {
+        self.graphics.is_animating()
+    }
+
     /// The working directory last reported by the shell (OSC 7), if any.
     pub fn cwd(&self) -> Option<&str> {
         self.cwd.as_deref()
@@ -668,6 +680,24 @@ mod tests {
         assert_eq!(cell.image.map(|r| r.image), Some(1));
         let resp = t.take_response();
         assert!(resp.windows(2).any(|w| w == b"OK"), "expected OK response");
+    }
+
+    #[test]
+    fn kitty_unicode_placeholder_virtual_placement() {
+        // Transmit + a virtual placement (U=1): no cells are stamped, but the
+        // placement is registered for placeholder cells to reference.
+        let mut t = Term::new(20, 4);
+        let px = beer_protocols::codec::base64_encode(&[0xff; 4]);
+        let seq = format!("\x1b_Ga=T,U=1,i=7,c=1,r=1,f=32,s=1,v=1;{px}\x1b\\");
+        feed(&mut t, seq.as_bytes());
+        assert!(
+            t.grid().cell(0, 0).image.is_none(),
+            "virtual placement stamps nothing"
+        );
+        assert!(t.graphics().placement(7, 0).is_some());
+        // The app prints a placeholder carrying image id 7 in its fg colour.
+        feed(&mut t, "\x1b[38;5;7m\u{10EEEE}\u{0305}\u{0305}".as_bytes());
+        assert_eq!(t.grid().cell(0, 0).c, '\u{10EEEE}');
     }
 
     #[test]

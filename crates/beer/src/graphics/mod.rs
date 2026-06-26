@@ -22,13 +22,106 @@ const MAX_IMAGE_BYTES: usize = 64 * 1024 * 1024;
 /// Cap on accumulated direct-transmission base64 across chunks.
 const MAX_TRANSMIT_BYTES: usize = 96 * 1024 * 1024;
 
-/// A decoded image, normalized to 8-bit RGBA.
+/// Freshly decoded pixels before they become an image or animation frame:
+/// `width * height * 4` bytes of row-major, non-premultiplied RGBA.
+#[derive(Clone, Debug)]
+struct Pixels {
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
+}
+
+/// One animation frame: its RGBA pixels and the gap, in milliseconds, until the
+/// terminal advances to the next frame.
+#[derive(Clone, Debug)]
+struct Frame {
+    rgba: Vec<u8>,
+    gap_ms: u32,
+}
+
+/// A decoded image: one or more frames plus playback state. A still image is a
+/// single frame; the protocol's animation commands append, edit, and compose
+/// further frames and drive which one is current.
 #[derive(Clone, Debug)]
 pub struct Image {
     pub width: u32,
     pub height: u32,
-    /// `width * height * 4` bytes, row-major, non-premultiplied RGBA.
-    pub rgba: Vec<u8>,
+    /// At least one frame; `frames[0]` is the root (frame 1 in the protocol).
+    frames: Vec<Frame>,
+    /// Index of the frame currently shown.
+    current: usize,
+    /// Whether the terminal is advancing frames on their gaps.
+    playing: bool,
+    /// In loading mode the animation waits at the last frame for more frames
+    /// rather than looping (`s=2`).
+    loading: bool,
+    /// Remaining loops; `None` loops forever, `Some(0)` stops at the last frame.
+    loops_left: Option<u32>,
+    /// Milliseconds accumulated toward the current frame's gap.
+    accum_ms: u32,
+}
+
+impl Image {
+    fn from_pixels(p: Pixels) -> Self {
+        Self {
+            width: p.width,
+            height: p.height,
+            frames: vec![Frame {
+                rgba: p.rgba,
+                gap_ms: 0,
+            }],
+            current: 0,
+            playing: false,
+            loading: false,
+            loops_left: None,
+            accum_ms: 0,
+        }
+    }
+
+    /// The pixels of the frame currently shown, for the renderer to composite.
+    pub fn current_rgba(&self) -> &[u8] {
+        &self.frames[self.current.min(self.frames.len() - 1)].rgba
+    }
+
+    /// Whether this image has more than one frame and is actively playing.
+    fn is_animating(&self) -> bool {
+        self.playing && self.frames.len() > 1
+    }
+
+    /// Advance playback by `dt_ms`; returns whether the current frame changed.
+    fn advance(&mut self, dt_ms: u32) -> bool {
+        if !self.is_animating() {
+            return false;
+        }
+        self.accum_ms += dt_ms;
+        // A stored gap of zero (the root frame's default) plays at the standard
+        // 40ms; gapless frames are stored as 1ms.
+        let gap = match self.frames[self.current].gap_ms {
+            0 => 40,
+            g => g,
+        };
+        if self.accum_ms < gap {
+            return false;
+        }
+        self.accum_ms -= gap;
+        if self.current + 1 < self.frames.len() {
+            self.current += 1;
+        } else if self.loading {
+            // Wait at the last frame for more frames to arrive.
+            return false;
+        } else {
+            match &mut self.loops_left {
+                Some(0) => {
+                    self.playing = false;
+                    return false;
+                }
+                Some(n) => *n -= 1,
+                None => {}
+            }
+            self.current = 0;
+        }
+        true
+    }
 }
 
 /// One on-screen placement of an image: the cell rectangle it occupies and the
@@ -127,12 +220,10 @@ impl Graphics {
         match cmd.action {
             Action::Delete => self.delete(cmd),
             Action::Put => self.put(cmd, cell_px),
-            Action::Animate | Action::Frame | Action::Compose => {
-                // Animation lands in a later pass; accept silently so a client
-                // probing for it does not get spurious errors.
-                Outcome::default()
-            }
-            // Transmit / TransmitAndDisplay / Query all assemble pixel data.
+            Action::Animate => self.animate(cmd),
+            Action::Compose => self.compose(cmd),
+            // Frame data is assembled like image data, then routed to add_frame.
+            // Transmit / TransmitAndDisplay / Query assemble pixel data too.
             _ => self.transmit(cmd, payload, cell_px),
         }
     }
@@ -142,7 +233,7 @@ impl Graphics {
     /// displays.
     fn transmit(&mut self, cmd: GraphicsCommand, payload: &[u8], cell_px: (u32, u32)) -> Outcome {
         // Continuation chunk: append to the in-flight transmission.
-        if self.pending.is_some() && cmd.action == Action::Transmit && payload_is_chunk(&cmd) {
+        if self.pending.is_some() && is_continuation(&cmd) {
             return self.accumulate(cmd, payload, cell_px);
         }
         if cmd.more {
@@ -181,13 +272,17 @@ impl Graphics {
     }
 
     fn finalize_b64(&mut self, cmd: GraphicsCommand, b64: &[u8], cell_px: (u32, u32)) -> Outcome {
-        match self.load_image(&cmd, b64) {
-            Ok(image) => {
+        match self.load_pixels(&cmd, b64) {
+            Ok(pixels) => {
                 if cmd.action == Action::Query {
                     // Verify only: report success, store nothing.
                     return respond(&cmd, "OK");
                 }
-                let id = self.store(&cmd, image);
+                if cmd.action == Action::Frame {
+                    // Animation frame data for an existing image.
+                    return self.add_frame(&cmd, pixels);
+                }
+                let id = self.store(&cmd, pixels);
                 if cmd.action == Action::TransmitAndDisplay {
                     let mut out = self.display(id, &cmd, cell_px);
                     out.response = respond(&cmd, "OK").response;
@@ -200,8 +295,8 @@ impl Graphics {
         }
     }
 
-    /// Decode the transmitted payload into an RGBA [`Image`].
-    fn load_image(&self, cmd: &GraphicsCommand, b64: &[u8]) -> Result<Image, String> {
+    /// Decode the transmitted payload into RGBA [`Pixels`].
+    fn load_pixels(&self, cmd: &GraphicsCommand, b64: &[u8]) -> Result<Pixels, String> {
         let raw = base64_decode(b64).ok_or("EINVAL: bad base64 payload")?;
         // For non-direct mediums the payload is the path / shared-memory name.
         let bytes = match cmd.medium {
@@ -216,9 +311,9 @@ impl Graphics {
         decode(cmd, bytes)
     }
 
-    /// Store an image under its id (or number, or an auto id), replacing any
-    /// existing image with that id. Returns the id used.
-    fn store(&mut self, cmd: &GraphicsCommand, image: Image) -> u32 {
+    /// Store pixels as a new still image under its id (or number, or an auto id),
+    /// replacing any existing image with that id. Returns the id used.
+    fn store(&mut self, cmd: &GraphicsCommand, pixels: Pixels) -> u32 {
         let id = if cmd.id != 0 {
             cmd.id
         } else if cmd.number != 0 {
@@ -229,7 +324,7 @@ impl Graphics {
         } else {
             self.alloc_id()
         };
-        self.images.insert(id, image);
+        self.images.insert(id, Image::from_pixels(pixels));
         id
     }
 
@@ -237,6 +332,131 @@ impl Graphics {
         let id = self.next_auto_id;
         self.next_auto_id = self.next_auto_id.wrapping_add(1).max(0xf000_0000);
         id
+    }
+
+    /// Add or edit an animation frame (`a=f`). The decoded `pixels` are composed
+    /// onto a base canvas - a chosen base frame (`c`) or transparent black -
+    /// inside the destination rectangle `(x, y)` sized to the data, then stored
+    /// as a new frame or, with `r`, used to replace frame `r`.
+    fn add_frame(&mut self, cmd: &GraphicsCommand, pixels: Pixels) -> Outcome {
+        let Some(id) = self.resolve_id(cmd) else {
+            return respond_error(cmd, "ENOENT: no such image");
+        };
+        let Some(img) = self.images.get_mut(&id) else {
+            return respond_error(cmd, "ENOENT: no such image");
+        };
+        let canvas_len = img.width as usize * img.height as usize * 4;
+        // Base canvas: an existing frame's pixels, or transparent black.
+        let mut canvas = match img.frames.get(cmd.c.wrapping_sub(1) as usize) {
+            Some(f) if cmd.c != 0 => f.rgba.clone(),
+            _ => vec![0u8; canvas_len],
+        };
+        compose_rect(
+            &mut canvas,
+            img.width,
+            img.height,
+            &pixels,
+            (cmd.x, cmd.y),
+            cmd.cap_x == 1,
+        );
+        let gap = frame_gap(cmd.z);
+        if cmd.r != 0 {
+            match img.frames.get_mut(cmd.r as usize - 1) {
+                Some(f) => {
+                    f.rgba = canvas;
+                    f.gap_ms = gap;
+                }
+                None => return respond_error(cmd, "ENOENT: no such frame"),
+            }
+        } else {
+            img.frames.push(Frame {
+                rgba: canvas,
+                gap_ms: gap,
+            });
+        }
+        respond(cmd, "OK")
+    }
+
+    /// Compose a rectangle of one frame onto another (`a=c`): copy a `w` by `h`
+    /// region from source frame `r` at `(x, y)` onto destination frame `c` at
+    /// `(X, Y)`, alpha-blending unless `C=1` requests a plain overwrite.
+    fn compose(&mut self, cmd: GraphicsCommand) -> Outcome {
+        let Some(id) = self.resolve_id(&cmd) else {
+            return respond_error(&cmd, "ENOENT: no such image");
+        };
+        let Some(img) = self.images.get_mut(&id) else {
+            return respond_error(&cmd, "ENOENT: no such image");
+        };
+        let (src, dst) = (cmd.r as usize, cmd.c as usize);
+        if src == 0 || dst == 0 || src > img.frames.len() || dst > img.frames.len() {
+            return respond_error(&cmd, "ENOENT: no such frame");
+        }
+        let (iw, ih) = (img.width, img.height);
+        let w = if cmd.w == 0 { iw } else { cmd.w };
+        let h = if cmd.h == 0 { ih } else { cmd.h };
+        let source = img.frames[src - 1].rgba.clone();
+        let overwrite = cmd.cursor_policy == 1;
+        compose_frames(
+            &mut img.frames[dst - 1].rgba,
+            iw,
+            ih,
+            &source,
+            (cmd.x, cmd.y),
+            (cmd.cap_x, cmd.cap_y),
+            (w, h),
+            overwrite,
+        );
+        respond(&cmd, "OK")
+    }
+
+    /// Control playback (`a=a`): set the current frame (`c`), the run state
+    /// (`s`: stop / loading / loop), and the loop count (`v`).
+    fn animate(&mut self, cmd: GraphicsCommand) -> Outcome {
+        let Some(id) = self.resolve_id(&cmd) else {
+            return respond_error(&cmd, "ENOENT: no such image");
+        };
+        let Some(img) = self.images.get_mut(&id) else {
+            return respond_error(&cmd, "ENOENT: no such image");
+        };
+        if cmd.c != 0 {
+            img.current = (cmd.c as usize - 1).min(img.frames.len() - 1);
+            img.accum_ms = 0;
+        }
+        // For a=a the `s` key is the run state and `v` the loop count; the parser
+        // stores them under the width/height fields they share.
+        match cmd.width {
+            1 => img.playing = false,
+            2 => {
+                img.playing = true;
+                img.loading = true;
+            }
+            3 => {
+                img.playing = true;
+                img.loading = false;
+            }
+            _ => {}
+        }
+        match cmd.height {
+            0 => {}
+            1 => img.loops_left = None,
+            n => img.loops_left = Some(n - 1),
+        }
+        respond(&cmd, "OK")
+    }
+
+    /// Advance every playing animation by `dt_ms`; returns whether any image's
+    /// current frame changed (and the screen therefore needs repainting).
+    pub fn tick(&mut self, dt_ms: u32) -> bool {
+        let mut changed = false;
+        for img in self.images.values_mut() {
+            changed |= img.advance(dt_ms);
+        }
+        changed
+    }
+
+    /// Whether any stored image is currently playing a multi-frame animation.
+    pub fn is_animating(&self) -> bool {
+        self.images.values().any(Image::is_animating)
     }
 
     /// Display an already-stored image (`a=p`).
@@ -293,15 +513,18 @@ impl Graphics {
                 z: cmd.z,
             },
         );
+        // A virtual placement (`U=1`) reserves geometry for Unicode-placeholder
+        // cells the application prints itself; it stamps no cells of its own.
+        let grid_op = (!cmd.virtual_placement).then_some(GridOp::Place {
+            image: id,
+            placement: placement_id,
+            cols,
+            rows,
+            keep_cursor: cmd.cursor_policy == 1,
+        });
         Outcome {
             response: None,
-            grid_op: Some(GridOp::Place {
-                image: id,
-                placement: placement_id,
-                cols,
-                rows,
-                keep_cursor: cmd.cursor_policy == 1,
-            }),
+            grid_op,
         }
     }
 
@@ -367,10 +590,17 @@ impl Graphics {
     }
 }
 
-/// Whether a continuation chunk carries only the `m`/`q` keys (no fresh action),
-/// i.e. it belongs to the in-flight transmission rather than starting a new one.
-fn payload_is_chunk(cmd: &GraphicsCommand) -> bool {
-    cmd.action == Action::Transmit && cmd.id == 0 && cmd.number == 0 && cmd.format == Format::Rgba
+/// Whether a command is a continuation chunk of the in-flight transmission
+/// rather than a fresh command: it carries no id, number, or geometry, only the
+/// `m`/`q` (and, for frames, `a=f`) keys. Both image and animation-frame
+/// transmissions chunk this way.
+fn is_continuation(cmd: &GraphicsCommand) -> bool {
+    matches!(cmd.action, Action::Transmit | Action::Frame)
+        && cmd.id == 0
+        && cmd.number == 0
+        && cmd.format == Format::Rgba
+        && cmd.width == 0
+        && cmd.height == 0
 }
 
 /// Choose the cell rectangle for a placement. Explicit `c`/`r` win; a missing
@@ -396,15 +626,15 @@ fn cell_rect(c: u32, r: u32, src_w: u32, src_h: u32, cell_w: u32, cell_h: u32) -
     (cols as usize, rows as usize)
 }
 
-/// Decode transmitted bytes into RGBA per the command's format.
-fn decode(cmd: &GraphicsCommand, bytes: Vec<u8>) -> Result<Image, String> {
+/// Decode transmitted bytes into RGBA [`Pixels`] per the command's format.
+fn decode(cmd: &GraphicsCommand, bytes: Vec<u8>) -> Result<Pixels, String> {
     match cmd.format {
         Format::Png => {
             let img = image::load_from_memory(&bytes).map_err(|e| format!("EINVAL: {e}"))?;
             let rgba = img.to_rgba8();
             let (width, height) = (rgba.width(), rgba.height());
             check_size(width, height)?;
-            Ok(Image {
+            Ok(Pixels {
                 width,
                 height,
                 rgba: rgba.into_raw(),
@@ -416,7 +646,7 @@ fn decode(cmd: &GraphicsCommand, bytes: Vec<u8>) -> Result<Image, String> {
             if bytes.len() < want {
                 return Err("EINVAL: RGBA data smaller than s*v*4".into());
             }
-            Ok(Image {
+            Ok(Pixels {
                 width: cmd.width,
                 height: cmd.height,
                 rgba: bytes[..want].to_vec(),
@@ -433,7 +663,7 @@ fn decode(cmd: &GraphicsCommand, bytes: Vec<u8>) -> Result<Image, String> {
                 rgba.extend_from_slice(chunk);
                 rgba.push(0xff);
             }
-            Ok(Image {
+            Ok(Pixels {
                 width: cmd.width,
                 height: cmd.height,
                 rgba,
@@ -458,6 +688,91 @@ fn check_size(width: u32, height: u32) -> Result<(), String> {
 fn push_capped(buf: &mut Vec<u8>, data: &[u8], cap: usize) {
     let room = cap.saturating_sub(buf.len());
     buf.extend_from_slice(&data[..data.len().min(room)]);
+}
+
+/// The stored gap for a frame from its `z` value: zero keeps the default (played
+/// as 40ms), a negative value is gapless (stored as 1ms, advanced at once), a
+/// positive value is taken as milliseconds.
+fn frame_gap(z: i32) -> u32 {
+    match z {
+        0 => 0,
+        n if n < 0 => 1,
+        n => n as u32,
+    }
+}
+
+/// Composite a `(src.width, src.height)` patch onto a `(cw, ch)` canvas with its
+/// top-left at `off`, clipped to the canvas, blending unless `overwrite`.
+fn compose_rect(
+    canvas: &mut [u8],
+    cw: u32,
+    ch: u32,
+    src: &Pixels,
+    off: (u32, u32),
+    overwrite: bool,
+) {
+    let (ox, oy) = off;
+    for sy in 0..src.height {
+        let dy = oy + sy;
+        if dy >= ch {
+            break;
+        }
+        for sx in 0..src.width {
+            let dx = ox + sx;
+            if dx >= cw {
+                break;
+            }
+            let si = ((sy * src.width + sx) * 4) as usize;
+            let di = ((dy * cw + dx) * 4) as usize;
+            blend_into(&mut canvas[di..di + 4], &src.rgba[si..si + 4], overwrite);
+        }
+    }
+}
+
+/// Copy a `(w, h)` region of `src` (an `iw` by `ih` frame) at `soff` onto `dst`
+/// (also `iw` by `ih`) at `doff`, clipped to the image, blending unless
+/// `overwrite`.
+#[allow(clippy::too_many_arguments)]
+fn compose_frames(
+    dst: &mut [u8],
+    iw: u32,
+    ih: u32,
+    src: &[u8],
+    soff: (u32, u32),
+    doff: (u32, u32),
+    size: (u32, u32),
+    overwrite: bool,
+) {
+    let ((sx0, sy0), (dx0, dy0), (w, h)) = (soff, doff, size);
+    for row in 0..h {
+        let (sy, dy) = (sy0 + row, dy0 + row);
+        if sy >= ih || dy >= ih {
+            break;
+        }
+        for col in 0..w {
+            let (sx, dx) = (sx0 + col, dx0 + col);
+            if sx >= iw || dx >= iw {
+                break;
+            }
+            let si = ((sy * iw + sx) * 4) as usize;
+            let di = ((dy * iw + dx) * 4) as usize;
+            blend_into(&mut dst[di..di + 4], &src[si..si + 4], overwrite);
+        }
+    }
+}
+
+/// Composite one straight-alpha RGBA pixel `src` onto `dst` in place, either
+/// replacing it (`overwrite`) or alpha-blending.
+fn blend_into(dst: &mut [u8], src: &[u8], overwrite: bool) {
+    if overwrite || src[3] == 255 {
+        dst.copy_from_slice(src);
+        return;
+    }
+    let (a, inv) = (u32::from(src[3]), u32::from(255 - src[3]));
+    for i in 0..3 {
+        dst[i] = ((u32::from(src[i]) * a + u32::from(dst[i]) * inv) / 255) as u8;
+    }
+    dst[3] = (a + u32::from(dst[3]) * inv / 255).min(255) as u8;
 }
 
 /// zlib-inflate `o=z` payloads.
@@ -597,7 +912,7 @@ mod tests {
         assert_eq!(out.response.as_deref(), Some(&b"\x1b_Gi=1;OK\x1b\\"[..]));
         let img = g.image(1).expect("stored");
         assert_eq!((img.width, img.height), (2, 2));
-        assert_eq!(img.rgba.len(), 16);
+        assert_eq!(img.current_rgba().len(), 16);
     }
 
     #[test]
@@ -609,8 +924,8 @@ mod tests {
         g.handle(cmd, &b64(&px), (8, 16));
         let img = g.image(5).unwrap();
         assert_eq!(
-            img.rgba,
-            vec![0x10, 0x10, 0x10, 0xff, 0x10, 0x10, 0x10, 0xff]
+            img.current_rgba(),
+            [0x10, 0x10, 0x10, 0xff, 0x10, 0x10, 0x10, 0xff]
         );
     }
 
@@ -653,7 +968,7 @@ mod tests {
         };
         let out = g.handle(last, b, (8, 16));
         assert_eq!(out.response.as_deref(), Some(&b"\x1b_Gi=9;OK\x1b\\"[..]));
-        assert_eq!(g.image(9).unwrap().rgba.len(), 16);
+        assert_eq!(g.image(9).unwrap().current_rgba().len(), 16);
     }
 
     #[test]
@@ -699,5 +1014,78 @@ mod tests {
         let out = g.handle(cmd, &[], (8, 16));
         assert!(matches!(out.grid_op, Some(GridOp::Clear(ClearSpec::All))));
         assert!(g.image(1).is_none(), "uppercase delete frees data");
+    }
+
+    #[test]
+    fn animation_frames_advance_on_tick() {
+        let mut g = Graphics::new();
+        // Root frame: a 1x1 red pixel.
+        g.handle(
+            rgba_cmd(1, 1, 1, Action::Transmit),
+            &b64(&[0xff, 0, 0, 0xff]),
+            (8, 16),
+        );
+        // Append a second frame (a=f): a 1x1 green pixel, default 40ms gap.
+        let frame = GraphicsCommand {
+            action: Action::Frame,
+            format: Format::Rgba,
+            width: 1,
+            height: 1,
+            id: 1,
+            ..Default::default()
+        };
+        g.handle(frame, &b64(&[0, 0xff, 0, 0xff]), (8, 16));
+        // Run looping (a=a, s=3).
+        let run = GraphicsCommand {
+            action: Action::Animate,
+            id: 1,
+            width: 3,
+            ..Default::default()
+        };
+        g.handle(run, &[], (8, 16));
+        assert!(g.is_animating());
+        assert_eq!(
+            &g.image(1).unwrap().current_rgba()[..4],
+            &[0xff, 0, 0, 0xff]
+        );
+        // A short tick does not cross the 40ms gap; a full one advances a frame.
+        assert!(!g.tick(10));
+        assert!(g.tick(40));
+        assert_eq!(
+            &g.image(1).unwrap().current_rgba()[..4],
+            &[0, 0xff, 0, 0xff]
+        );
+    }
+
+    #[test]
+    fn animate_selects_current_frame() {
+        let mut g = Graphics::new();
+        g.handle(
+            rgba_cmd(1, 1, 1, Action::Transmit),
+            &b64(&[1, 1, 1, 0xff]),
+            (8, 16),
+        );
+        let frame = GraphicsCommand {
+            action: Action::Frame,
+            format: Format::Rgba,
+            width: 1,
+            height: 1,
+            id: 1,
+            ..Default::default()
+        };
+        g.handle(frame, &b64(&[2, 2, 2, 0xff]), (8, 16));
+        // a=a,c=2 makes the second frame current without playing.
+        let select = GraphicsCommand {
+            action: Action::Animate,
+            id: 1,
+            c: 2,
+            ..Default::default()
+        };
+        g.handle(select, &[], (8, 16));
+        assert_eq!(&g.image(1).unwrap().current_rgba()[..4], &[2, 2, 2, 0xff]);
+        assert!(
+            !g.is_animating(),
+            "selecting a frame does not start playback"
+        );
     }
 }

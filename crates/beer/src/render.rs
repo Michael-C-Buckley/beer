@@ -7,10 +7,11 @@
 
 use std::num::NonZeroU16;
 
+use beer_protocols::graphics::{PLACEHOLDER, diacritic_value};
 use beer_protocols::text_size::{HAlign, VAlign};
 
 use crate::font::{CellMetrics, Fonts, Glyph, GlyphData, Style};
-use crate::grid::{Cell, CursorShape, Flags, Grid, Underline};
+use crate::grid::{Cell, Color, CursorShape, Flags, Grid, Underline};
 use crate::theme::{Plane, Rgb, Theme};
 
 /// A mutable view over a BGRA pixel buffer.
@@ -246,6 +247,11 @@ impl Renderer {
             if cell.flags.contains(Flags::BLINK) && !blink_on {
                 continue;
             }
+            // A Unicode placeholder cell shows an image slice, drawn in its own
+            // pass below; never paint the placeholder code point as a glyph.
+            if cell.c == PLACEHOLDER {
+                continue;
+            }
             let (fg, _) = cell_colors(cell, theme);
             let origin_x = pad_x + x as i32 * m.width as i32;
             let style = cell_style(cell);
@@ -309,6 +315,8 @@ impl Renderer {
             m,
             |z| z >= 0,
         );
+        // Unicode-placeholder image cells.
+        draw_placeholders(&mut canvas, frame.images, cells, cols, pad_x, row_top, m);
 
         // The cursor belongs to the live screen; hide it while scrolled back.
         if grid.view_at_bottom() && grid.cursor().1 == y {
@@ -659,6 +667,71 @@ fn draw_image_cells(
     }
 }
 
+/// Composite the Unicode-placeholder cells of one row. A placeholder cell holds
+/// `U+10EEEE`, its image id in the foreground colour, and its row/column as
+/// combining diacritics; a missing row/column/id-byte is inherited from the
+/// placeholder to the left, the way the protocol specifies.
+fn draw_placeholders(
+    canvas: &mut Canvas,
+    images: &crate::graphics::Graphics,
+    cells: &[Cell],
+    cols: usize,
+    pad_x: i32,
+    row_top: i32,
+    m: CellMetrics,
+) {
+    // The left neighbour's (row, column, id high byte, foreground), for cells
+    // that omit diacritics and continue the run.
+    let mut prev: Option<(u32, u32, u32, Color)> = None;
+    for (x, cell) in cells.iter().take(cols).enumerate() {
+        if cell.c != PLACEHOLDER {
+            prev = None;
+            continue;
+        }
+        let Some(base_id) = placeholder_id(cell.fg) else {
+            prev = None;
+            continue;
+        };
+        let marks: Vec<char> = cell.combining.as_deref().unwrap_or("").chars().collect();
+        let d0 = marks.first().copied().and_then(diacritic_value);
+        let d1 = marks.get(1).copied().and_then(diacritic_value);
+        let d2 = marks.get(2).copied().and_then(diacritic_value);
+        let same_fg = prev.is_some_and(|p| p.3 == cell.fg);
+        let (row, col, msb) = match (d0, d1, d2, prev) {
+            // No diacritics: continue the previous cell's row, next column.
+            (None, None, None, Some(p)) if same_fg => (p.0, p.1 + 1, p.2),
+            // Only the row: same row continues, next column.
+            (Some(r), None, None, Some(p)) if same_fg && p.0 == r => (r, p.1 + 1, p.2),
+            // Row and column given, id byte inherited from an adjacent run.
+            (Some(r), Some(c), None, Some(p)) if same_fg && p.0 == r && p.1 + 1 == c => (r, c, p.2),
+            // Otherwise take whatever was given, defaulting the rest to zero.
+            (r, c, msb, _) => (r.unwrap_or(0), c.unwrap_or(0), msb.unwrap_or(0)),
+        };
+        prev = Some((row, col, msb, cell.fg));
+
+        let id = base_id | (msb << 24);
+        let Some(p) = images.placement(id, 0) else {
+            continue;
+        };
+        let Some(img) = images.image(p.image) else {
+            continue;
+        };
+        let origin_x = pad_x + x as i32 * m.width as i32;
+        blit_image_cell(canvas, img, p, col as i32, row as i32, origin_x, row_top, m);
+    }
+}
+
+/// The image id a placeholder cell's foreground colour encodes: an indexed
+/// colour is the id directly, a truecolor is its packed 24-bit value. A default
+/// foreground carries no id.
+fn placeholder_id(fg: Color) -> Option<u32> {
+    match fg {
+        Color::Indexed(n) => Some(u32::from(n)),
+        Color::Rgb(r, g, b) => Some(u32::from(r) << 16 | u32::from(g) << 8 | u32::from(b)),
+        Color::Default => None,
+    }
+}
+
 /// Composite one cell's slice of an image placement. The placement's source
 /// rectangle is scaled to its full cell-pixel area; this cell shows the
 /// sub-rectangle for its `(dx, dy)`, sampled nearest-neighbour and alpha-blended.
@@ -701,7 +774,7 @@ fn blit_image_cell(
                 continue;
             }
             let i = ((sy * iw + sx) * 4) as usize;
-            let px = &img.rgba[i..i + 4];
+            let px = &img.current_rgba()[i..i + 4];
             canvas.blend_rgba(origin_x + cx, row_top + cy, [px[0], px[1], px[2], px[3]]);
         }
     }
