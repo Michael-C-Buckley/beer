@@ -19,9 +19,10 @@ pub struct Pty {
 }
 
 impl Pty {
-    /// Open a PTY, size it to `cols`x`rows`, and exec the user's login shell on
-    /// the slave end with `TERM=term`.
-    pub fn spawn(cols: u16, rows: u16, term: &str) -> anyhow::Result<Self> {
+    /// Open a PTY, size it to `cols`x`rows` (with `cell` giving the cell size in
+    /// pixels, so the kernel reports a pixel geometry for graphics clients), and
+    /// exec the user's login shell on the slave end with `TERM=term`.
+    pub fn spawn(cols: u16, rows: u16, cell: (u16, u16), term: &str) -> anyhow::Result<Self> {
         let master = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC)
             .context("open pty master")?;
         grantpt(&master).context("grantpt")?;
@@ -29,7 +30,7 @@ impl Pty {
         let slave = ioctl_tiocgptpeer(&master, OpenptFlags::RDWR | OpenptFlags::NOCTTY)
             .context("open pty slave")?;
 
-        set_winsize(&master, cols, rows)?;
+        set_winsize(&master, cols, rows, cell)?;
 
         let shell = std::env::var_os("SHELL").unwrap_or_else(|| "/bin/sh".into());
         let argv0 = login_argv0(&shell);
@@ -73,9 +74,10 @@ impl Pty {
         &self.master
     }
 
-    /// Inform the kernel (and thus the child) of a new terminal size.
-    pub fn resize(&self, cols: u16, rows: u16) -> anyhow::Result<()> {
-        set_winsize(&self.master, cols, rows)
+    /// Inform the kernel (and thus the child) of a new terminal size; `cell` is
+    /// the cell size in pixels, carried into the winsize pixel fields.
+    pub fn resize(&self, cols: u16, rows: u16, cell: (u16, u16)) -> anyhow::Result<()> {
+        set_winsize(&self.master, cols, rows, cell)
     }
 
     /// Reap the child if it has exited.
@@ -84,12 +86,14 @@ impl Pty {
     }
 }
 
-fn set_winsize(master: &OwnedFd, cols: u16, rows: u16) -> anyhow::Result<()> {
+fn set_winsize(master: &OwnedFd, cols: u16, rows: u16, cell: (u16, u16)) -> anyhow::Result<()> {
     let ws = Winsize {
         ws_row: rows,
         ws_col: cols,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
+        // The pixel geometry lets graphics-protocol clients size images; it is
+        // the grid size times the cell size.
+        ws_xpixel: cols.saturating_mul(cell.0),
+        ws_ypixel: rows.saturating_mul(cell.1),
     };
     tcsetwinsize(master.as_fd(), ws).context("set pty winsize")
 }

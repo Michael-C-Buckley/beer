@@ -93,7 +93,12 @@ impl Perform for Term {
                     .kitty_set(n(params, 0, 0) as u8, n(params, 1, 1) as u8),
                 _ => self.grid.restore_cursor(),
             },
-            't' => self.title_stack_op(params),
+            // `CSI 14/16/18 t` report pixel/character geometry (used by graphics
+            // clients to size images); other `t` operations are title-stack ops.
+            't' => match raw(params, 0) {
+                14 | 16 | 18 => self.report_geometry(raw(params, 0)),
+                _ => self.title_stack_op(params),
+            },
             'g' => match raw(params, 0) {
                 3 => self.grid.clear_all_tabs(),
                 _ => self.grid.clear_tab(),

@@ -575,7 +575,9 @@ impl App {
     /// Spawn the shell at the current window size and start reading its output.
     fn spawn_session(&mut self) {
         let (cols, rows) = self.grid_dims();
-        let pty = match Pty::spawn(cols, rows, &self.config.main.term) {
+        let m = self.renderer.metrics();
+        let cell = (m.width as u16, m.height as u16);
+        let pty = match Pty::spawn(cols, rows, cell, &self.config.main.term) {
             Ok(pty) => pty,
             Err(err) => {
                 tracing::error!("spawn shell: {err:#}");
@@ -1857,6 +1859,8 @@ impl App {
     /// PTY about it if it changed.
     fn resize_grid(&mut self) {
         let (cols, rows) = self.grid_dims();
+        let m = self.renderer.metrics();
+        let cell = (m.width as u16, m.height as u16);
         let Some(session) = self.session.as_mut() else {
             return;
         };
@@ -1866,7 +1870,7 @@ impl App {
             return;
         }
         session.term.resize(cols as usize, rows as usize);
-        if let Err(err) = session.pty.resize(cols, rows) {
+        if let Err(err) = session.pty.resize(cols, rows, cell) {
             tracing::warn!("resize pty: {err}");
         }
     }

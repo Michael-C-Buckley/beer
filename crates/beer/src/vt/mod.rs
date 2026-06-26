@@ -290,6 +290,20 @@ impl Term {
         self.graphics.is_animating()
     }
 
+    /// Answer a `CSI 14/16/18 t` geometry query: `14` reports the text area in
+    /// pixels (`CSI 4 ; h ; w t`), `16` the cell size in pixels (`CSI 6 ; …`),
+    /// `18` the text area in characters (`CSI 8 ; …`). Graphics clients read
+    /// these to size and place images.
+    fn report_geometry(&mut self, kind: u16) {
+        let (cw, ch) = self.cell_px;
+        let (cols, rows) = (self.grid.cols() as u32, self.grid.rows() as u32);
+        let _ = match kind {
+            14 => write!(self.response, "\x1b[4;{};{}t", rows * ch, cols * cw),
+            16 => write!(self.response, "\x1b[6;{ch};{cw}t"),
+            _ => write!(self.response, "\x1b[8;{rows};{cols}t"),
+        };
+    }
+
     /// The working directory last reported by the shell (OSC 7), if any.
     pub fn cwd(&self) -> Option<&str> {
         self.cwd.as_deref()
@@ -680,6 +694,19 @@ mod tests {
         assert_eq!(cell.image.map(|r| r.image), Some(1));
         let resp = t.take_response();
         assert!(resp.windows(2).any(|w| w == b"OK"), "expected OK response");
+    }
+
+    #[test]
+    fn reports_pixel_geometry_for_graphics_clients() {
+        // The test harness feeds with an 8x16 cell. A 20x4 grid is then 160x64
+        // pixels. These answers are what an image client needs to size images.
+        let mut t = Term::new(20, 4);
+        feed(&mut t, b"\x1b[16t"); // cell size in pixels
+        assert_eq!(t.take_response(), b"\x1b[6;16;8t");
+        feed(&mut t, b"\x1b[14t"); // text area in pixels
+        assert_eq!(t.take_response(), b"\x1b[4;64;160t");
+        feed(&mut t, b"\x1b[18t"); // text area in cells
+        assert_eq!(t.take_response(), b"\x1b[8;4;20t");
     }
 
     #[test]
