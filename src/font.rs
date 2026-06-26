@@ -16,12 +16,16 @@ use fontconfig::{CharSet, Fontconfig, Pattern};
 use freetype::bitmap::PixelMode;
 use freetype::face::{LoadFlag, StyleFlag};
 use freetype::{Face, Library, Matrix, Vector};
+use harfbuzz_rs_now as harfbuzz;
 use lru::LruCache;
 use thiserror::Error;
 
 /// Upper bound on cached glyphs; the working set of a terminal is far smaller,
 /// but this caps memory under adversarial all-of-Unicode output.
 const GLYPH_CACHE_CAP: usize = 4096;
+
+/// Upper bound on cached shaped clusters (base char + combining marks).
+const SHAPE_CACHE_CAP: usize = 1024;
 
 #[derive(Debug, Error)]
 pub enum FontError {
@@ -91,8 +95,36 @@ pub enum GlyphData {
     Color(Vec<u8>),
 }
 
+/// One shaped glyph in a cluster: a glyph index into a specific face plus the
+/// pixel offset, relative to the cell origin and baseline, that HarfBuzz placed
+/// it at. `x` grows rightward, `y` upward (away from the baseline).
+#[derive(Clone, Copy, Debug)]
+pub struct Placed {
+    pub gid: u32,
+    pub x: i32,
+    pub y: i32,
+}
+
+/// The result of shaping a base char plus its combining marks: the face the
+/// cluster was shaped against and the positioned glyphs to draw, in order.
+#[derive(Clone, Debug)]
+pub struct ShapedCluster {
+    pub face_idx: usize,
+    pub glyphs: Vec<Placed>,
+}
+
+/// A loaded face plus where it came from, so HarfBuzz can be handed the same
+/// font bytes that FreeType rasterizes from.
+struct FaceEntry {
+    face: Face,
+    path: PathBuf,
+    index: u32,
+    /// HarfBuzz font for this face, built on first shape against it.
+    hb: Option<harfbuzz::Owned<harfbuzz::Font<'static>>>,
+}
+
 /// The font set for one terminal: a primary family with lazily-loaded
-/// bold/italic variants and per-codepoint fallback faces, plus a glyph cache.
+/// bold/italic variants and per-codepoint fallback faces, plus glyph caches.
 pub struct Fonts {
     library: Library,
     fontconfig: Fontconfig,
@@ -100,12 +132,17 @@ pub struct Fonts {
     size_px: u32,
     metrics: CellMetrics,
     /// All loaded faces; indices into this vector are stable.
-    faces: Vec<Face>,
+    faces: Vec<FaceEntry>,
     /// Index of each style variant, by [`Style::index`]; filled on demand.
     styled: [Option<usize>; 4],
     /// Fallback faces resolved by coverage, deduplicated by file path.
     fallbacks: HashMap<PathBuf, usize>,
+    /// Glyphs keyed by `char` (the common, unshaped path).
     cache: LruCache<(char, usize), Glyph>,
+    /// Glyphs keyed by `(glyph index, face, style)` (the shaped path).
+    gcache: LruCache<(u32, usize, usize), Glyph>,
+    /// Shaped clusters keyed by `(cluster string, style)`.
+    shape_cache: LruCache<(Box<str>, usize), Option<ShapedCluster>>,
 }
 
 impl fmt::Debug for Fonts {
@@ -127,8 +164,9 @@ impl Fonts {
         let fontconfig = Fontconfig::new().ok_or(FontError::FontconfigInit)?;
 
         let regular = resolve_face(&library, &fontconfig, family, Style::default(), size_px)?;
-        let metrics = cell_metrics(&regular, family)?;
+        let metrics = cell_metrics(&regular.face, family)?;
 
+        let cap = |n| NonZeroUsize::new(n).expect("cache cap is nonzero");
         Ok(Self {
             library,
             fontconfig,
@@ -138,7 +176,9 @@ impl Fonts {
             faces: vec![regular],
             styled: [Some(0), None, None, None],
             fallbacks: HashMap::new(),
-            cache: LruCache::new(NonZeroUsize::new(GLYPH_CACHE_CAP).expect("cap is nonzero")),
+            cache: LruCache::new(cap(GLYPH_CACHE_CAP)),
+            gcache: LruCache::new(cap(GLYPH_CACHE_CAP)),
+            shape_cache: LruCache::new(cap(SHAPE_CACHE_CAP)),
         })
     }
 
@@ -152,16 +192,100 @@ impl Fonts {
         let key = (c, style.index());
         if self.cache.get(&key).is_none() {
             let idx = self.face_for(c, style)?;
-            let face = &self.faces[idx];
+            let face = &self.faces[idx].face;
             // Synthesize bold/italic only when the resolved face lacks the real
             // variant (most monospace families ship both).
-            let flags = face.style_flags();
-            let synth_bold = style.bold && !flags.contains(StyleFlag::BOLD);
-            let synth_italic = style.italic && !flags.contains(StyleFlag::ITALIC);
+            let (synth_bold, synth_italic) = synth_flags(face, style);
             let glyph = rasterize(face, c, synth_bold, synth_italic)?;
             self.cache.put(key, glyph);
         }
         Ok(self.cache.get(&key).expect("glyph was just inserted"))
+    }
+
+    /// Return the rasterized glyph for glyph index `gid` in `face_idx`,
+    /// rasterizing and caching on first use. Used by the shaped path, where
+    /// HarfBuzz has already chosen the face and glyph.
+    pub fn glyph_indexed(
+        &mut self,
+        face_idx: usize,
+        gid: u32,
+        style: Style,
+    ) -> Result<&Glyph, FontError> {
+        let key = (gid, face_idx, style.index());
+        if self.gcache.get(&key).is_none() {
+            let face = &self.faces[face_idx].face;
+            let (synth_bold, synth_italic) = synth_flags(face, style);
+            let glyph = rasterize_index(face, gid, synth_bold, synth_italic)?;
+            self.gcache.put(key, glyph);
+        }
+        Ok(self.gcache.get(&key).expect("glyph was just inserted"))
+    }
+
+    /// Shape `base` plus its combining `marks` into positioned glyphs using
+    /// HarfBuzz, so marks land where the font's GPOS table wants them rather
+    /// than stacked at the origin. Returns `None` when shaping is unavailable or
+    /// the cluster has glyphs the face does not cover (`.notdef`), so the caller
+    /// can fall back to drawing the marks stacked. Results are cached.
+    pub fn shape_cluster(
+        &mut self,
+        base: char,
+        marks: &str,
+        style: Style,
+    ) -> Option<ShapedCluster> {
+        let mut cluster = String::with_capacity(base.len_utf8() + marks.len());
+        cluster.push(base);
+        cluster.push_str(marks);
+        let key = (cluster.clone().into_boxed_str(), style.index());
+        if let Some(cached) = self.shape_cache.get(&key) {
+            return cached.clone();
+        }
+        let shaped = self.shape_uncached(base, &cluster, style);
+        self.shape_cache.put(key, shaped.clone());
+        shaped
+    }
+
+    fn shape_uncached(&mut self, base: char, cluster: &str, style: Style) -> Option<ShapedCluster> {
+        let face_idx = self.face_for(base, style).ok()?;
+        let font = self.hb_font(face_idx)?;
+        let buffer = harfbuzz::UnicodeBuffer::new().add_str(cluster);
+        let output = harfbuzz::shape(font, buffer, &[]);
+        let infos = output.get_glyph_infos();
+        let positions = output.get_glyph_positions();
+        let mut glyphs = Vec::with_capacity(infos.len());
+        let mut pen = 0i32;
+        for (info, pos) in infos.iter().zip(positions) {
+            // A .notdef means this face does not cover part of the cluster; bail
+            // so the caller stacks the marks via per-char fallback instead.
+            if info.codepoint == 0 {
+                return None;
+            }
+            glyphs.push(Placed {
+                gid: info.codepoint,
+                // HarfBuzz positions are 26.6 fixed point at our pixel scale.
+                x: (pen + pos.x_offset) >> 6,
+                y: pos.y_offset >> 6,
+            });
+            pen += pos.x_advance;
+        }
+        Some(ShapedCluster { face_idx, glyphs })
+    }
+
+    /// Lazily build the HarfBuzz font for `face_idx` from the same file bytes
+    /// FreeType loaded. The bytes are leaked to `'static`: a face lives for the
+    /// process, and only the handful actually used to shape clusters allocate.
+    fn hb_font(&mut self, face_idx: usize) -> Option<&harfbuzz::Owned<harfbuzz::Font<'static>>> {
+        if self.faces[face_idx].hb.is_none() {
+            let entry = &self.faces[face_idx];
+            let bytes = std::fs::read(&entry.path).ok()?;
+            let leaked: &'static [u8] = Box::leak(bytes.into_boxed_slice());
+            let face = harfbuzz::Face::from_bytes(leaked, entry.index);
+            let mut font = harfbuzz::Font::new(face);
+            let scale = self.size_px as i32 * 64;
+            font.set_scale(scale, scale);
+            font.set_ppem(self.size_px, self.size_px);
+            self.faces[face_idx].hb = Some(font);
+        }
+        self.faces[face_idx].hb.as_ref()
     }
 
     /// Pick the face that should render `c`: the requested style if it has the
@@ -169,17 +293,17 @@ impl Fonts {
     /// coverage match. Falls back to the styled face (rendering `.notdef`).
     fn face_for(&mut self, c: char, style: Style) -> Result<usize, FontError> {
         let styled = self.styled_face(style)?;
-        if face_has_glyph(&self.faces[styled], c) {
+        if face_has_glyph(&self.faces[styled].face, c) {
             return Ok(styled);
         }
         if let Some(regular) = self.styled[0]
             && regular != styled
-            && face_has_glyph(&self.faces[regular], c)
+            && face_has_glyph(&self.faces[regular].face, c)
         {
             return Ok(regular);
         }
         for &idx in self.fallbacks.values() {
-            if face_has_glyph(&self.faces[idx], c) {
+            if face_has_glyph(&self.faces[idx].face, c) {
                 return Ok(idx);
             }
         }
@@ -200,8 +324,8 @@ impl Fonts {
             style,
             self.size_px,
         ) {
-            Ok(face) => {
-                self.faces.push(face);
+            Ok(entry) => {
+                self.faces.push(entry);
                 self.faces.len() - 1
             }
             Err(_) => regular,
@@ -223,12 +347,17 @@ impl Fonts {
         if let Some(&idx) = self.fallbacks.get(&path) {
             return Ok(Some(idx));
         }
-        let index = matched.face_index().unwrap_or(0) as isize;
-        let face = self.library.new_face(&path, index)?;
+        let index = matched.face_index().unwrap_or(0);
+        let face = self.library.new_face(&path, index as isize)?;
         if size_face(&face, self.size_px).is_err() {
             return Ok(None);
         }
-        self.faces.push(face);
+        self.faces.push(FaceEntry {
+            face,
+            path: path.clone(),
+            index: index as u32,
+            hb: None,
+        });
         let idx = self.faces.len() - 1;
         self.fallbacks.insert(path, idx);
         Ok(Some(idx))
@@ -239,19 +368,34 @@ fn face_has_glyph(face: &Face, c: char) -> bool {
     face.get_char_index(c as usize).is_some_and(|g| g != 0)
 }
 
+/// Whether bold/italic must be synthesized: only when the requested style is
+/// set but the resolved face lacks the real variant.
+fn synth_flags(face: &Face, style: Style) -> (bool, bool) {
+    let flags = face.style_flags();
+    let synth_bold = style.bold && !flags.contains(StyleFlag::BOLD);
+    let synth_italic = style.italic && !flags.contains(StyleFlag::ITALIC);
+    (synth_bold, synth_italic)
+}
+
 fn resolve_face(
     library: &Library,
     fontconfig: &Fontconfig,
     family: &str,
     style: Style,
     size_px: u32,
-) -> Result<Face, FontError> {
+) -> Result<FaceEntry, FontError> {
     let font = fontconfig
         .find(family, Some(style.fontconfig_style()))
         .map_err(|_| FontError::NoFamily(family.to_owned()))?;
-    let face = library.new_face(&font.path, font.index.unwrap_or(0) as isize)?;
+    let index = font.index.unwrap_or(0);
+    let face = library.new_face(&font.path, index as isize)?;
     size_face(&face, size_px)?;
-    Ok(face)
+    Ok(FaceEntry {
+        face,
+        path: font.path,
+        index: index as u32,
+        hb: None,
+    })
 }
 
 /// Set a face to `size_px`. Scalable faces size directly; bitmap-strike faces
@@ -312,12 +456,35 @@ fn rasterize(
     synth_bold: bool,
     synth_italic: bool,
 ) -> Result<Glyph, FontError> {
+    rasterize_with(face, synth_bold, synth_italic, |face| {
+        face.load_char(c as usize, LoadFlag::RENDER | LoadFlag::COLOR)
+    })
+}
+
+/// Rasterize by glyph index rather than character (the shaped path).
+fn rasterize_index(
+    face: &Face,
+    gid: u32,
+    synth_bold: bool,
+    synth_italic: bool,
+) -> Result<Glyph, FontError> {
+    rasterize_with(face, synth_bold, synth_italic, |face| {
+        face.load_glyph(gid, LoadFlag::RENDER | LoadFlag::COLOR)
+    })
+}
+
+fn rasterize_with(
+    face: &Face,
+    synth_bold: bool,
+    synth_italic: bool,
+    load: impl FnOnce(&Face) -> Result<(), freetype::Error>,
+) -> Result<Glyph, FontError> {
     // A shear transform fakes italics on a face that has no real oblique. It is
     // applied to the outline at load time, so reset it immediately after.
     if synth_italic {
         face.set_transform(&mut shear_matrix(), &mut Vector { x: 0, y: 0 });
     }
-    let result = face.load_char(c as usize, LoadFlag::RENDER | LoadFlag::COLOR);
+    let result = load(face);
     if synth_italic {
         face.set_transform(&mut identity_matrix(), &mut Vector { x: 0, y: 0 });
     }
@@ -453,6 +620,37 @@ mod tests {
         embolden(&mut mask, 3, 2);
         // Each lit pixel bleeds one column to the right; the left edge is unchanged.
         assert_eq!(mask, vec![0, 255, 255, 0, 200, 200]);
+    }
+
+    #[test]
+    fn shapes_a_simple_cluster() {
+        let mut f = fonts();
+        // Shaping a bare base char yields exactly its one glyph, and that glyph
+        // index rasterizes to ink through the shaped path.
+        let shaped = f
+            .shape_cluster('a', "", Style::default())
+            .expect("monospace shapes 'a'");
+        assert_eq!(shaped.glyphs.len(), 1);
+        let g = f
+            .glyph_indexed(shaped.face_idx, shaped.glyphs[0].gid, Style::default())
+            .expect("rasterize shaped glyph");
+        match &g.data {
+            GlyphData::Mask(px) => assert!(px.iter().any(|&p| p > 0), "'a' should have ink"),
+            GlyphData::Color(_) => {}
+        }
+    }
+
+    #[test]
+    fn shapes_combining_cluster_without_notdef() {
+        // 'e' + combining acute: a covering face shapes it (>=1 glyph, never a
+        // .notdef, which `shape_cluster` rejects by returning None); a face
+        // missing the mark returns None so the renderer stacks instead. Either
+        // outcome is fine - the point is no panic and no notdef leaking through.
+        let mut f = fonts();
+        if let Some(shaped) = f.shape_cluster('e', "\u{0301}", Style::default()) {
+            assert!(!shaped.glyphs.is_empty());
+            assert!(shaped.glyphs.iter().all(|g| g.gid != 0));
+        }
     }
 
     #[test]

@@ -7,7 +7,7 @@
 
 use std::num::NonZeroU16;
 
-use crate::font::{CellMetrics, Fonts, GlyphData, Style};
+use crate::font::{CellMetrics, Fonts, Glyph, GlyphData, Style};
 use crate::grid::{Cell, CursorShape, Flags, Grid, Underline};
 use crate::theme::{Plane, Rgb, Theme};
 
@@ -205,19 +205,47 @@ impl Renderer {
             }
             let (fg, _) = cell_colors(cell, theme);
             let origin_x = pad_x + x as i32 * m.width as i32;
-            if is_braille(cell.c) {
+            let style = cell_style(cell);
+            // A cell carrying combining marks is shaped as a cluster so the
+            // marks land where the font's GPOS table wants them. Shaping returns
+            // None for braille (drawn directly) and for clusters the face does
+            // not fully cover, both of which fall through to the legacy path.
+            let shaped = match &cell.combining {
+                Some(marks) if !is_braille(cell.c) => {
+                    self.fonts.shape_cluster(cell.c, marks, style)
+                }
+                _ => None,
+            };
+            if let Some(shaped) = shaped {
+                for placed in &shaped.glyphs {
+                    if let Ok(glyph) = self.fonts.glyph_indexed(shaped.face_idx, placed.gid, style)
+                    {
+                        blit_glyph(
+                            &mut canvas,
+                            glyph,
+                            m,
+                            origin_x + placed.x,
+                            row_top,
+                            placed.y,
+                            fg,
+                        );
+                    }
+                }
+            } else if is_braille(cell.c) {
                 // Drawn directly so the dots are crisp and fill the cell, the
                 // way tools like btop expect, rather than however the fallback
                 // font happens to size its braille glyphs.
                 draw_braille(&mut canvas, cell.c, origin_x, row_top, m, fg);
-            } else if cell.c != ' ' {
-                self.draw_glyph(&mut canvas, cell.c, cell_style(cell), origin_x, row_top, fg);
-            }
-            // Stack any combining marks over the base glyph; their own bearings
-            // position them (no shaper, so placement is the font's default).
-            if let Some(marks) = &cell.combining {
-                for mark in marks.chars() {
-                    self.draw_glyph(&mut canvas, mark, cell_style(cell), origin_x, row_top, fg);
+            } else {
+                if cell.c != ' ' {
+                    self.draw_glyph(&mut canvas, cell.c, style, origin_x, row_top, fg);
+                }
+                // No shaper available for this cluster: stack the marks over the
+                // base using each mark glyph's own bearings.
+                if let Some(marks) = &cell.combining {
+                    for mark in marks.chars() {
+                        self.draw_glyph(&mut canvas, mark, style, origin_x, row_top, fg);
+                    }
                 }
             }
             draw_decorations(&mut canvas, cell, theme, origin_x, row_top, m, fg);
@@ -414,40 +442,50 @@ impl Renderer {
                 return;
             }
         };
-        let (gw, gh) = (glyph.width as i32, glyph.height as i32);
-        match &glyph.data {
-            GlyphData::Mask(mask) => {
-                let baseline = cell_top + m.ascent as i32;
-                for gy in 0..gh {
-                    for gx in 0..gw {
-                        let a = mask[(gy * gw + gx) as usize];
-                        if a != 0 {
-                            canvas.blend(
-                                origin_x + glyph.left + gx,
-                                baseline - glyph.top + gy,
-                                fg,
-                                a,
-                            );
-                        }
+        blit_glyph(canvas, glyph, m, origin_x, cell_top, 0, fg);
+    }
+}
+
+/// Composite a rasterized glyph into the canvas. `origin_x`/`cell_top` are the
+/// cell's top-left; `rise` lifts the glyph above the baseline (HarfBuzz's
+/// vertical offset, 0 for the unshaped path).
+fn blit_glyph(
+    canvas: &mut Canvas,
+    glyph: &Glyph,
+    m: CellMetrics,
+    origin_x: i32,
+    cell_top: i32,
+    rise: i32,
+    fg: Rgb,
+) {
+    let (gw, gh) = (glyph.width as i32, glyph.height as i32);
+    match &glyph.data {
+        GlyphData::Mask(mask) => {
+            let baseline = cell_top + m.ascent as i32 - rise;
+            for gy in 0..gh {
+                for gx in 0..gw {
+                    let a = mask[(gy * gw + gx) as usize];
+                    if a != 0 {
+                        canvas.blend(origin_x + glyph.left + gx, baseline - glyph.top + gy, fg, a);
                     }
                 }
             }
-            // Colour glyphs (emoji) come from a fixed strike at native size;
-            // scale them to the line height with nearest-neighbour sampling.
-            GlyphData::Color(bgra) if gh > 0 => {
-                let scale = m.height as f32 / gh as f32;
-                let target_w = (gw as f32 * scale) as i32;
-                for ty in 0..m.height as i32 {
-                    let sy = ((ty as f32 / scale) as i32).min(gh - 1);
-                    for tx in 0..target_w {
-                        let sx = ((tx as f32 / scale) as i32).min(gw - 1);
-                        let i = ((sy * gw + sx) * 4) as usize;
-                        canvas.over(origin_x + tx, cell_top + ty, &bgra[i..i + 4]);
-                    }
-                }
-            }
-            GlyphData::Color(_) => {}
         }
+        // Colour glyphs (emoji) come from a fixed strike at native size;
+        // scale them to the line height with nearest-neighbour sampling.
+        GlyphData::Color(bgra) if gh > 0 => {
+            let scale = m.height as f32 / gh as f32;
+            let target_w = (gw as f32 * scale) as i32;
+            for ty in 0..m.height as i32 {
+                let sy = ((ty as f32 / scale) as i32).min(gh - 1);
+                for tx in 0..target_w {
+                    let sx = ((tx as f32 / scale) as i32).min(gw - 1);
+                    let i = ((sy * gw + sx) * 4) as usize;
+                    canvas.over(origin_x + tx, cell_top + ty, &bgra[i..i + 4]);
+                }
+            }
+        }
+        GlyphData::Color(_) => {}
     }
 }
 

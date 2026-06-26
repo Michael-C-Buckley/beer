@@ -10,6 +10,7 @@
   libxkbcommon,
   freetype,
   fontconfig,
+  harfbuzz,
 }: let
   cargoTOML = (lib.importTOML ../Cargo.toml).package.version;
 in
@@ -49,6 +50,7 @@ in
       libxkbcommon
       freetype
       fontconfig
+      harfbuzz
     ];
 
     # Install the terminfo entry, and make the Wayland/xkb libraries (loaded via
