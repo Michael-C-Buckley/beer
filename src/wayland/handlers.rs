@@ -1,4 +1,5 @@
 use super::*;
+use crate::bindings::MouseButton;
 
 impl CompositorHandler for App {
     fn scale_factor_changed(
@@ -330,6 +331,16 @@ fn button_code(button: u32) -> Option<u8> {
     }
 }
 
+/// Map a Wayland button code to a bindable [`MouseButton`].
+fn mouse_button(button: u32) -> Option<MouseButton> {
+    match button {
+        BTN_LEFT => Some(MouseButton::Left),
+        BTN_MIDDLE => Some(MouseButton::Middle),
+        BTN_RIGHT => Some(MouseButton::Right),
+        _ => None,
+    }
+}
+
 impl PointerHandler for App {
     fn pointer_frame(
         &mut self,
@@ -372,13 +383,17 @@ impl PointerHandler for App {
                         self.pressed_button = Some(code);
                         continue;
                     }
-                    match *button {
-                        BTN_LEFT => {
-                            self.press_cell = self.cell_at(self.pointer_pos.0, self.pointer_pos.1);
-                            self.pointer_press(*time);
-                        }
-                        BTN_MIDDLE => self.paste_primary(),
-                        _ => {}
+                    // A configured `[mouse-bindings]` action (Middle defaults to
+                    // primary paste) fires before the built-in left-drag select.
+                    if let Some(mb) = mouse_button(*button)
+                        && let Some(action) = self.bindings.mouse_action(mb, self.modifiers)
+                    {
+                        self.dispatch_action(action);
+                        continue;
+                    }
+                    if *button == BTN_LEFT {
+                        self.press_cell = self.cell_at(self.pointer_pos.0, self.pointer_pos.1);
+                        self.pointer_press(*time);
                     }
                 }
                 PointerEventKind::Release { button, .. } => {

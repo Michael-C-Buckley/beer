@@ -25,6 +25,9 @@ pub struct Config {
     pub key_bindings: std::collections::HashMap<String, String>,
     /// Chord → literal text to send (supports `\e \n \r \t \\ \xNN`).
     pub text_bindings: std::collections::HashMap<String, String>,
+    /// Mouse chord (e.g. `"Middle"`, `"Shift+Right"`) → action. Merged over the
+    /// defaults; `"none"` unbinds. Left-button select/drag stays built in.
+    pub mouse_bindings: std::collections::HashMap<String, String>,
 }
 
 /// `[cursor]`: the default cursor presentation (DECSCUSR may override at runtime).

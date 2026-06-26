@@ -106,11 +106,69 @@ impl Chord {
     }
 }
 
+/// A mouse button that a `[mouse-bindings]` chord can name.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MouseButton {
+    Left,
+    Middle,
+    Right,
+}
+
+/// A parsed mouse chord: a button plus the modifiers that must be held exactly.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct MouseChord {
+    button: MouseButton,
+    ctrl: bool,
+    shift: bool,
+    alt: bool,
+    logo: bool,
+}
+
+impl MouseChord {
+    /// Parse a chord like `Shift+Middle`; the final non-modifier token is the
+    /// button. Returns `None` if no button is recognized.
+    fn parse(spec: &str) -> Option<Self> {
+        let (mut ctrl, mut shift, mut alt, mut logo) = (false, false, false, false);
+        let mut button = None;
+        for token in spec.split('+').map(str::trim).filter(|t| !t.is_empty()) {
+            match token.to_ascii_lowercase().as_str() {
+                "ctrl" | "control" => ctrl = true,
+                "shift" => shift = true,
+                "alt" | "mod1" | "meta" => alt = true,
+                "super" | "logo" | "cmd" | "mod4" => logo = true,
+                "left" | "button1" => button = Some(MouseButton::Left),
+                "middle" | "button2" => button = Some(MouseButton::Middle),
+                "right" | "button3" => button = Some(MouseButton::Right),
+                other => {
+                    tracing::warn!("unknown mouse button {other:?} in binding");
+                    return None;
+                }
+            }
+        }
+        Some(Self {
+            button: button?,
+            ctrl,
+            shift,
+            alt,
+            logo,
+        })
+    }
+
+    fn matches(&self, button: MouseButton, mods: Modifiers) -> bool {
+        self.button == button
+            && mods.ctrl == self.ctrl
+            && mods.shift == self.shift
+            && mods.alt == self.alt
+            && mods.logo == self.logo
+    }
+}
+
 /// The resolved binding tables for a session.
 #[derive(Clone, Debug, Default)]
 pub struct Bindings {
     keys: Vec<(Chord, Action)>,
     text: Vec<(Chord, Vec<u8>)>,
+    mouse: Vec<(MouseChord, Action)>,
 }
 
 impl Bindings {
@@ -119,6 +177,7 @@ impl Bindings {
     pub fn from_config(
         key_bindings: &HashMap<String, String>,
         text_bindings: &HashMap<String, String>,
+        mouse_bindings: &HashMap<String, String>,
     ) -> Self {
         let mut keys: Vec<(Chord, Action)> = Vec::new();
         let mut add = |chord: &str, action: Action| {
@@ -149,7 +208,30 @@ impl Bindings {
                 text.push((c, unescape(value)));
             }
         }
-        Self { keys, text }
+
+        let mut mouse: Vec<(MouseChord, Action)> = Vec::new();
+        let mut add_mouse = |chord: &str, action: Option<Action>| {
+            if let Some(c) = MouseChord::parse(chord) {
+                mouse.retain(|(existing, _)| *existing != c);
+                if let Some(a) = action {
+                    mouse.push((c, a));
+                }
+            }
+        };
+        for (chord, action) in DEFAULT_MOUSE_BINDINGS {
+            add_mouse(chord, Action::parse(action));
+        }
+        for (chord, action) in mouse_bindings {
+            if action == "none" {
+                add_mouse(chord, None);
+            } else if let Some(a) = Action::parse(action) {
+                add_mouse(chord, Some(a));
+            } else {
+                tracing::warn!("unknown mouse-binding action {action:?}");
+            }
+        }
+
+        Self { keys, text, mouse }
     }
 
     /// The action bound to this key event, if any.
@@ -166,6 +248,14 @@ impl Bindings {
             .iter()
             .find(|(c, _)| c.matches(event, mods))
             .map(|(_, t)| t.as_slice())
+    }
+
+    /// The action bound to this mouse button + modifiers, if any.
+    pub fn mouse_action(&self, button: MouseButton, mods: Modifiers) -> Option<Action> {
+        self.mouse
+            .iter()
+            .find(|(c, _)| c.matches(button, mods))
+            .map(|(_, a)| *a)
     }
 }
 
@@ -189,6 +279,10 @@ const DEFAULT_BINDINGS: &[(&str, &str)] = &[
     ("Ctrl+Shift+O", "url-mode"),
     ("Ctrl+Shift+U", "unicode-input"),
 ];
+
+/// Built-in default mouse bindings (chord, action name). Left-button select and
+/// drag are built-in gestures, not bindings, so only the other buttons appear.
+const DEFAULT_MOUSE_BINDINGS: &[(&str, &str)] = &[("Middle", "paste-primary")];
 
 /// Map a key token to a keysym: a single character, or a named special key.
 fn keysym_from_token(token: &str) -> Option<Keysym> {
@@ -292,7 +386,7 @@ mod tests {
 
     #[test]
     fn default_copy_binding_matches_case_insensitively() {
-        let b = Bindings::from_config(&HashMap::new(), &HashMap::new());
+        let b = Bindings::from_config(&HashMap::new(), &HashMap::new(), &HashMap::new());
         let mods = Modifiers {
             ctrl: true,
             shift: true,
@@ -309,7 +403,7 @@ mod tests {
         let mut kb = HashMap::new();
         kb.insert("Ctrl+Shift+C".to_string(), "none".to_string());
         kb.insert("Ctrl+y".to_string(), "copy".to_string());
-        let b = Bindings::from_config(&kb, &HashMap::new());
+        let b = Bindings::from_config(&kb, &HashMap::new(), &HashMap::new());
         let cs = Modifiers {
             ctrl: true,
             shift: true,
@@ -324,12 +418,40 @@ mod tests {
     fn text_binding_unescapes() {
         let mut tb = HashMap::new();
         tb.insert("Ctrl+Shift+Return".to_string(), "\\x1b\\r".to_string());
-        let b = Bindings::from_config(&HashMap::new(), &tb);
+        let b = Bindings::from_config(&HashMap::new(), &tb, &HashMap::new());
         let mods = Modifiers {
             ctrl: true,
             shift: true,
             ..NONE
         };
         assert_eq!(b.text(&key(Keysym::Return), mods), Some(&[0x1b, b'\r'][..]));
+    }
+
+    #[test]
+    fn mouse_bindings_default_override_and_unbind() {
+        // Default: middle button pastes the primary selection.
+        let b = Bindings::from_config(&HashMap::new(), &HashMap::new(), &HashMap::new());
+        assert_eq!(
+            b.mouse_action(MouseButton::Middle, NONE),
+            Some(Action::PastePrimary)
+        );
+        assert_eq!(b.mouse_action(MouseButton::Right, NONE), None);
+
+        // Config rebinds right to paste and unbinds the middle default.
+        let mut mb = HashMap::new();
+        mb.insert("Right".to_string(), "paste".to_string());
+        mb.insert("Middle".to_string(), "none".to_string());
+        let b = Bindings::from_config(&HashMap::new(), &HashMap::new(), &mb);
+        assert_eq!(
+            b.mouse_action(MouseButton::Right, NONE),
+            Some(Action::Paste)
+        );
+        assert_eq!(b.mouse_action(MouseButton::Middle, NONE), None);
+        // Modifiers must match exactly.
+        let shift = Modifiers {
+            shift: true,
+            ..NONE
+        };
+        assert_eq!(b.mouse_action(MouseButton::Right, shift), None);
     }
 }

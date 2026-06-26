@@ -217,8 +217,11 @@ pub fn run(config: Config, config_path: Option<std::path::PathBuf>) -> anyhow::R
     )
     .context("create shm slot pool")?;
 
-    let bindings =
-        crate::bindings::Bindings::from_config(&config.key_bindings, &config.text_bindings);
+    let bindings = crate::bindings::Bindings::from_config(
+        &config.key_bindings,
+        &config.text_bindings,
+        &config.mouse_bindings,
+    );
     let font_size = config.main.font_size;
 
     let mut app = App {
@@ -934,8 +937,11 @@ impl App {
     /// Re-read the config file and apply it in place (SIGUSR1).
     fn reload_config(&mut self) {
         let new = Config::load(self.config_path.as_deref());
-        self.bindings =
-            crate::bindings::Bindings::from_config(&new.key_bindings, &new.text_bindings);
+        self.bindings = crate::bindings::Bindings::from_config(
+            &new.key_bindings,
+            &new.text_bindings,
+            &new.mouse_bindings,
+        );
         let font_changed = new.main.font != self.config.main.font
             || new.main.font_size != self.config.main.font_size;
         if font_changed {

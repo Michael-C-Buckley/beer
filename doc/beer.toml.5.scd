@@ -123,6 +123,22 @@ _unicode-input_.
 "Ctrl+`" = "none"
 ```
 
+# [mouse-bindings]
+
+A table of _button-chord_ = _action_ entries, merged over the built-in
+defaults. A chord is optional modifiers and a button joined by _+_, e.g.
+_"Shift+Middle"_. Buttons are _Left_, _Middle_, and _Right_. The actions are
+the same set as *[key-bindings]*. An action of _"none"_ unbinds the chord. The
+left button's select/drag is a built-in gesture and is not rebindable.
+
+The only default is _"Middle" = "paste-primary"_.
+
+```
+[mouse-bindings]
+"Right" = "paste"
+"Middle" = "none"
+```
+
 # [shell-integration]
 
 Behaviour driven by *OSC 7* (cwd) and *OSC 133* (prompt) marks.
