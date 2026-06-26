@@ -1,163 +1,47 @@
-# beer
+# 🍺 beer
 
-`beer` is a small Wayland-native terminal emulator written in Rust. It renders
-through `wl_shm` with the CPU, uses a real PTY for the child shell, and keeps
-the architecture close to the model used by terminals like foot: no GPU
-renderer, no tabs, no ligatures, and no async runtime.
+**A terminal worth pouring time into.**
 
-The project is still pre-1.0, but it is already usable as a single-window
-terminal on Wayland.
+A small, fast, Wayland-native terminal emulator written in Rust drawn entirely
+on the CPU, with no GPU pipeline, no tabs, no ligatures, and no async runtime to
+get in the way.
 
-## Features
+## Why another terminal?
 
-- Software-rendered Wayland window with server-side decoration negotiation.
-- PTY-backed login shell with resize propagation through `TIOCSWINSZ`.
-- VT parsing through `vte`, including cursor movement, erase/edit operations,
-  scroll regions, alternate screen, SGR attributes, truecolor, 256-color, OSC
-  palette/theme escapes, title updates, DA/DSR, XTGETTCAP, and synchronized
-  output.
-- Font discovery and rasterization through fontconfig and FreeType, including
-  fallback faces, styled variants, bounded glyph caching, and color emoji.
-- Scrollback with wheel and key scrolling, reflow on resize, and incremental
-  search.
-- Mouse selection with word, line, and rectangular selection; clipboard and
-  primary-selection integration; bracketed paste; OSC 52 set/query.
-- Mouse and focus reporting for terminal applications.
-- TOML configuration with live reload on `SIGUSR1`.
-- Shell integration through OSC 7 and OSC 133 for cwd-aware new windows, prompt
-  jumping, and piping the last command's output.
-- OSC 8 hyperlinks, visible URL hint mode, and OSC 9/777/99 notifications.
+[foot]: https://codeberg.org/dnkl/foot
 
-## Not Implemented Yet
+Most terminals reach for the GPU and a stack of abstractions before they draw a
+single glyph. `beer` goes the other way. It takes its cues from [foot] keep the
+moving parts few, render with the CPU through `wl_shm`, talk to a real PTY, and
+stay out of the way. The result is a terminal that starts instantly, sits
+quietly in the background, and spends its cycles on your shell rather than on
+itself. It is the kind of tool you forget is running which, for a terminal, is
+the highest compliment. Pour one, get to work.
 
-- Daemon/server mode and client mode.
-- Kitty keyboard protocol and Unicode codepoint input mode.
-- Touchscreen input.
-- Conformance and performance hardening passes beyond the current unit tests.
+## Project status
 
-## Build
+`beer` is pre-1.0 but already comfortable as your daily single-window terminal
+on Wayland. It's made clear in documentation about what it does and does not do
+yet, and it would rather do a smaller set of things well than a larger set
+half-heartedly. Feature requests are welcome, but not everything will be
+implemented.
 
-The repository provides a Nix dev shell with the Rust toolchain and native
-Wayland/font dependencies:
+## What's in here
 
-```sh
-# Enter the development shell.
-$ nix develop
+This is a Cargo workspace with two crates:
 
-# Build an optimized local binary.
-$ cargo build --release
-```
+- **[`crates/beer`](crates/beer/README.md)** - the terminal application itself.
+  Start here for the feature list, installation, configuration, and day-to-day
+  use.
+- **[`crates/beer-protocols`](crates/beer-protocols/README.md)** - the reusable,
+  self-documenting building blocks the terminal is made of, and a readable
+  reference for the escape sequences and protocols `beer` speaks.
 
-The Nix package builds the binary, terminfo entry, and man pages:
-
-```sh
-# Build the Nix package.
-$ nix build
-```
-
-## Run
-
-From a Wayland session:
-
-```sh
-# Start Beer from your terminal.
-$ beer
-```
-
-or after a release build:
-
-```sh
-# Run the release binary directly.
-$ ./target/release/beer
-```
-
-Useful flags:
-
-```sh
-# Pass a config file to Beer.
-$ beer --config /path/to/beer.toml
-
-# Check the version with -V or --version.
-$ beer --version
-
-# See the help text.
-$ beer --help
-```
-
-`--server` exists as a future mode switch and currently returns an error.
-
-## Configuration
-
-By default, `beer` reads:
-
-```text
-$XDG_CONFIG_HOME/beer/beer.toml
-```
-
-or, if `XDG_CONFIG_HOME` is unset:
-
-```text
-~/.config/beer/beer.toml
-```
-
-A missing file uses defaults. A malformed file logs a warning and falls back to
-defaults. Unknown keys are ignored for forward compatibility.
-
-Example:
-
-```toml
-[main]
-font = "monospace"
-font-size = 16
-pad-x = 2
-pad-y = 2
-
-[colors]
-background = "#181818"
-foreground = "#c5c8c6"
-alpha = 1.0
-
-[key-bindings]
-"Ctrl+Shift+C" = "copy"
-"Ctrl+Shift+V" = "paste"
-"Ctrl+Shift+F" = "search"
-
-[url]
-launch = ["xdg-open"]
-```
-
-See `doc/beer.toml.5.scd` for the full configuration reference.
-
-## Development
-
-The expected verification set is:
-
-```sh
-# Check Rust formatting.
-$ cargo fmt --all -- --check
-
-# Run Clippy with warnings denied.
-$ cargo clippy --all-targets --all-features -- -D warnings
-
-# Build a release-optimized binary.
-$ cargo build --release
-
-# Run the test suite.
-$ cargo test
-
-# Check dependency policy.
-$ cargo deny check
-
-# Verify the Nix package.
-$ nix build
-```
-
-The code is organized as a single crate with internal modules for the PTY, VT
-model, grid, font pipeline, renderer, input encoding, configuration, and Wayland
-frontend. Keep feature logic in the module that owns the concept; avoid adding
-more state directly to the Wayland event root or the core grid when a focused
-submodule can own it.
+If you just want to run it, head to the
+[application README](crates/beer/README.md). If you are curious how a terminal
+actually talks to the programs inside it, the
+[protocols README](crates/beer-protocols/README.md) is a friendly tour.
 
 ## License
 
-EUPL-1.2.
+[EUPL-1.2](https://joinup.ec.europa.eu/collection/eupl/eupl-text-eupl-12).

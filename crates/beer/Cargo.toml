@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 description = "A fast, software-rendered, Wayland-native terminal emulator"
-readme = true
+readme = "README.md"
 
 [dependencies]
 anyhow = "1.0.102"

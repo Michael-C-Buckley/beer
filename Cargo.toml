@@ -16,5 +16,7 @@ missing_debug_implementations = "warn"
 all = { level = "warn", priority = -1 }
 
 [profile.release]
-lto = "thin"
+opt-level = 3
+lto = "fat"
 codegen-units = 1
+strip = true
