@@ -193,8 +193,9 @@ pub fn parse(control: &[u8]) -> GraphicsCommand {
         let Some(eq) = pair.iter().position(|&b| b == b'=') else {
             continue;
         };
-        let (key, value) = (pair.get(..eq).unwrap_or(&[]), &pair[eq + 1..]);
+        let (key, value) = pair.split_at(eq);
         let [key] = key else { continue };
+        let value = &value[1..];
         let ch = value.first().copied();
         match key {
             b'a' => {
