@@ -115,9 +115,7 @@ impl TextSize {
 /// default (ordinary text).
 pub fn parse(meta: &[u8]) -> TextSize {
     let mut ts = TextSize::default();
-    if meta.is_empty() {
-        return ts;
-    }
+
     for pair in meta.split(|&b| b == b':') {
         let Some(eq) = pair.iter().position(|&b| b == b'=') else {
             continue;
