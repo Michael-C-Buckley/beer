@@ -185,9 +185,18 @@ pub fn kitty_encode(
 
     let bits = kitty_mod_bits(mods);
     let mod_param = bits + 1;
-    // Events other than a press are only reported when asked for.
+    // Events other than a press are only reported when asked for. Without
+    // event reporting, repeats are re-sent as presses (legacy repeat), but a
+    // release must produce nothing. Otherwise a release encodes as a press
+    // and a single tap sends the key twice.
     let events_ok = report_events || report_all;
-    let kind = if events_ok { kind } else { KeyKind::Press };
+    let kind = if events_ok {
+        kind
+    } else if kind == KeyKind::Release {
+        return None;
+    } else {
+        KeyKind::Press
+    };
 
     // Lone modifier keys: only in report-all mode.
     if let Some(code) = modifier_key(event.keysym) {
@@ -214,9 +223,6 @@ pub fn kitty_encode(
                     Keysym::Tab => b"\t".to_vec(),
                     _ => b"\r".to_vec(),
                 });
-            }
-            if kind != KeyKind::Press && !events_ok {
-                return None;
             }
             Some(match func {
                 Func::Number(n) => csi(n.to_string(), mod_param, kind, None, b'u'),
@@ -475,6 +481,32 @@ mod tests {
         assert_eq!(release(0b11), None);
         // Report-all does: CSI 97 ; 5 : 3 u.
         assert_eq!(release(0b1011), Some(b"\x1b[97;5:3u".to_vec()));
+    }
+
+    #[test]
+    fn kitty_release_suppressed_without_event_reporting() {
+        // A release under disambiguate-only (no report-event-types, no
+        // report-all) must not be re-encoded as a press, or a single tap sends
+        // the key twice. Applies to both functional keys and text keys.
+        assert_eq!(
+            kitty_encode(&key(Keysym::Up, None), NONE, 0b1, KeyKind::Release, false),
+            None
+        );
+        assert_eq!(
+            kitty_encode(
+                &key(Keysym::a, Some("a")),
+                NONE,
+                0b1,
+                KeyKind::Release,
+                false
+            ),
+            None
+        );
+        // A repeat is still re-sent as a press (legacy repeat behaviour).
+        assert_eq!(
+            kitty_encode(&key(Keysym::Up, None), NONE, 0b1, KeyKind::Repeat, false),
+            Some(b"\x1b[A".to_vec())
+        );
     }
 
     #[test]
