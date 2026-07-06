@@ -155,7 +155,7 @@ const DEFAULT_W: u32 = 800;
 const DEFAULT_H: u32 = 600;
 
 /// Run a single window until it is closed, returning the shell's exit code.
-pub fn run(config: Config, config_path: Option<std::path::PathBuf>) -> anyhow::Result<ExitCode> {
+pub fn run(config: Config, config_paths: Vec<std::path::PathBuf>) -> anyhow::Result<ExitCode> {
     let conn = Connection::connect_to_env().context("connect to Wayland compositor")?;
     let (globals, event_queue) =
         registry_queue_init(&conn).context("initialize Wayland registry")?;
@@ -277,7 +277,7 @@ pub fn run(config: Config, config_path: Option<std::path::PathBuf>) -> anyhow::R
         session: None,
         title: None,
         config,
-        config_path,
+        config_paths,
         bindings,
         font_size,
         fullscreen: false,
@@ -522,8 +522,8 @@ struct App {
     title: Option<String>,
     /// The active user configuration.
     config: Config,
-    /// Path the config was loaded from, for SIGUSR1 live reload.
-    config_path: Option<std::path::PathBuf>,
+    /// Paths the config was loaded from, for SIGUSR1 live reload and new windows.
+    config_paths: Vec<std::path::PathBuf>,
     /// Resolved key/text bindings.
     bindings: crate::bindings::Bindings,
     /// Current font size in pixels (changed by font-resize bindings).
@@ -919,7 +919,7 @@ impl App {
             }
         };
         let mut cmd = std::process::Command::new(exe);
-        if let Some(path) = self.config_path.as_ref() {
+        for path in &self.config_paths {
             cmd.arg("--config").arg(path);
         }
         if let Some(cwd) = self.session.as_ref().and_then(|s| s.term.cwd()) {
@@ -927,7 +927,8 @@ impl App {
         }
         cmd.stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
+            .stderr(std::process::Stdio::null())
+            .env_remove("BEER_CONFIG");
         if let Err(err) = cmd.spawn() {
             tracing::warn!("spawn new window: {err}");
         }
@@ -972,7 +973,7 @@ impl App {
 
     /// Re-read the config file and apply it in place (SIGUSR1).
     fn reload_config(&mut self) {
-        let new = Config::load(self.config_path.as_deref());
+        let new = Config::load(&self.config_paths);
         self.bindings = crate::bindings::Bindings::from_config(
             &new.key_bindings,
             &new.text_bindings,

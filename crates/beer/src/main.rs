@@ -26,8 +26,9 @@ struct Cli {
     #[pound(long)]
     server: bool,
     /// Path to a config file (default: $XDG_CONFIG_HOME/beer/beer.toml).
+    /// Repeatable; later files take priority over earlier ones.
     #[pound(long)]
-    config: Option<PathBuf>,
+    config: Vec<PathBuf>,
 }
 
 fn main() -> ExitCode {
@@ -60,7 +61,20 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         anyhow::bail!("server mode is not implemented yet");
     }
 
-    let config = Config::load(cli.config.as_deref());
+    let mut paths: Vec<PathBuf> = cli.config;
+
+    if let Some(env) = std::env::var_os("BEER_CONFIG").filter(|s| !s.is_empty()) {
+        let extra: Vec<PathBuf> = std::env::split_paths(&env).collect();
+        if extra.is_empty() {
+            paths.push(PathBuf::from(&env));
+        }
+        // BEER_CONFIG paths are lower priority than --config; insert at front.
+        let mut combined = extra;
+        combined.append(&mut paths);
+        paths = combined;
+    }
+
+    let config = Config::load(&paths);
     tracing::info!("starting beer");
-    wayland::run(config, cli.config)
+    wayland::run(config, paths)
 }

@@ -2,7 +2,7 @@
 //! deserialized into a typed [`Config`]. A missing file uses defaults; a
 //! malformed one warns and falls back to defaults rather than failing to start.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde::Deserialize;
 
@@ -193,43 +193,92 @@ impl Default for Scrollback {
 }
 
 impl Config {
-    /// Load configuration from `explicit` if given, else the default path.
-    /// Any read/parse failure logs a warning and returns defaults.
-    pub fn load(explicit: Option<&Path>) -> Self {
-        let Some(path) = explicit.map(Path::to_path_buf).or_else(default_path) else {
-            return Self::default();
+    /// Load configuration from `paths`, merging later files over earlier ones.
+    /// When `paths` is empty, falls back to the default config path.
+    /// Any read/parse failure in a file logs a warning and skips that file.
+    pub fn load(paths: &[PathBuf]) -> Self {
+        let resolved = if paths.is_empty() {
+            match default_path().filter(|p| p.exists()) {
+                Some(p) => vec![p],
+                None => return Self::default(),
+            }
+        } else {
+            paths.to_vec()
         };
-        if !path.exists() {
-            return Self::default();
+
+        // Read + parse + report-unknown-keys in a single pass per file so each
+        // file hits disk only once. Parse errors skip the file; unknown-key
+        // warnings are best-effort (deserialization failures in serde_ignored
+        // mean only the unknown-key check is lost, not the actual config load).
+        let mut merged = toml::Value::Table(toml::Table::new());
+        for path in &resolved {
+            let text = match std::fs::read_to_string(path) {
+                Ok(t) => t,
+                Err(err) => {
+                    tracing::warn!("read config {}: {err}; skipping", path.display());
+                    continue;
+                }
+            };
+            report_unknown_keys(&text, path);
+            let value = match text.parse::<toml::Value>() {
+                Ok(v) => v,
+                Err(err) => {
+                    tracing::warn!("config {}: {err}; skipping", path.display());
+                    continue;
+                }
+            };
+            deep_merge(&mut merged, &value);
         }
-        let text = match std::fs::read_to_string(&path) {
-            Ok(text) => text,
+
+        let serialized = toml::to_string(&merged).unwrap_or_default();
+        let config = match toml::from_str(&serialized) {
+            Ok(c) => c,
             Err(err) => {
-                tracing::warn!("read config {}: {err}; using defaults", path.display());
+                tracing::warn!("config deserialize: {err}; using defaults");
                 return Self::default();
             }
         };
-        // Deserialize through serde_ignored so a typo'd key (`font-sze`) is
-        // reported instead of silently dropped, while still loading: unknown
-        // keys stay tolerated, keeping forward-compatibility with newer configs.
-        let de = match toml::Deserializer::parse(&text) {
-            Ok(de) => de,
-            Err(err) => {
-                tracing::warn!("config {}: {err}; using defaults", path.display());
-                return Self::default();
+        tracing::info!("loaded config from {} file(s)", resolved.len());
+        config
+    }
+}
+
+/// Deep-merge `overlay` into `base`. Tables are merged recursively; every
+/// other value type is replaced outright (last write wins).
+fn deep_merge(base: &mut toml::Value, overlay: &toml::Value) {
+    match (base, overlay) {
+        (toml::Value::Table(base), toml::Value::Table(overlay)) => {
+            for (k, v) in overlay {
+                match base.get_mut(k) {
+                    Some(existing) => deep_merge(existing, v),
+                    None => {
+                        base.insert(k.clone(), v.clone());
+                    }
+                }
             }
-        };
-        match serde_ignored::deserialize(de, |key| {
-            tracing::warn!("config {}: unknown key `{key}` ignored", path.display());
-        }) {
-            Ok(config) => {
-                tracing::info!("loaded config from {}", path.display());
-                config
-            }
-            Err(err) => {
-                tracing::warn!("config {}: {err}; using defaults", path.display());
-                Self::default()
-            }
+        }
+        (base, overlay) => *base = overlay.clone(),
+    }
+}
+
+/// Parse `text` through `serde_ignored` with `Config` as the target so a typo'd
+/// key (`font-sze`) is reported instead of silently dropped, while still loading
+/// so unknown keys remain tolerated for forward-compatibility.
+fn report_unknown_keys(text: &str, path: &std::path::Path) {
+    let de = match toml::Deserializer::parse(text) {
+        Ok(de) => de,
+        Err(_) => return,
+    };
+    match serde_ignored::deserialize(de, |key| {
+        tracing::warn!("config {}: unknown key `{key}` ignored", path.display());
+    })
+    .map(|_: Config| ()) {
+        Ok(()) => {}
+        Err(err) => {
+            tracing::warn!(
+                "config {}: unknown-key check failed ({err}); typo warnings may be missing",
+                path.display(),
+            );
         }
     }
 }
