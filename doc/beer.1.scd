@@ -21,8 +21,11 @@ search, mouse selection, and clipboard integration.
 	Run as a daemon hosting multiple windows. (Not yet implemented.)
 
 *--config* _PATH_
-	Load configuration from _PATH_ instead of the default location (see
-	*FILES*).
+	Load configuration from _PATH_ on top of the defaults. Repeatable; when
+	given more than once, later files override keys from earlier ones and
+	have higher priority than files listed in *BEER_CONFIG* (see
+	*ENVIRONMENT*). Without any *--config* flags, the default location is
+	used (see *FILES*).
 
 *-h*, *--help*
 	Print usage and exit.
@@ -102,6 +105,11 @@ notifications via *OSC 9*, *OSC 777*, and *OSC 99*.
 
 *TERM*
 	Set to the configured terminal name (default _beer_) for the child.
+
+*BEER_CONFIG*
+	A colon-separated list of config file paths, like *PATH*. These are
+	lower priority than paths given via *--config* so explicit flags always
+	win. Empty elements are ignored.
 
 *BEER_LOG*
 	Log filter, in the _tracing_ env-filter syntax (e.g. _debug_).

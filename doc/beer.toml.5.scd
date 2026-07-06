@@ -8,7 +8,9 @@ beer.toml - configuration file for _beer_(1)
 
 *beer* reads a TOML configuration file from
 _$XDG_CONFIG_HOME/beer/beer.toml_, falling back to
-_~/.config/beer/beer.toml_, or from the path given to *--config*. A missing
+_~/.config/beer/beer.toml_. The *--config* flag (repeatable, later files
+override earlier ones) and the *BEER_CONFIG* environment variable (colon-
+separated paths, lowest priority) can supply additional files. A missing
 file uses the built-in defaults; a malformed file is reported and the defaults
 are used. Unknown keys are ignored, so a file written for a newer *beer* still
 loads.
