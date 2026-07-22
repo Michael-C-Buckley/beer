@@ -1,0 +1,51 @@
+[package]
+name    = "beer-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Fuzz targets need a nightly toolchain and the sanitizer runtime, so they must
+# *not* be pulled into the normal build, test, or `cargo deny` runs.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys  = "0.4.13"
+beer-protocols = { path = "../crates/beer-protocols" }
+
+[[bin]]
+name  = "base64_decode"
+path  = "fuzz_targets/base64_decode.rs"
+test  = false
+doc   = false
+bench = false
+
+[[bin]]
+name  = "hex_decode"
+path  = "fuzz_targets/hex_decode.rs"
+test  = false
+doc   = false
+bench = false
+
+[[bin]]
+name  = "file_uri"
+path  = "fuzz_targets/file_uri.rs"
+test  = false
+doc   = false
+bench = false
+
+[[bin]]
+name  = "graphics_parse"
+path  = "fuzz_targets/graphics_parse.rs"
+test  = false
+doc   = false
+bench = false
+
+[[bin]]
+name  = "text_size_parse"
+path  = "fuzz_targets/text_size_parse.rs"
+test  = false
+doc   = false
+bench = false
