@@ -29,6 +29,7 @@ impl Pty {
         cell: (u16, u16),
         term: &str,
         cwd: Option<&Path>,
+        env: &[(String, String)],
     ) -> anyhow::Result<Self> {
         let master = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC)
             .context("open pty master")?;
@@ -53,20 +54,25 @@ impl Pty {
 
         let mut cmd = Command::new(&shell);
         cmd.arg0(&argv0)
-            .env("TERM", term)
-            // Advertise Kitty graphics protocol compatibility. Yazi (and other
-            // clients) gate `kgp` vs `kgp_old` on recognising the terminal
-            // brand; KITTY_WINDOW_ID is the env check they use for Kitty.
-            .env("KITTY_WINDOW_ID", process::id().to_string())
-            .env_remove("COLUMNS")
-            .env_remove("LINES")
-            .env_remove("TERMCAP")
             .stdin(Stdio::from(stdin))
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr));
         if let Some(dir) = cwd {
             cmd.current_dir(dir);
         }
+        // A daemon client forwards its environment; apply it first so the child
+        // sees the client's session, then let beer's own invariants win over it.
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        cmd.env("TERM", term)
+            // Advertise Kitty graphics protocol compatibility. Yazi (and other
+            // clients) gate `kgp` vs `kgp_old` on recognising the terminal
+            // brand; KITTY_WINDOW_ID is the env check they use for Kitty.
+            .env("KITTY_WINDOW_ID", process::id().to_string())
+            .env_remove("COLUMNS")
+            .env_remove("LINES")
+            .env_remove("TERMCAP");
 
         // SAFETY: setsid and the TIOCSCTTY ioctl are async-signal-safe raw
         // syscalls; ctty is a valid fd captured by move. We touch no parent

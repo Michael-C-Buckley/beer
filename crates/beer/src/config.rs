@@ -160,6 +160,9 @@ pub struct Main {
     /// Hold an idle inhibitor while the window is focused, so the compositor
     /// does not blank the screen or start the screensaver. Default off.
     pub idle_inhibit: bool,
+    /// Keep a `--server` process alive after its last window closes. Off makes
+    /// the server exit with its last window, like a standalone process.
+    pub server_resident: bool,
 }
 
 impl Default for Main {
@@ -174,6 +177,7 @@ impl Default for Main {
             pad_y: 2,
             word_delimiters: None,
             idle_inhibit: false,
+            server_resident: true,
         }
     }
 }

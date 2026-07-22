@@ -5,6 +5,7 @@ mod config;
 mod font;
 mod graphics;
 mod grid;
+mod ipc;
 mod pty;
 mod render;
 mod theme;
@@ -25,6 +26,9 @@ struct Cli {
     /// Run as a daemon hosting multiple windows.
     #[pound(long)]
     server: bool,
+    /// Always run a private window, never connect to a running server.
+    #[pound(long)]
+    no_daemon: bool,
     /// Path to a config file (default: $XDG_CONFIG_HOME/beer/beer.toml).
     /// Repeatable; later files take priority over earlier ones.
     #[pound(long)]
@@ -57,24 +61,38 @@ fn init_logging() {
 }
 
 fn run(cli: Cli) -> anyhow::Result<ExitCode> {
-    if cli.server {
-        anyhow::bail!("server mode is not implemented yet");
+    // A plain `beer` prefers a running server: forward the request and mirror the
+    // window's exit status. `--no-daemon` and `--server` opt out.
+    if !cli.server && !cli.no_daemon {
+        let req = ipc::OpenRequest {
+            cwd: std::env::current_dir()
+                .ok()
+                .map(|p| p.to_string_lossy().into_owned()),
+            env: std::env::vars().collect(),
+        };
+        match ipc::run_client(&req) {
+            Ok(code) => return Ok(ExitCode::from(code)),
+            // No server (or it went away mid-handshake): run our own window.
+            Err(err) => tracing::debug!("no server, running standalone: {err}"),
+        }
     }
 
-    let mut paths: Vec<PathBuf> = cli.config;
+    let paths = config_paths(cli.config);
+    let config = Config::load(&paths);
+    tracing::info!(server = cli.server, "starting beer");
+    wayland::run(config, paths, cli.server)
+}
 
+/// Merge `--config` paths with `$BEER_CONFIG` (the env paths rank lower).
+fn config_paths(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
     if let Some(env) = std::env::var_os("BEER_CONFIG").filter(|s| !s.is_empty()) {
         let extra: Vec<PathBuf> = std::env::split_paths(&env).collect();
         if extra.is_empty() {
             paths.push(PathBuf::from(&env));
         }
-        // BEER_CONFIG paths are lower priority than --config; insert at front.
         let mut combined = extra;
         combined.append(&mut paths);
         paths = combined;
     }
-
-    let config = Config::load(&paths);
-    tracing::info!("starting beer");
-    wayland::run(config, paths)
+    paths
 }

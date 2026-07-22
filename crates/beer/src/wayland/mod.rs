@@ -6,10 +6,11 @@
 mod handlers;
 mod rendering;
 
-use std::fs::File;
-use std::io::{Read as _, Write as _};
+use std::fs::{self, File};
+use std::io::{ErrorKind, Read as _, Write as _};
 use std::num::NonZeroU16;
 use std::os::fd::OwnedFd;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -24,6 +25,7 @@ use calloop_wayland_source::WaylandSource;
 
 use crate::config::Config;
 use crate::font::Fonts;
+use crate::ipc;
 use crate::grid::{Cell, CursorShape, Grid, MouseProtocol, UrlHit};
 use crate::pty::Pty;
 use crate::render::Renderer;
@@ -156,7 +158,12 @@ const DEFAULT_W: u32 = 800;
 const DEFAULT_H: u32 = 600;
 
 /// Run a single window until it is closed, returning the shell's exit code.
-pub fn run(config: Config, config_paths: Vec<std::path::PathBuf>) -> anyhow::Result<ExitCode> {
+pub fn run(
+    config: Config,
+    config_paths: Vec<std::path::PathBuf>,
+    server: bool,
+) -> anyhow::Result<ExitCode> {
+    let resident = config.main.server_resident;
     let conn = Connection::connect_to_env().context("connect to Wayland compositor")?;
     let (globals, event_queue) =
         registry_queue_init(&conn).context("initialize Wayland registry")?;
@@ -234,12 +241,19 @@ pub fn run(config: Config, config_paths: Vec<std::path::PathBuf>) -> anyhow::Res
         windows: Vec::new(),
         focused_window: 0,
         next_window_id: 1,
+        resident,
     };
 
-    // The initial window. The PTY spawns on its first configure, once the real
-    // window size is known, so the shell starts at the final size and is not hit
-    // by a startup SIGWINCH storm that makes it reprint its prompt.
-    app.open_window(None);
+    // A server opens no window at startup; it waits for client connections. A
+    // standalone process opens its one window now. The PTY spawns on the first
+    // configure, once the real size is known, so the shell starts at the final
+    // size and is not hit by a startup SIGWINCH storm that reprints its prompt.
+    let socket = if server {
+        Some(bind_server_socket(&event_loop)?)
+    } else {
+        app.open_window(None, Vec::new(), None);
+        None
+    };
 
     // Toggle the blink phase on a timer so blinking text and cursors animate.
     let blink = Timer::from_duration(Duration::from_millis(BLINK_MS));
@@ -315,7 +329,65 @@ pub fn run(config: Config, config_paths: Vec<std::path::PathBuf>) -> anyhow::Res
             }
         }
     }
+    // Remove the listening socket so a later server can bind the same path.
+    if let Some(path) = socket {
+        let _ = fs::remove_file(path);
+    }
     Ok(app.exit_code)
+}
+
+/// Bind the daemon socket and register a calloop source that opens a window per
+/// client connection. Returns the socket path so the caller can unlink it on
+/// exit.
+///
+/// # Errors
+///
+/// Fails if another server already owns the socket, or if binding or
+/// registering the listener fails.
+fn bind_server_socket(event_loop: &EventLoop<App>) -> anyhow::Result<PathBuf> {
+    let path = ipc::socket_path();
+    // A connectable socket means a live server already owns this display; a
+    // dangling one is stale and safe to replace.
+    if UnixStream::connect(&path).is_ok() {
+        anyhow::bail!("a beer server is already running at {}", path.display());
+    }
+    let _ = fs::remove_file(&path);
+    let listener =
+        UnixListener::bind(&path).with_context(|| format!("bind socket {}", path.display()))?;
+    listener
+        .set_nonblocking(true)
+        .context("set socket non-blocking")?;
+
+    let source = Generic::new(listener, Interest::READ, Mode::Level);
+    event_loop
+        .handle()
+        .insert_source(source, |_, listener, app: &mut App| {
+            // Drain every pending connection; the listener is level-triggered.
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        // The request is a small frame sent right after connect,
+                        // so a brief blocking read of it is fine.
+                        let _ = stream.set_nonblocking(false);
+                        match ipc::read_request(&mut stream) {
+                            Ok(req) => {
+                                let cwd = req.cwd.map(PathBuf::from);
+                                app.open_window(cwd, req.env, Some(stream));
+                            }
+                            Err(err) => tracing::warn!("bad client request: {err}"),
+                        }
+                    }
+                    Err(err) if err.kind() == ErrorKind::WouldBlock => break,
+                    Err(err) => {
+                        tracing::warn!("accept client: {err}");
+                        break;
+                    }
+                }
+            }
+            Ok(PostAction::Continue)
+        })
+        .map_err(|e| anyhow::anyhow!("register socket source: {e}"))?;
+    Ok(path)
 }
 
 /// Bind a singleton global at version 1 with `()` user-data, or `None` if the
@@ -429,6 +501,12 @@ struct Window {
     /// Directory the shell starts in, seeded when the session spawns; a new
     /// window inherits the focused window's reported cwd.
     pending_cwd: Option<PathBuf>,
+    /// Environment for the shell, seeded when the session spawns. Non-empty only
+    /// for windows opened by a daemon client, which forwards its environment.
+    pending_env: Vec<(String, String)>,
+    /// Daemon client that requested this window, notified with the exit status
+    /// when it closes. `None` for the initial and in-process windows.
+    client: Option<UnixStream>,
     /// Calloop token for the PTY read source, removed on teardown.
     pty_token: Option<RegistrationToken>,
     /// Last title applied to the toplevel, to avoid redundant requests.
@@ -557,6 +635,9 @@ struct App {
     focused_window: usize,
     /// Next window id to hand out; increases monotonically.
     next_window_id: u64,
+    /// A server stays alive after its last window closes; a standalone process
+    /// exits with the shell. Set from `[main] server-resident`.
+    resident: bool,
 }
 
 impl App {
@@ -582,8 +663,14 @@ impl App {
 
     /// Create a new toplevel surface and its per-window state, returning its id.
     /// The session spawns on the first configure (unchanged), so the shell starts
-    /// at the final size; `cwd` seeds the child's working directory then.
-    fn open_window(&mut self, cwd: Option<PathBuf>) -> WindowId {
+    /// at the final size; `cwd`/`env` seed the child then, and `client` is the
+    /// daemon connection to notify with the exit status when the window closes.
+    fn open_window(
+        &mut self,
+        cwd: Option<PathBuf>,
+        env: Vec<(String, String)>,
+        client: Option<UnixStream>,
+    ) -> WindowId {
         let id = self.alloc_window_id();
         let surface = self.compositor.create_surface(&self.qh);
         let window =
@@ -654,6 +741,8 @@ impl App {
             scale120: 120,
             session: None,
             pending_cwd: cwd,
+            pending_env: env,
+            client,
             pty_token: None,
             title: None,
             fullscreen: false,
@@ -710,12 +799,19 @@ impl App {
             win.flash_timer.take(),
             win.sync_timeout.take(),
         ];
+        // A client still waiting on this window (e.g. the user closed the toplevel
+        // rather than the shell exiting) gets a success status. The child-exit
+        // path takes the client first, so it is already `None` there.
+        if let Some(client) = win.client.take() {
+            ipc::send_exit(client, 0);
+        }
         for token in tokens.into_iter().flatten() {
             self.loop_handle.remove(token);
         }
         self.windows.remove(idx);
+        // A resident server keeps running with no windows, waiting for clients.
         if self.windows.is_empty() {
-            self.exit = true;
+            self.exit = !self.resident;
         } else if self.focused_window >= self.windows.len() {
             self.focused_window = 0;
         }
@@ -728,11 +824,20 @@ impl App {
         let cell = (m.width as u16, m.height as u16);
         let id = self.windows[idx].id;
         let cwd = self.windows[idx].pending_cwd.clone();
-        let pty = match Pty::spawn(cols, rows, cell, &self.config.main.term, cwd.as_deref()) {
+        let env = std::mem::take(&mut self.windows[idx].pending_env);
+        let pty = match Pty::spawn(
+            cols,
+            rows,
+            cell,
+            &self.config.main.term,
+            cwd.as_deref(),
+            &env,
+        ) {
             Ok(pty) => pty,
             Err(err) => {
+                // Close just this window; a resident server keeps its others.
                 tracing::error!("spawn shell: {err:#}");
-                self.exit = true;
+                self.close_window(id);
                 return;
             }
         };
@@ -740,7 +845,7 @@ impl App {
             Ok(fd) => fd,
             Err(err) => {
                 tracing::error!("clone pty master: {err}");
-                self.exit = true;
+                self.close_window(id);
                 return;
             }
         };
@@ -782,7 +887,7 @@ impl App {
             Ok(token) => self.windows[idx].pty_token = Some(token),
             Err(err) => {
                 tracing::error!("register pty in event loop: {err}");
-                self.exit = true;
+                self.close_window(id);
                 return;
             }
         }
@@ -1089,7 +1194,9 @@ impl App {
             .as_ref()
             .and_then(|s| s.term.cwd())
             .map(PathBuf::from);
-        self.open_window(cwd);
+        // In-process windows inherit this process's environment and have no
+        // client to report an exit status to.
+        self.open_window(cwd, Vec::new(), None);
     }
 
     /// Send `count` cursor-up/down keys to the shell for alternate-scroll,
@@ -1917,9 +2024,7 @@ impl App {
                         data.extend_from_slice(&tmp[..n]);
                         PostAction::Continue
                     }
-                    Err(e) if matches!(e.kind(), std::io::ErrorKind::Interrupted) => {
-                        PostAction::Continue
-                    }
+                    Err(e) if matches!(e.kind(), ErrorKind::Interrupted) => PostAction::Continue,
                     Err(e) => {
                         tracing::warn!("read paste pipe: {e}");
                         PostAction::Remove
@@ -2119,20 +2224,28 @@ impl App {
             return;
         };
         let last = self.windows.len() == 1;
+        let mut code: u8 = 0;
         if let Some(session) = self.windows[idx].session.as_mut() {
             match session.pty.wait() {
                 Ok(status) => {
                     tracing::info!("shell exited: {status}");
                     // Mirror the shell's status: its code, or 128+signal if killed.
-                    if last {
-                        let code = status
-                            .code()
-                            .unwrap_or_else(|| 128 + status.signal().unwrap_or(0));
-                        self.exit_code = ExitCode::from(code as u8);
-                    }
+                    code = status
+                        .code()
+                        .unwrap_or_else(|| 128 + status.signal().unwrap_or(0))
+                        as u8;
                 }
                 Err(err) => tracing::warn!("reap shell: {err}"),
             }
+        }
+        // A standalone process returns the shell's status as its own.
+        if last {
+            self.exit_code = ExitCode::from(code);
+        }
+        // Report the real status to the daemon client that opened this window
+        // before close_window, which would otherwise send a default success.
+        if let Some(client) = self.windows[idx].client.take() {
+            ipc::send_exit(client, code);
         }
         self.close_window(id);
     }
