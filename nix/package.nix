@@ -30,6 +30,7 @@ in
           (s + /Cargo.toml)
           (s + /terminfo)
           (s + /doc)
+          (s + /contrib)
         ];
       };
 
@@ -62,7 +63,15 @@ in
       # Generate the man pages from their scdoc sources.
       scdoc < doc/beer.1.scd > beer.1
       scdoc < doc/beer.toml.5.scd > beer.toml.5
-      installManPage beer.1 beer.toml.5
+      scdoc < doc/beer-themes.7.scd > beer-themes.7
+      installManPage beer.1 beer.toml.5 beer-themes.7
+
+      # Desktop entry, scalable icon, and a commented example config.
+      install -Dm644 contrib/dev.notashelf.beer.desktop \
+        "$out/share/applications/dev.notashelf.beer.desktop"
+      install -Dm644 contrib/dev.notashelf.beer.svg \
+        "$out/share/icons/hicolor/scalable/apps/dev.notashelf.beer.svg"
+      install -Dm644 contrib/beer.toml "$out/share/doc/beer/beer.toml.example"
 
       wrapProgram "$out/bin/beer" \
         --prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath [wayland libxkbcommon]}
