@@ -11,7 +11,9 @@ impl CompositorHandler for App {
     ) {
         // Integer fallback for compositors without fractional-scale-v1; ignored
         // when the fractional-scale object drives the scale instead.
-        let idx = self.window_index(surface).unwrap_or(self.focused_window);
+        let Some(idx) = self.window_index(surface).or_else(|| self.focused_index()) else {
+            return;
+        };
         if self.windows[idx].fractional_scale.is_none() {
             self.set_scale(idx, (factor.max(1) as u32) * 120);
         }
@@ -35,7 +37,9 @@ impl CompositorHandler for App {
     ) {
         // The compositor is ready for another frame; `flush` will repaint if the
         // grid has changed since the last present.
-        let idx = self.window_index(surface).unwrap_or(self.focused_window);
+        let Some(idx) = self.window_index(surface).or_else(|| self.focused_index()) else {
+            return;
+        };
         self.windows[idx].frame_pending = false;
     }
 
@@ -76,9 +80,12 @@ impl WindowHandler for App {
         configure: WindowConfigure,
         _serial: u32,
     ) {
-        let idx = self
+        let Some(idx) = self
             .window_index(window.wl_surface())
-            .unwrap_or(self.focused_window);
+            .or_else(|| self.focused_index())
+        else {
+            return;
+        };
         if let (Some(w), Some(h)) = configure.new_size {
             self.windows[idx].width = w.get();
             self.windows[idx].height = h.get();
@@ -193,7 +200,9 @@ impl SeatHandler for App {
                 if let Some(touch) = s.touch.take() {
                     touch.release();
                 }
-                self.windows[self.focused_window].touch_scroll = None;
+                if let Some(idx) = self.focused_index() {
+                    self.windows[idx].touch_scroll = None;
+                }
             }
             _ => {}
         }
@@ -218,7 +227,9 @@ impl KeyboardHandler for App {
     ) {
         self.activate_keyboard(keyboard);
         self.serial = serial;
-        let idx = self.window_index(surface).unwrap_or(self.focused_window);
+        let Some(idx) = self.window_index(surface).or_else(|| self.focused_index()) else {
+            return;
+        };
         self.focused_window = idx;
         self.windows[idx].focused = true;
         self.sync_idle_inhibit();
@@ -234,7 +245,9 @@ impl KeyboardHandler for App {
         surface: &wl_surface::WlSurface,
         _: u32,
     ) {
-        let idx = self.window_index(surface).unwrap_or(self.focused_window);
+        let Some(idx) = self.window_index(surface).or_else(|| self.focused_index()) else {
+            return;
+        };
         self.windows[idx].focused = false;
         self.sync_idle_inhibit();
         // Drop held-key state so a key released while unfocused can't leak a
@@ -370,7 +383,9 @@ impl PointerHandler for App {
         events: &[PointerEvent],
     ) {
         self.activate_pointer(pointer);
-        let idx = self.focused_window;
+        let Some(idx) = self.focused_index() else {
+            return;
+        };
         let cell_h = f64::from(self.renderer.metrics().height);
         for event in events {
             match &event.kind {
@@ -502,7 +517,9 @@ impl TouchHandler for App {
         id: i32,
         position: (f64, f64),
     ) {
-        let idx = self.window_index(&surface).unwrap_or(self.focused_window);
+        let Some(idx) = self.window_index(&surface).or_else(|| self.focused_index()) else {
+            return;
+        };
         if self.windows[idx].touch_scroll.is_none() {
             self.windows[idx].touch_scroll = Some(TouchScroll {
                 id,
@@ -521,7 +538,9 @@ impl TouchHandler for App {
         _time: u32,
         id: i32,
     ) {
-        let idx = self.focused_window;
+        let Some(idx) = self.focused_index() else {
+            return;
+        };
         if self.windows[idx]
             .touch_scroll
             .as_ref()
@@ -540,7 +559,9 @@ impl TouchHandler for App {
         id: i32,
         position: (f64, f64),
     ) {
-        let idx = self.focused_window;
+        let Some(idx) = self.focused_index() else {
+            return;
+        };
         let cell_h = self.renderer.metrics().height as f64;
         let win = &mut self.windows[idx];
         let Some(touch) = win.touch_scroll.as_mut().filter(|t| t.id == id) else {
@@ -582,7 +603,9 @@ impl TouchHandler for App {
     }
 
     fn cancel(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_touch::WlTouch) {
-        self.windows[self.focused_window].touch_scroll = None;
+        if let Some(idx) = self.focused_index() {
+            self.windows[idx].touch_scroll = None;
+        }
     }
 }
 
@@ -842,9 +865,8 @@ impl ActivationHandler for App {
 
     fn new_token(&mut self, token: String, _: &RequestData) {
         // The compositor granted an activation token; use it to draw attention.
-        if let Some(activation) = self.activation.as_ref() {
-            activation
-                .activate::<App>(self.windows[self.focused_window].window.wl_surface(), token);
+        if let (Some(activation), Some(idx)) = (self.activation.as_ref(), self.focused_index()) {
+            activation.activate::<App>(self.windows[idx].window.wl_surface(), token);
         }
     }
 }

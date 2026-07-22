@@ -649,6 +649,13 @@ impl App {
             .position(|w| w.window.wl_surface() == surface)
     }
 
+    /// The focused window's index, or `None` when there are no windows (a server
+    /// idles windowless until a client connects). Handlers bail on `None` rather
+    /// than index an empty `windows`.
+    fn focused_index(&self) -> Option<usize> {
+        (self.focused_window < self.windows.len()).then_some(self.focused_window)
+    }
+
     /// Allocate a fresh, never-reused window id.
     fn alloc_window_id(&mut self) -> WindowId {
         let id = WindowId(self.next_window_id);
@@ -908,7 +915,9 @@ impl App {
     /// text bindings, else the byte encoding sent to the shell (which snaps the
     /// viewport back to the live screen).
     fn handle_key(&mut self, event: &KeyEvent) {
-        let idx = self.focused_window;
+        let Some(idx) = self.focused_index() else {
+            return;
+        };
         // A new arrival of a held key is a repeat; otherwise a fresh press.
         let kind = if self.windows[idx].keys_down.insert(event.raw_code) {
             beer_protocols::key::KeyKind::Press
@@ -956,7 +965,9 @@ impl App {
     /// Handle a key release: only the kitty keyboard protocol cares, and only
     /// when it has asked for event reporting.
     fn handle_key_release(&mut self, event: &KeyEvent) {
-        let idx = self.focused_window;
+        let Some(idx) = self.focused_index() else {
+            return;
+        };
         self.windows[idx].keys_down.remove(&event.raw_code);
         let (app_cursor, kitty) = self.windows[idx].session.as_ref().map_or((false, 0), |s| {
             (s.term.grid().app_cursor(), s.term.grid().kitty_flags())
