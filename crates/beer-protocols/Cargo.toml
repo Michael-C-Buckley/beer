@@ -1,17 +1,25 @@
 [package]
-name = "beer-protocols"
-version.workspace = true
-edition.workspace = true
+name                   = "beer-protocols"
+description            = "Terminal protocol codecs and key/mouse wire encoders used by beer"
+version.workspace      = true
+edition.workspace      = true
 rust-version.workspace = true
-license.workspace = true
-description = "Terminal protocol codecs and key/mouse wire encoders used by beer"
-readme = "README.md"
+license.workspace      = true
+readme                 = true
 
 [dependencies]
 # Provides the keyboard vocabulary (Keysym, Modifiers, KeyEvent) the key
-# encoder consumes. The version comes from [workspace.dependencies] so it is
-# always the same as beer's and the types unify to a single definition.
+# encoder consumes.
 smithay-client-toolkit.workspace = true
+
+[dev-dependencies]
+criterion = { version = "0.8.2", default-features = false, features = [
+  "cargo_bench_support",
+] }
+
+[[bench]]
+name    = "protocols"
+harness = false
 
 [lints]
 workspace = true
