@@ -1,16 +1,16 @@
 [workspace]
 resolver = "3"
-members = ["crates/beer", "crates/beer-protocols"]
+members  = ["crates/beer", "crates/beer-protocols"]
 
 [workspace.package]
-version = "0.5.4"
-edition = "2024"
+version      = "0.5.5"
+edition      = "2024"
 rust-version = "1.95.0"
-license = "EUPL-1.2"
+license      = "EUPL-1.2"
 
 [workspace.dependencies]
 # Workspace components
-beer-protocols = { path = "crates/beer-protocols", version = "0.5.4" }
+beer-protocols = { path = "crates/beer-protocols", version = "0.5.5" }
 
 # Other dependencies
 anyhow = "1.0.102"
@@ -55,14 +55,14 @@ wayland-protocols = { version = "0.32.13", features = [
 ] }
 
 [workspace.lints.rust]
-unsafe_op_in_unsafe_fn = "deny"
+unsafe_op_in_unsafe_fn        = "deny"
 missing_debug_implementations = "warn"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
 
 [profile.release]
-opt-level = 3
-lto = "fat"
+opt-level     = 3
+lto           = "fat"
 codegen-units = 1
-strip = true
+strip         = true
