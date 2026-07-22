@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=beer
+GenericName=Terminal
+Comment=A fast, software-rendered, Wayland-native terminal emulator
+TryExec=beer
+Exec=beer
+Icon=dev.notashelf.beer
+Terminal=false
+StartupNotify=true
+StartupWMClass=dev.notashelf.beer
+Categories=System;TerminalEmulator;
+Keywords=shell;prompt;command;commandline;cmd;
