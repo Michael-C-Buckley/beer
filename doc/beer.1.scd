@@ -18,7 +18,12 @@ search, mouse selection, and clipboard integration.
 # OPTIONS
 
 *--server*
-	Run as a daemon hosting multiple windows. (Not yet implemented.)
+	Run as a daemon: a single process that hosts many windows over a Unix
+	socket (see *DAEMON MODE*).
+
+*--no-daemon*
+	Always open a private, standalone window; never connect to or start a
+	server. Without this flag a plain *beer* prefers a running server.
 
 *--config* _PATH_
 	Load configuration from _PATH_ on top of the defaults. Repeatable; when
@@ -98,6 +103,28 @@ With a shell configured to emit them, *beer* tracks the working directory
 and piping the last command's output. Applications may raise desktop
 notifications via *OSC 9*, *OSC 777*, and *OSC 99*.
 
+# DAEMON MODE
+
+*beer --server* runs one process that hosts many windows, sharing a single
+Wayland connection and glyph cache. It listens on a Unix socket at
+_$XDG_RUNTIME_DIR/beer-$WAYLAND_DISPLAY.sock_.
+
+A plain *beer* (without *--server* or *--no-daemon*) is the client: it forwards
+its working directory and environment to a running server, which opens a window
+there, and it mirrors that window's exit status. If no server is running it
+falls back to a standalone window, so the same command works with or without a
+daemon. *--no-daemon* forces the standalone path.
+
+Whether the server keeps running after its last window closes is set by
+*server-resident* in _beer.toml_(5); by default it stays resident.
+
+# GRAPHICS AND TEXT SIZING
+
+*beer* implements the kitty graphics protocol (inline raster images via the
+*APC* _G_ transmission, placements, animation, and Unicode placeholders) and the
+kitty text-sizing protocol (*OSC 66*), which scales a run of text across a block
+of cells. It does not implement sixel.
+
 # ENVIRONMENT
 
 *SHELL*
@@ -105,6 +132,10 @@ notifications via *OSC 9*, *OSC 777*, and *OSC 99*.
 
 *TERM*
 	Set to the configured terminal name (default _beer_) for the child.
+
+*KITTY_WINDOW_ID*
+	Set for the child process to the window's numeric id, so programs that key
+	off it (kitty graphics placeholders) have a stable per-window handle.
 
 *BEER_CONFIG*
 	A colon-separated list of config file paths, like *PATH*. These are
@@ -127,4 +158,4 @@ _$XDG_CONFIG_HOME/beer/beer.toml_
 
 # SEE ALSO
 
-_beer.toml_(5)
+_beer.toml_(5), _beer-themes_(7)
