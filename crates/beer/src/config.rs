@@ -272,7 +272,8 @@ fn report_unknown_keys(text: &str, path: &std::path::Path) {
     match serde_ignored::deserialize(de, |key| {
         tracing::warn!("config {}: unknown key `{key}` ignored", path.display());
     })
-    .map(|_: Config| ()) {
+    .map(|_: Config| ())
+    {
         Ok(()) => {}
         Err(err) => {
             tracing::warn!(

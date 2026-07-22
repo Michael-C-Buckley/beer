@@ -878,7 +878,31 @@ impl Grid {
         let x_end = (x0 + cols).min(self.cols);
         for by in y0..(y0 + rows).min(self.rows) {
             for cell in &mut self.lines[by].cells[x0..x_end] {
-                *cell = blank.clone();
+                // Only blank cells that are themselves part of a sized block, so
+                // a stale `(dx, dy)` (e.g. after a scroll split the block) can
+                // never wipe unrelated plain text - at worst it leaves a fragment.
+                if cell.sized.is_some() {
+                    *cell = blank.clone();
+                }
+            }
+        }
+    }
+
+    /// Dissolve every text-sizing block that intersects cells `[from, to)` of row
+    /// `y`, so any write into a block (erase, delete, shift) removes the whole
+    /// block rather than leaving the renderer to draw an orphaned fragment.
+    fn dissolve_sized(&mut self, y: usize, from: usize, to: usize) {
+        let to = to.min(self.cols);
+        for x in from..to {
+            if self
+                .lines
+                .get(y)
+                .and_then(|l| l.cells.get(x))
+                .is_some_and(|c| c.sized.is_some())
+            {
+                // Clearing the block blanks the rest of the range's members too,
+                // so subsequent iterations find nothing and skip.
+                self.clear_sized_at(x, y);
             }
         }
     }
@@ -904,6 +928,8 @@ impl Grid {
     fn shift_right(&mut self, n: usize) {
         let (x, y) = (self.cursor.x, self.cursor.y);
         let end = self.cols;
+        // Shifting cells sideways would scramble a scaled block's back-references.
+        self.dissolve_sized(y, x, end);
         let blank = self.pen_blank();
         let row = &mut self.lines[y].cells;
         for i in (x + n..end).rev() {
@@ -1107,6 +1133,8 @@ impl Grid {
     }
 
     fn blank_row(&mut self, y: usize) {
+        let cols = self.cols;
+        self.dissolve_sized(y, 0, cols);
         let blank = self.pen_blank();
         let line = &mut self.lines[y];
         for cell in &mut line.cells {
@@ -1160,8 +1188,10 @@ impl Grid {
     }
 
     fn erase_in_row(&mut self, y: usize, from: usize, to: usize) {
+        let to = to.min(self.cols);
+        self.dissolve_sized(y, from, to);
         let blank = self.pen_blank();
-        for cell in &mut self.lines[y].cells[from..to.min(self.cols)] {
+        for cell in &mut self.lines[y].cells[from..to] {
             *cell = blank.clone();
         }
     }
@@ -1180,6 +1210,8 @@ impl Grid {
     pub fn delete_chars(&mut self, n: usize) {
         let (x, y) = (self.cursor.x, self.cursor.y);
         let n = n.min(self.cols - x);
+        // Shifting cells sideways would scramble a scaled block's back-references.
+        self.dissolve_sized(y, x, self.cols);
         let blank = self.pen_blank();
         let row = &mut self.lines[y].cells;
         for i in x..self.cols {
@@ -1663,6 +1695,33 @@ mod tests {
             }
         }
         assert_eq!(g.cell(1, 1).c, 'z');
+    }
+
+    #[test]
+    fn erasing_over_a_sized_block_dissolves_it() {
+        let mut g = Grid::new(8, 4);
+        g.print_sized("X", TextSize::parse_str("s=2"));
+        // Erase row 0; the whole 2x2 block (rows 0-1) must dissolve, not just row 0.
+        g.move_to(0, 0);
+        g.erase_line(2);
+        for y in 0..2 {
+            for x in 0..2 {
+                assert!(g.cell(x, y).sized.is_none(), "({x},{y}) still sized");
+            }
+        }
+    }
+
+    #[test]
+    fn deleting_chars_dissolves_a_sized_block() {
+        let mut g = Grid::new(8, 2);
+        g.print_sized("X", TextSize::parse_str("s=2"));
+        g.move_to(0, 0);
+        g.delete_chars(1);
+        for y in 0..2 {
+            for x in 0..2 {
+                assert!(g.cell(x, y).sized.is_none(), "({x},{y}) still sized");
+            }
+        }
     }
 
     #[test]
