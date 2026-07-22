@@ -6,13 +6,14 @@ impl CompositorHandler for App {
         &mut self,
         _: &Connection,
         _: &QueueHandle<Self>,
-        _: &wl_surface::WlSurface,
+        surface: &wl_surface::WlSurface,
         factor: i32,
     ) {
         // Integer fallback for compositors without fractional-scale-v1; ignored
         // when the fractional-scale object drives the scale instead.
-        if self.fractional_scale.is_none() {
-            self.set_scale((factor.max(1) as u32) * 120);
+        let idx = self.window_index(surface).unwrap_or(self.focused_window);
+        if self.windows[idx].fractional_scale.is_none() {
+            self.set_scale(idx, (factor.max(1) as u32) * 120);
         }
     }
 
@@ -25,10 +26,17 @@ impl CompositorHandler for App {
     ) {
     }
 
-    fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: u32) {
+    fn frame(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        surface: &wl_surface::WlSurface,
+        _: u32,
+    ) {
         // The compositor is ready for another frame; `flush` will repaint if the
         // grid has changed since the last present.
-        self.frame_pending = false;
+        let idx = self.window_index(surface).unwrap_or(self.focused_window);
+        self.windows[idx].frame_pending = false;
     }
 
     fn surface_enter(
@@ -51,7 +59,10 @@ impl CompositorHandler for App {
 }
 
 impl WindowHandler for App {
-    fn request_close(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &Window) {
+    fn request_close(&mut self, _: &Connection, _: &QueueHandle<Self>, window: &XdgWindow) {
+        // Single window: closing it exits the process. Route to the matching
+        // window first so per-window teardown can generalize later.
+        let _ = self.window_index(window.wl_surface());
         self.exit = true;
     }
 
@@ -59,25 +70,29 @@ impl WindowHandler for App {
         &mut self,
         _: &Connection,
         _: &QueueHandle<Self>,
-        _: &Window,
+        window: &XdgWindow,
         configure: WindowConfigure,
         _serial: u32,
     ) {
+        let idx = self
+            .window_index(window.wl_surface())
+            .unwrap_or(self.focused_window);
         if let (Some(w), Some(h)) = configure.new_size {
-            self.width = w.get();
-            self.height = h.get();
-            if let Some(vp) = &self.viewport {
-                vp.set_destination(self.width.max(1) as i32, self.height.max(1) as i32);
+            self.windows[idx].width = w.get();
+            self.windows[idx].height = h.get();
+            if let Some(vp) = &self.windows[idx].viewport {
+                let (ww, hh) = (self.windows[idx].width, self.windows[idx].height);
+                vp.set_destination(ww.max(1) as i32, hh.max(1) as i32);
             }
         }
-        self.focused = configure.is_activated();
+        self.windows[idx].focused = configure.is_activated();
         self.sync_idle_inhibit();
-        if self.session.is_none() {
-            self.spawn_session();
+        if self.windows[idx].session.is_none() {
+            self.spawn_session(idx);
         } else {
-            self.resize_grid();
+            self.resize_grid(idx);
         }
-        self.needs_draw = true;
+        self.windows[idx].needs_draw = true;
     }
 }
 
@@ -176,7 +191,7 @@ impl SeatHandler for App {
                 if let Some(touch) = s.touch.take() {
                     touch.release();
                 }
-                self.touch_scroll = None;
+                self.windows[self.focused_window].touch_scroll = None;
             }
             _ => {}
         }
@@ -194,17 +209,19 @@ impl KeyboardHandler for App {
         _: &Connection,
         _: &QueueHandle<Self>,
         keyboard: &wl_keyboard::WlKeyboard,
-        _: &wl_surface::WlSurface,
+        surface: &wl_surface::WlSurface,
         serial: u32,
         _: &[u32],
         _: &[Keysym],
     ) {
         self.activate_keyboard(keyboard);
         self.serial = serial;
-        self.focused = true;
+        let idx = self.window_index(surface).unwrap_or(self.focused_window);
+        self.focused_window = idx;
+        self.windows[idx].focused = true;
         self.sync_idle_inhibit();
         self.report_focus(true);
-        self.needs_draw = true;
+        self.windows[idx].needs_draw = true;
     }
 
     fn leave(
@@ -212,16 +229,17 @@ impl KeyboardHandler for App {
         _: &Connection,
         _: &QueueHandle<Self>,
         _: &wl_keyboard::WlKeyboard,
-        _: &wl_surface::WlSurface,
+        surface: &wl_surface::WlSurface,
         _: u32,
     ) {
-        self.focused = false;
+        let idx = self.window_index(surface).unwrap_or(self.focused_window);
+        self.windows[idx].focused = false;
         self.sync_idle_inhibit();
         // Drop held-key state so a key released while unfocused can't leak a
         // stale kitty release event later.
-        self.keys_down.clear();
+        self.windows[idx].keys_down.clear();
         self.report_focus(false);
-        self.needs_draw = true;
+        self.windows[idx].needs_draw = true;
     }
 
     fn press_key(
@@ -350,21 +368,22 @@ impl PointerHandler for App {
         events: &[PointerEvent],
     ) {
         self.activate_pointer(pointer);
+        let idx = self.focused_window;
         let cell_h = f64::from(self.renderer.metrics().height);
         for event in events {
             match &event.kind {
                 PointerEventKind::Enter { serial } => {
-                    self.pointer_pos = event.position;
-                    self.pointer_enter_serial = *serial;
+                    self.windows[idx].pointer_pos = event.position;
+                    self.windows[idx].pointer_enter_serial = *serial;
                     self.update_hover(pointer);
                     self.pointer_drag();
                 }
                 PointerEventKind::Motion { .. } => {
-                    self.pointer_pos = event.position;
+                    self.windows[idx].pointer_pos = event.position;
                     if self.try_report_motion() {
                         continue;
                     }
-                    if !self.selecting {
+                    if !self.windows[idx].selecting {
                         self.update_hover(pointer);
                     }
                     self.pointer_drag();
@@ -376,11 +395,11 @@ impl PointerHandler for App {
                     ..
                 } => {
                     self.serial = *serial;
-                    self.pointer_pos = event.position;
+                    self.windows[idx].pointer_pos = event.position;
                     if let Some(code) = button_code(*button)
                         && self.try_report_button(code, true)
                     {
-                        self.pressed_button = Some(code);
+                        self.windows[idx].pressed_button = Some(code);
                         continue;
                     }
                     // A configured `[mouse-bindings]` action (Middle defaults to
@@ -392,18 +411,20 @@ impl PointerHandler for App {
                         continue;
                     }
                     if *button == BTN_LEFT {
-                        self.press_cell = self.cell_at(self.pointer_pos.0, self.pointer_pos.1);
+                        let (px, py) = self.windows[idx].pointer_pos;
+                        let cell = self.cell_at(idx, px, py);
+                        self.windows[idx].press_cell = cell;
                         self.pointer_press(*time);
                     }
                 }
                 PointerEventKind::Release { button, .. } => {
-                    self.pointer_pos = event.position;
+                    self.windows[idx].pointer_pos = event.position;
                     let code = button_code(*button);
                     if let Some(code) = code
                         && self.try_report_button(code, false)
                     {
-                        if self.pressed_button == Some(code) {
-                            self.pressed_button = None;
+                        if self.windows[idx].pressed_button == Some(code) {
+                            self.windows[idx].pressed_button = None;
                         }
                         continue;
                     }
@@ -432,7 +453,7 @@ impl PointerHandler for App {
                     let up = raw < 0.0;
                     // Reporting apps get wheel buttons (64 up / 65 down) as
                     // presses, one per line, capped so a flick cannot flood.
-                    if self.mouse_reporting() {
+                    if self.mouse_reporting(idx) {
                         let code = if up { 64 } else { 65 };
                         for _ in 0..lines.clamp(1, 8) {
                             self.try_report_button(code, true);
@@ -442,7 +463,7 @@ impl PointerHandler for App {
                     // On the alternate screen there is no scrollback to move, so
                     // (when enabled) translate the wheel into cursor-key presses
                     // for apps that did not request mouse reporting.
-                    let alt = self
+                    let alt = self.windows[idx]
                         .session
                         .as_ref()
                         .is_some_and(|s| s.term.grid().alt_active());
@@ -453,9 +474,10 @@ impl PointerHandler for App {
                     // Positive axis = scroll down (toward live); the viewport
                     // scrolls the opposite way (negative offset delta).
                     let delta = if up { lines } else { -lines };
-                    if let Some(session) = self.session.as_mut() {
+                    let win = &mut self.windows[idx];
+                    if let Some(session) = win.session.as_mut() {
                         session.term.scroll_view(delta);
-                        self.needs_draw = true;
+                        win.needs_draw = true;
                     }
                 }
                 _ => {}
@@ -474,12 +496,13 @@ impl TouchHandler for App {
         _: &wl_touch::WlTouch,
         _serial: u32,
         _time: u32,
-        _surface: wl_surface::WlSurface,
+        surface: wl_surface::WlSurface,
         id: i32,
         position: (f64, f64),
     ) {
-        if self.touch_scroll.is_none() {
-            self.touch_scroll = Some(TouchScroll {
+        let idx = self.window_index(&surface).unwrap_or(self.focused_window);
+        if self.windows[idx].touch_scroll.is_none() {
+            self.windows[idx].touch_scroll = Some(TouchScroll {
                 id,
                 last_y: position.1,
                 acc: 0.0,
@@ -496,8 +519,13 @@ impl TouchHandler for App {
         _time: u32,
         id: i32,
     ) {
-        if self.touch_scroll.as_ref().is_some_and(|t| t.id == id) {
-            self.touch_scroll = None;
+        let idx = self.focused_window;
+        if self.windows[idx]
+            .touch_scroll
+            .as_ref()
+            .is_some_and(|t| t.id == id)
+        {
+            self.windows[idx].touch_scroll = None;
         }
     }
 
@@ -510,8 +538,10 @@ impl TouchHandler for App {
         id: i32,
         position: (f64, f64),
     ) {
+        let idx = self.focused_window;
         let cell_h = self.renderer.metrics().height as f64;
-        let Some(touch) = self.touch_scroll.as_mut().filter(|t| t.id == id) else {
+        let win = &mut self.windows[idx];
+        let Some(touch) = win.touch_scroll.as_mut().filter(|t| t.id == id) else {
             return;
         };
         touch.acc += position.1 - touch.last_y;
@@ -521,9 +551,9 @@ impl TouchHandler for App {
         let lines = (touch.acc / cell_h) as isize;
         if lines != 0 {
             touch.acc -= lines as f64 * cell_h;
-            if let Some(session) = self.session.as_mut() {
+            if let Some(session) = win.session.as_mut() {
                 session.term.scroll_view(lines);
-                self.needs_draw = true;
+                win.needs_draw = true;
             }
         }
     }
@@ -550,7 +580,7 @@ impl TouchHandler for App {
     }
 
     fn cancel(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_touch::WlTouch) {
-        self.touch_scroll = None;
+        self.windows[self.focused_window].touch_scroll = None;
     }
 }
 
@@ -713,7 +743,8 @@ impl Dispatch<WpFractionalScaleV1, ()> for App {
         _: &QueueHandle<Self>,
     ) {
         if let wp_fractional_scale_v1::Event::PreferredScale { scale } = event {
-            state.set_scale(scale);
+            let idx = state.focused_window;
+            state.set_scale(idx, scale);
         }
     }
 }
@@ -810,7 +841,8 @@ impl ActivationHandler for App {
     fn new_token(&mut self, token: String, _: &RequestData) {
         // The compositor granted an activation token; use it to draw attention.
         if let Some(activation) = self.activation.as_ref() {
-            activation.activate::<App>(self.window.wl_surface(), token);
+            activation
+                .activate::<App>(self.windows[self.focused_window].window.wl_surface(), token);
         }
     }
 }
@@ -843,22 +875,26 @@ impl Dispatch<ZwpTextInputV3, ()> for App {
             Event::Enter { .. } => {
                 ti.enable();
                 ti.set_content_type(ContentHint::None, ContentPurpose::Terminal);
-                state.ime_set_cursor_rect(ti);
+                let idx = state.focused_window;
+                state.ime_set_cursor_rect(idx, ti);
                 ti.commit();
             }
             Event::Leave { .. } => {
                 ti.disable();
                 ti.commit();
-                state.preedit.clear();
-                state.ime_preedit_pending.clear();
-                state.ime_commit_pending.clear();
-                state.needs_draw = true;
+                let win = &mut state.windows[state.focused_window];
+                win.preedit.clear();
+                win.ime_preedit_pending.clear();
+                win.ime_commit_pending.clear();
+                win.needs_draw = true;
             }
             Event::PreeditString { text, .. } => {
-                state.ime_preedit_pending = text.unwrap_or_default();
+                state.windows[state.focused_window].ime_preedit_pending = text.unwrap_or_default();
             }
             Event::CommitString { text } => {
-                state.ime_commit_pending.push_str(&text.unwrap_or_default());
+                state.windows[state.focused_window]
+                    .ime_commit_pending
+                    .push_str(&text.unwrap_or_default());
             }
             Event::Done { .. } => state.ime_done(ti),
             // We do not expose surrounding text, so nothing to delete.

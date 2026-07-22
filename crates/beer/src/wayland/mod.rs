@@ -68,7 +68,7 @@ use smithay_client_toolkit::{
         WaylandSurface,
         xdg::{
             XdgShell,
-            window::{Window, WindowConfigure, WindowDecorations, WindowHandler},
+            window::{Window as XdgWindow, WindowConfigure, WindowDecorations, WindowHandler},
         },
     },
     shm::{
@@ -229,36 +229,33 @@ pub fn run(config: Config, config_paths: Vec<std::path::PathBuf>) -> anyhow::Res
     );
     let font_size = config.main.font_size;
 
-    let mut app = App {
-        registry_state: RegistryState::new(&globals),
-        output_state: OutputState::new(&globals, &qh),
-        seat_state: SeatState::new(&globals, &qh),
-        shm,
+    // The single window's per-window state. The PTY is spawned on the first
+    // configure, once the real window size is known, so the shell starts at the
+    // final size and is not hit by a startup SIGWINCH storm that makes it
+    // reprint its prompt.
+    let win = Window {
         pool,
         window,
-        renderer,
-        loop_handle: event_loop.handle(),
-        qh: qh.clone(),
-        data_device_manager,
-        primary_manager,
-        cursor_shape_manager,
-        text_input_manager,
-        activation,
-        idle_inhibit_manager,
         idle_inhibitor: None,
         content_type,
-        preedit: String::new(),
-        ime_preedit_pending: String::new(),
-        ime_commit_pending: String::new(),
         viewport,
         fractional_scale,
         scale120: 120,
-        seats: Vec::new(),
-        active_seat: 0,
-        copy_source: None,
-        primary_source: None,
-        clipboard: String::new(),
-        primary_clip: String::new(),
+        session: None,
+        title: None,
+        fullscreen: false,
+        width,
+        height,
+        needs_draw: false,
+        frame_pending: false,
+        frames: Vec::new(),
+        buf_dims: (0, 0),
+        sync_timeout: None,
+        flashing: false,
+        flash_timer: None,
+        preedit: String::new(),
+        ime_preedit_pending: String::new(),
+        ime_commit_pending: String::new(),
         selecting: false,
         hovered_link: None,
         pointer_enter_serial: 0,
@@ -269,28 +266,6 @@ pub fn run(config: Config, config_paths: Vec<std::path::PathBuf>) -> anyhow::Res
         autoscroll_timer: None,
         pointer_pos: (0.0, 0.0),
         last_click: None,
-        serial: 0,
-        modifiers: Modifiers::default(),
-        // The PTY is spawned on the first configure, once the real window size
-        // is known, so the shell starts at the final size and is not hit by a
-        // startup SIGWINCH storm that makes it reprint its prompt.
-        session: None,
-        title: None,
-        config,
-        config_paths,
-        bindings,
-        font_size,
-        fullscreen: false,
-        width,
-        height,
-        needs_draw: false,
-        frame_pending: false,
-        frames: Vec::new(),
-        buf_dims: (0, 0),
-        blink_on: true,
-        sync_timeout: None,
-        flashing: false,
-        flash_timer: None,
         searching: false,
         url_mode: false,
         url_hits: Vec::new(),
@@ -300,8 +275,39 @@ pub fn run(config: Config, config_paths: Vec<std::path::PathBuf>) -> anyhow::Res
         keys_down: std::collections::HashSet::new(),
         touch_scroll: None,
         focused: true,
+    };
+
+    let mut app = App {
+        registry_state: RegistryState::new(&globals),
+        output_state: OutputState::new(&globals, &qh),
+        seat_state: SeatState::new(&globals, &qh),
+        shm,
+        renderer,
+        loop_handle: event_loop.handle(),
+        qh: qh.clone(),
+        data_device_manager,
+        primary_manager,
+        cursor_shape_manager,
+        text_input_manager,
+        activation,
+        idle_inhibit_manager,
+        seats: Vec::new(),
+        active_seat: 0,
+        copy_source: None,
+        primary_source: None,
+        clipboard: String::new(),
+        primary_clip: String::new(),
+        serial: 0,
+        modifiers: Modifiers::default(),
+        config,
+        config_paths,
+        bindings,
+        font_size,
+        blink_on: true,
         exit: false,
         exit_code: ExitCode::SUCCESS,
+        windows: vec![win],
+        focused_window: 0,
     };
 
     // Toggle the blink phase on a timer so blinking text and cursors animate.
@@ -310,7 +316,9 @@ pub fn run(config: Config, config_paths: Vec<std::path::PathBuf>) -> anyhow::Res
         .handle()
         .insert_source(blink, |_, _, app: &mut App| {
             app.blink_on = !app.blink_on;
-            app.needs_draw = true;
+            for win in &mut app.windows {
+                win.needs_draw = true;
+            }
             TimeoutAction::ToDuration(Duration::from_millis(BLINK_MS))
         });
     if let Err(err) = blink_registered {
@@ -325,16 +333,20 @@ pub fn run(config: Config, config_paths: Vec<std::path::PathBuf>) -> anyhow::Res
     let anim_registered = event_loop
         .handle()
         .insert_source(anim, |_, _, app: &mut App| {
-            let (changed, animating) = match app.session.as_mut() {
-                Some(session) => (
-                    session.term.animation_tick(ANIM_MS as u32),
-                    session.term.is_animating(),
-                ),
-                None => (false, false),
-            };
-            if changed {
-                app.frames.clear();
-                app.needs_draw = true;
+            let mut animating = false;
+            for win in &mut app.windows {
+                let (changed, anim) = match win.session.as_mut() {
+                    Some(session) => (
+                        session.term.animation_tick(ANIM_MS as u32),
+                        session.term.is_animating(),
+                    ),
+                    None => (false, false),
+                };
+                if changed {
+                    win.frames.clear();
+                    win.needs_draw = true;
+                }
+                animating |= anim;
             }
             let next = if animating { ANIM_MS } else { ANIM_IDLE_MS };
             TimeoutAction::ToDuration(Duration::from_millis(next))
@@ -363,7 +375,8 @@ pub fn run(config: Config, config_paths: Vec<std::path::PathBuf>) -> anyhow::Res
         event_loop
             .dispatch(None, &mut app)
             .context("dispatch event loop")?;
-        app.flush();
+        let idx = app.focused_window;
+        app.flush(idx);
     }
     Ok(app.exit_code)
 }
@@ -444,29 +457,15 @@ struct TouchScroll {
     acc: f64,
 }
 
-/// Window + Wayland client state shared across all protocol handlers.
+/// Per-window state: the surface, its shm buffers, the terminal behind it, and
+/// all the input/paint bookkeeping scoped to one toplevel. `App` owns a `Vec`
+/// of these; today there is exactly one.
 #[derive(Debug)]
-struct App {
-    registry_state: RegistryState,
-    output_state: OutputState,
-    seat_state: SeatState,
-    shm: Shm,
+struct Window {
     pool: SlotPool,
-    window: Window,
-    renderer: Renderer,
-    loop_handle: LoopHandle<'static, App>,
-    qh: QueueHandle<App>,
-    data_device_manager: DataDeviceManagerState,
-    primary_manager: Option<PrimarySelectionManagerState>,
-    /// Sets the pointer to an I-beam over the window (cursor-shape-v1).
-    cursor_shape_manager: Option<CursorShapeManager>,
-    /// IME manager (text-input-v3); per-seat handles live in `seats`.
-    text_input_manager: Option<ZwpTextInputManagerV3>,
-    /// xdg-activation, used to request attention on an urgent bell.
-    activation: Option<ActivationState>,
-    /// idle-inhibit-v1 manager; an inhibitor is held while focused when the
+    window: XdgWindow,
+    /// idle-inhibitor held while this window is focused when the
     /// `[main] idle-inhibit` config is on, so the screen does not blank.
-    idle_inhibit_manager: Option<ZwpIdleInhibitManagerV1>,
     idle_inhibitor: Option<ZwpIdleInhibitorV1>,
     /// content-type-v1 hint object. Set once at startup; held only so the
     /// object (and thus the hint) outlives construction.
@@ -475,25 +474,39 @@ struct App {
         reason = "kept alive to preserve the surface content-type hint"
     )]
     content_type: Option<WpContentTypeV1>,
-    /// Committed IME preedit string shown inline at the cursor while composing.
-    preedit: String,
-    /// Preedit/commit accumulated since the last text-input `done`.
-    ime_preedit_pending: String,
-    ime_commit_pending: String,
     /// Presents a scaled buffer at the logical surface size (viewporter).
     viewport: Option<WpViewport>,
     /// Per-surface fractional-scale object; kept alive to receive scale events.
     fractional_scale: Option<WpFractionalScaleV1>,
     /// Compositor's preferred scale in 120ths (120 = 1.0, 180 = 1.5).
     scale120: u32,
-    /// One entry per seat; `active_seat` indexes the most recently used.
-    seats: Vec<SeatData>,
-    active_seat: usize,
-    /// Held while we own the clipboard / primary selection, serving paste reads.
-    copy_source: Option<CopyPasteSource>,
-    primary_source: Option<PrimarySelectionSource>,
-    clipboard: String,
-    primary_clip: String,
+    /// `None` until the first configure spawns the shell.
+    session: Option<Session>,
+    /// Last title applied to the toplevel, to avoid redundant requests.
+    title: Option<String>,
+    /// Whether the toplevel is fullscreen.
+    fullscreen: bool,
+    width: u32,
+    height: u32,
+    /// The grid changed and the window wants repainting on the next frame.
+    needs_draw: bool,
+    /// A `wl_surface.frame` callback is in flight; defer drawing until it fires.
+    frame_pending: bool,
+    /// Double/triple-buffer ring, each tagged with the rows it currently shows.
+    frames: Vec<FrameBuf>,
+    /// Pixel size the `frames` buffers were allocated for.
+    buf_dims: (u32, u32),
+    /// Armed while synchronized output holds the screen, to force it open.
+    sync_timeout: Option<RegistrationToken>,
+    /// The visual bell is inverting the screen.
+    flashing: bool,
+    /// Timer that ends the visual-bell flash.
+    flash_timer: Option<RegistrationToken>,
+    /// Committed IME preedit string shown inline at the cursor while composing.
+    preedit: String,
+    /// Preedit/commit accumulated since the last text-input `done`.
+    ime_preedit_pending: String,
+    ime_commit_pending: String,
     /// A left-button drag is in progress.
     selecting: bool,
     /// OSC 8 hyperlink under the pointer, underlined and opened on click.
@@ -513,41 +526,6 @@ struct App {
     pointer_pos: (f64, f64),
     /// Last click (time ms, abs row, col, count) for double/triple detection.
     last_click: Option<(u32, usize, usize, u32)>,
-    /// Most recent input serial, used to claim selections.
-    serial: u32,
-    modifiers: Modifiers,
-    /// `None` until the first configure spawns the shell.
-    session: Option<Session>,
-    /// Last title applied to the toplevel, to avoid redundant requests.
-    title: Option<String>,
-    /// The active user configuration.
-    config: Config,
-    /// Paths the config was loaded from, for SIGUSR1 live reload and new windows.
-    config_paths: Vec<std::path::PathBuf>,
-    /// Resolved key/text bindings.
-    bindings: crate::bindings::Bindings,
-    /// Current font size in pixels (changed by font-resize bindings).
-    font_size: u32,
-    /// Whether the toplevel is fullscreen.
-    fullscreen: bool,
-    width: u32,
-    height: u32,
-    /// The grid changed and the window wants repainting on the next frame.
-    needs_draw: bool,
-    /// A `wl_surface.frame` callback is in flight; defer drawing until it fires.
-    frame_pending: bool,
-    /// Double/triple-buffer ring, each tagged with the rows it currently shows.
-    frames: Vec<FrameBuf>,
-    /// Pixel size the `frames` buffers were allocated for.
-    buf_dims: (u32, u32),
-    /// Current blink phase, toggled by a timer; off hides blinking ink.
-    blink_on: bool,
-    /// Armed while synchronized output holds the screen, to force it open.
-    sync_timeout: Option<RegistrationToken>,
-    /// The visual bell is inverting the screen.
-    flashing: bool,
-    /// Timer that ends the visual-bell flash.
-    flash_timer: Option<RegistrationToken>,
     /// Whether incremental search mode is active (the query lives in the grid).
     searching: bool,
     /// URL hint mode: detected URLs get keyboard labels to open them.
@@ -566,15 +544,72 @@ struct App {
     touch_scroll: Option<TouchScroll>,
     /// Whether the toplevel currently has keyboard focus (drives the cursor).
     focused: bool,
+}
+
+/// Process-wide Wayland client state shared across all windows and protocol
+/// handlers.
+#[derive(Debug)]
+struct App {
+    registry_state: RegistryState,
+    output_state: OutputState,
+    seat_state: SeatState,
+    shm: Shm,
+    renderer: Renderer,
+    loop_handle: LoopHandle<'static, App>,
+    qh: QueueHandle<App>,
+    data_device_manager: DataDeviceManagerState,
+    primary_manager: Option<PrimarySelectionManagerState>,
+    /// Sets the pointer to an I-beam over the window (cursor-shape-v1).
+    cursor_shape_manager: Option<CursorShapeManager>,
+    /// IME manager (text-input-v3); per-seat handles live in `seats`.
+    text_input_manager: Option<ZwpTextInputManagerV3>,
+    /// xdg-activation, used to request attention on an urgent bell.
+    activation: Option<ActivationState>,
+    /// idle-inhibit-v1 manager; a per-window inhibitor is held while focused.
+    idle_inhibit_manager: Option<ZwpIdleInhibitManagerV1>,
+    /// One entry per seat; `active_seat` indexes the most recently used.
+    seats: Vec<SeatData>,
+    active_seat: usize,
+    /// Held while we own the clipboard / primary selection, serving paste reads.
+    copy_source: Option<CopyPasteSource>,
+    primary_source: Option<PrimarySelectionSource>,
+    clipboard: String,
+    primary_clip: String,
+    /// Most recent input serial, used to claim selections.
+    serial: u32,
+    modifiers: Modifiers,
+    /// The active user configuration.
+    config: Config,
+    /// Paths the config was loaded from, for SIGUSR1 live reload and new windows.
+    config_paths: Vec<std::path::PathBuf>,
+    /// Resolved key/text bindings.
+    bindings: crate::bindings::Bindings,
+    /// Current font size in pixels (changed by font-resize bindings).
+    font_size: u32,
+    /// Current blink phase, toggled by a timer; off hides blinking ink. Global
+    /// so every window blinks in step.
+    blink_on: bool,
     exit: bool,
     /// Exit code to return, taken from the shell when it exits.
     exit_code: ExitCode,
+    /// Hosted windows. Today there is exactly one.
+    windows: Vec<Window>,
+    /// Index into `windows` of the focused window (always 0 while single-window).
+    focused_window: usize,
 }
 
 impl App {
-    /// Spawn the shell at the current window size and start reading its output.
-    fn spawn_session(&mut self) {
-        let (cols, rows) = self.grid_dims();
+    /// The index of the window backing `surface`, if any. Compares each window's
+    /// surface by identity, so surface-carrying handlers route to the right one.
+    fn window_index(&self, surface: &wl_surface::WlSurface) -> Option<usize> {
+        self.windows
+            .iter()
+            .position(|w| w.window.wl_surface() == surface)
+    }
+
+    /// Spawn the shell at window `idx`'s current size and start reading output.
+    fn spawn_session(&mut self, idx: usize) {
+        let (cols, rows) = self.grid_dims(idx);
         let m = self.renderer.metrics();
         let cell = (m.width as u16, m.height as u16);
         let pty = match Pty::spawn(cols, rows, cell, &self.config.main.term) {
@@ -602,7 +637,7 @@ impl App {
                 let mut buf = [0u8; 4096];
                 let n = match rustix::io::read(&*fd, &mut buf) {
                     Ok(0) => {
-                        app.child_exited();
+                        app.child_exited(idx);
                         return Ok(PostAction::Remove);
                     }
                     Ok(n) => n,
@@ -610,17 +645,17 @@ impl App {
                         return Ok(PostAction::Continue);
                     }
                     Err(_) => {
-                        app.child_exited();
+                        app.child_exited(idx);
                         return Ok(PostAction::Remove);
                     }
                 };
                 let cell = app.renderer.metrics();
-                if let Some(session) = app.session.as_mut() {
+                if let Some(session) = app.windows[idx].session.as_mut() {
                     session
                         .term
                         .feed(&mut parser, &buf[..n], (cell.width, cell.height));
                 }
-                app.after_feed();
+                app.after_feed(idx);
                 Ok(PostAction::Continue)
             });
         if let Err(err) = registered {
@@ -638,15 +673,16 @@ impl App {
             grid.set_cursor_shape(shape);
         }
         grid.set_cursor_blink(self.config.cursor.blink);
-        self.session = Some(Session { pty, term });
+        self.windows[idx].session = Some(Session { pty, term });
     }
 
     /// Handle a key (initial press or repeat): configured bindings first, then
     /// text bindings, else the byte encoding sent to the shell (which snaps the
     /// viewport back to the live screen).
     fn handle_key(&mut self, event: &KeyEvent) {
+        let idx = self.focused_window;
         // A new arrival of a held key is a repeat; otherwise a fresh press.
-        let kind = if self.keys_down.insert(event.raw_code) {
+        let kind = if self.windows[idx].keys_down.insert(event.raw_code) {
             beer_protocols::key::KeyKind::Press
         } else {
             beer_protocols::key::KeyKind::Repeat
@@ -654,15 +690,15 @@ impl App {
 
         // The Unicode-input prompt, URL hint mode, and search each capture the
         // keyboard while active.
-        if self.unicode_input.is_some() {
+        if self.windows[idx].unicode_input.is_some() {
             self.unicode_key(event);
             return;
         }
-        if self.url_mode {
+        if self.windows[idx].url_mode {
             self.url_key(event);
             return;
         }
-        if self.searching {
+        if self.windows[idx].searching {
             self.search_key(event);
             return;
         }
@@ -676,7 +712,7 @@ impl App {
             return;
         }
 
-        let (app_cursor, kitty) = self.session.as_ref().map_or((false, 0), |s| {
+        let (app_cursor, kitty) = self.windows[idx].session.as_ref().map_or((false, 0), |s| {
             (s.term.grid().app_cursor(), s.term.grid().kitty_flags())
         });
         let bytes = if kitty != 0 {
@@ -692,8 +728,9 @@ impl App {
     /// Handle a key release: only the kitty keyboard protocol cares, and only
     /// when it has asked for event reporting.
     fn handle_key_release(&mut self, event: &KeyEvent) {
-        self.keys_down.remove(&event.raw_code);
-        let (app_cursor, kitty) = self.session.as_ref().map_or((false, 0), |s| {
+        let idx = self.focused_window;
+        self.windows[idx].keys_down.remove(&event.raw_code);
+        let (app_cursor, kitty) = self.windows[idx].session.as_ref().map_or((false, 0), |s| {
             (s.term.grid().app_cursor(), s.term.grid().kitty_flags())
         });
         if kitty == 0 {
@@ -713,10 +750,11 @@ impl App {
     /// Write key/text bytes to the shell, snapping the viewport to the live
     /// screen and clearing any selection first.
     fn send_to_shell(&mut self, bytes: &[u8]) {
-        if let Some(session) = self.session.as_mut() {
+        let win = &mut self.windows[self.focused_window];
+        if let Some(session) = win.session.as_mut() {
             session.term.scroll_to_bottom();
             session.term.grid_mut().clear_selection();
-            self.needs_draw = true;
+            win.needs_draw = true;
             if let Err(err) = write_all(session.pty.master(), bytes) {
                 tracing::warn!("write key to pty: {err}");
             }
@@ -736,15 +774,17 @@ impl App {
             Action::ScrollPageUp => self.scroll_page(true),
             Action::ScrollPageDown => self.scroll_page(false),
             Action::ScrollTop => {
-                if let Some(session) = self.session.as_mut() {
+                let win = &mut self.windows[self.focused_window];
+                if let Some(session) = win.session.as_mut() {
                     session.term.scroll_view(isize::MAX);
-                    self.needs_draw = true;
+                    win.needs_draw = true;
                 }
             }
             Action::ScrollBottom => {
-                if let Some(session) = self.session.as_mut() {
+                let win = &mut self.windows[self.focused_window];
+                if let Some(session) = win.session.as_mut() {
                     session.term.scroll_to_bottom();
-                    self.needs_draw = true;
+                    win.needs_draw = true;
                 }
             }
             Action::SearchStart => self.toggle_search(),
@@ -758,8 +798,9 @@ impl App {
             Action::PipeCommandOutput => self.pipe_command_output(),
             Action::UrlMode => self.enter_url_mode(),
             Action::UnicodeInput => {
-                self.unicode_input = Some(String::new());
-                self.needs_draw = true;
+                let win = &mut self.windows[self.focused_window];
+                win.unicode_input = Some(String::new());
+                win.needs_draw = true;
             }
         }
     }
@@ -767,19 +808,20 @@ impl App {
     /// Handle a key while Unicode codepoint-input mode is active: accumulate hex
     /// digits, then commit the codepoint as UTF-8 on Enter/Space.
     fn unicode_key(&mut self, event: &KeyEvent) {
+        let idx = self.focused_window;
         match event.keysym {
             Keysym::Escape => {
-                self.unicode_input = None;
-                self.needs_draw = true;
+                self.windows[idx].unicode_input = None;
+                self.windows[idx].needs_draw = true;
             }
             Keysym::BackSpace => {
-                if let Some(buf) = self.unicode_input.as_mut() {
+                if let Some(buf) = self.windows[idx].unicode_input.as_mut() {
                     buf.pop();
                 }
-                self.needs_draw = true;
+                self.windows[idx].needs_draw = true;
             }
             Keysym::Return | Keysym::KP_Enter | Keysym::space => {
-                let buf = self.unicode_input.take().unwrap_or_default();
+                let buf = self.windows[idx].unicode_input.take().unwrap_or_default();
                 if let Some(c) = u32::from_str_radix(buf.trim(), 16)
                     .ok()
                     .and_then(char::from_u32)
@@ -788,18 +830,18 @@ impl App {
                     let s = c.encode_utf8(&mut bytes).as_bytes().to_vec();
                     self.send_to_shell(&s);
                 }
-                self.needs_draw = true;
+                self.windows[idx].needs_draw = true;
             }
             _ => {
                 if let Some(text) = event.utf8.as_ref() {
                     let hex: String = text.chars().filter(char::is_ascii_hexdigit).collect();
                     // Cap at 6 hex digits - the widest valid codepoint (U+10FFFF) fits.
-                    if let Some(buf) = self.unicode_input.as_mut()
+                    if let Some(buf) = self.windows[idx].unicode_input.as_mut()
                         && buf.len() + hex.len() <= 6
                     {
                         buf.push_str(&hex);
                     }
-                    self.needs_draw = true;
+                    self.windows[idx].needs_draw = true;
                 }
             }
         }
@@ -808,60 +850,62 @@ impl App {
     /// Enter URL hint mode: detect the visible URLs and label them. No-op (with
     /// a brief log) when there are none.
     fn enter_url_mode(&mut self) {
-        let Some(session) = self.session.as_ref() else {
+        let idx = self.focused_window;
+        let Some(session) = self.windows[idx].session.as_ref() else {
             return;
         };
         let hits = session.term.grid().visible_urls();
         if hits.is_empty() {
             return;
         }
-        self.url_labels = hint_labels(hits.len());
-        self.url_hits = hits;
-        self.url_input = String::new();
-        self.url_mode = true;
-        self.needs_draw = true;
+        let labels = hint_labels(hits.len());
+        let win = &mut self.windows[idx];
+        win.url_labels = labels;
+        win.url_hits = hits;
+        win.url_input = String::new();
+        win.url_mode = true;
+        win.needs_draw = true;
     }
 
     /// Leave URL hint mode, discarding any partial label input.
     fn exit_url_mode(&mut self) {
-        self.url_mode = false;
-        self.url_hits.clear();
-        self.url_labels.clear();
-        self.url_input.clear();
+        let win = &mut self.windows[self.focused_window];
+        win.url_mode = false;
+        win.url_hits.clear();
+        win.url_labels.clear();
+        win.url_input.clear();
         // Drop the labelled buffers so the next present repaints without labels.
-        self.frames.clear();
-        self.needs_draw = true;
+        win.frames.clear();
+        win.needs_draw = true;
     }
 
     /// Handle a key while URL hint mode is active: build up a label, open the
     /// matching URL, or cancel.
     fn url_key(&mut self, event: &KeyEvent) {
+        let idx = self.focused_window;
         match event.keysym {
             Keysym::Escape => self.exit_url_mode(),
             Keysym::BackSpace => {
-                self.url_input.pop();
-                self.needs_draw = true;
+                self.windows[idx].url_input.pop();
+                self.windows[idx].needs_draw = true;
             }
             _ => {
                 let Some(text) = event.utf8.as_ref() else {
                     return;
                 };
                 for c in text.chars().filter(|c| c.is_ascii_alphabetic()) {
-                    self.url_input.push(c.to_ascii_lowercase());
+                    self.windows[idx].url_input.push(c.to_ascii_lowercase());
                 }
                 // Exact match opens; if no label even has this prefix, cancel.
-                if let Some(i) = self.url_labels.iter().position(|l| *l == self.url_input) {
-                    let url = self.url_hits[i].url.clone();
+                let win = &self.windows[idx];
+                if let Some(i) = win.url_labels.iter().position(|l| *l == win.url_input) {
+                    let url = win.url_hits[i].url.clone();
                     self.exit_url_mode();
                     self.open_url(&url);
-                } else if !self
-                    .url_labels
-                    .iter()
-                    .any(|l| l.starts_with(&self.url_input))
-                {
+                } else if !win.url_labels.iter().any(|l| l.starts_with(&win.url_input)) {
                     self.exit_url_mode();
                 } else {
-                    self.needs_draw = true;
+                    self.windows[idx].needs_draw = true;
                 }
             }
         }
@@ -869,21 +913,23 @@ impl App {
 
     /// Scroll the viewport to the previous/next shell prompt (OSC 133).
     fn jump_prompt(&mut self, up: bool) {
-        if let Some(session) = self.session.as_mut() {
+        let win = &mut self.windows[self.focused_window];
+        if let Some(session) = win.session.as_mut() {
             session.term.grid_mut().jump_prompt(up);
-            self.needs_draw = true;
+            win.needs_draw = true;
         }
     }
 
     /// Feed the last command's output (between OSC 133 C and D) to the configured
     /// command on stdin.
     fn pipe_command_output(&mut self) {
+        let idx = self.focused_window;
         let argv = &self.config.shell_integration.pipe_command;
         let Some((program, args)) = argv.split_first() else {
             tracing::warn!("pipe-command-output: no [shell-integration] pipe-command configured");
             return;
         };
-        let Some(text) = self
+        let Some(text) = self.windows[idx]
             .session
             .as_ref()
             .and_then(|s| s.term.grid().last_command_output())
@@ -895,7 +941,11 @@ impl App {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
-        if let Some(cwd) = self.session.as_ref().and_then(|s| s.term.cwd()) {
+        if let Some(cwd) = self.windows[idx]
+            .session
+            .as_ref()
+            .and_then(|s| s.term.cwd())
+        {
             cmd.current_dir(cwd);
         }
         match cmd.spawn() {
@@ -911,6 +961,7 @@ impl App {
     /// Launch another beer process in the shell's reported working directory
     /// (OSC 7), inheriting the same config. The child is fully detached.
     fn spawn_new_window(&mut self) {
+        let idx = self.focused_window;
         let exe = match std::env::current_exe() {
             Ok(exe) => exe,
             Err(err) => {
@@ -922,7 +973,11 @@ impl App {
         for path in &self.config_paths {
             cmd.arg("--config").arg(path);
         }
-        if let Some(cwd) = self.session.as_ref().and_then(|s| s.term.cwd()) {
+        if let Some(cwd) = self.windows[idx]
+            .session
+            .as_ref()
+            .and_then(|s| s.term.cwd())
+        {
             cmd.current_dir(cwd);
         }
         cmd.stdin(std::process::Stdio::null())
@@ -937,7 +992,7 @@ impl App {
     /// Send `count` cursor-up/down keys to the shell for alternate-scroll,
     /// honouring the application cursor-key mode (DECCKM).
     fn alternate_scroll(&mut self, up: bool, count: isize) {
-        let app_cursor = self
+        let app_cursor = self.windows[self.focused_window]
             .session
             .as_ref()
             .is_some_and(|s| s.term.grid().app_cursor());
@@ -954,25 +1009,28 @@ impl App {
 
     /// Scroll the viewport one page back (`up`) or toward the live screen.
     fn scroll_page(&mut self, up: bool) {
-        if let Some(session) = self.session.as_mut() {
+        let win = &mut self.windows[self.focused_window];
+        if let Some(session) = win.session.as_mut() {
             let page = session.term.page() as isize;
             session.term.scroll_view(if up { page } else { -page });
-            self.needs_draw = true;
+            win.needs_draw = true;
         }
     }
 
     /// Toggle the toplevel between fullscreen and windowed.
     fn toggle_fullscreen(&mut self) {
-        self.fullscreen = !self.fullscreen;
-        if self.fullscreen {
-            self.window.set_fullscreen(None);
+        let win = &mut self.windows[self.focused_window];
+        win.fullscreen = !win.fullscreen;
+        if win.fullscreen {
+            win.window.set_fullscreen(None);
         } else {
-            self.window.unset_fullscreen();
+            win.window.unset_fullscreen();
         }
     }
 
     /// Re-read the config file and apply it in place (SIGUSR1).
     fn reload_config(&mut self) {
+        let idx = self.focused_window;
         let new = Config::load(&self.config_paths);
         self.bindings = crate::bindings::Bindings::from_config(
             &new.key_bindings,
@@ -989,8 +1047,8 @@ impl App {
         self.config.main.pad_x = new.main.pad_x;
         self.config.main.pad_y = new.main.pad_y;
         // Re-rasterize at the active scale and update padding in one place.
-        self.rescale_render();
-        if let Some(session) = self.session.as_mut() {
+        self.rescale_render(idx);
+        if let Some(session) = self.windows[idx].session.as_mut() {
             session
                 .term
                 .set_theme(crate::theme::Theme::from_config(&new.colors));
@@ -1003,49 +1061,52 @@ impl App {
             grid.set_cursor_blink(new.cursor.blink);
         }
         self.config = new;
-        self.frames.clear();
-        self.resize_grid();
-        self.needs_draw = true;
+        self.windows[idx].frames.clear();
+        self.resize_grid(idx);
+        self.windows[idx].needs_draw = true;
         tracing::info!("config reloaded");
     }
 
     /// Re-rasterize the font at `new_size`, then re-derive the grid geometry.
     fn change_font_size(&mut self, new_size: u32) {
+        let idx = self.focused_window;
         let new_size = new_size.clamp(6, 200);
         if new_size == self.font_size {
             return;
         }
         self.font_size = new_size;
-        self.rescale_render();
-        self.frames.clear();
-        self.resize_grid();
-        self.needs_draw = true;
+        self.rescale_render(idx);
+        self.windows[idx].frames.clear();
+        self.resize_grid(idx);
+        self.windows[idx].needs_draw = true;
     }
 
     /// Enter or leave incremental search mode.
     fn toggle_search(&mut self) {
-        self.searching = !self.searching;
-        if let Some(session) = self.session.as_mut() {
-            if self.searching {
+        let win = &mut self.windows[self.focused_window];
+        win.searching = !win.searching;
+        if let Some(session) = win.session.as_mut() {
+            if win.searching {
                 session.term.grid_mut().set_search("");
             } else {
                 session.term.grid_mut().clear_search();
             }
         }
-        self.needs_draw = true;
+        win.needs_draw = true;
     }
 
     /// Handle a key while search mode is active: edit the query incrementally,
     /// step between matches, or exit.
     fn search_key(&mut self, event: &KeyEvent) {
-        let Some(session) = self.session.as_mut() else {
+        let win = &mut self.windows[self.focused_window];
+        let Some(session) = win.session.as_mut() else {
             return;
         };
         let grid = session.term.grid_mut();
         match event.keysym {
             Keysym::Escape => {
                 grid.clear_search();
-                self.searching = false;
+                win.searching = false;
             }
             Keysym::Return | Keysym::KP_Enter | Keysym::Up | Keysym::Page_Up => {
                 grid.search_step(false);
@@ -1068,51 +1129,61 @@ impl App {
                 }
             }
         }
-        self.needs_draw = true;
+        win.needs_draw = true;
     }
 
     /// The OSC 8 hyperlink id under the pointer, if any.
-    fn link_under_pointer(&self) -> Option<NonZeroU16> {
-        let (row, col) = self.cell_at(self.pointer_pos.0, self.pointer_pos.1)?;
-        self.session.as_ref()?.term.grid().link_at(row, col)
+    fn link_under_pointer(&self, idx: usize) -> Option<NonZeroU16> {
+        let (px, py) = self.windows[idx].pointer_pos;
+        let (row, col) = self.cell_at(idx, px, py)?;
+        self.windows[idx]
+            .session
+            .as_ref()?
+            .term
+            .grid()
+            .link_at(row, col)
     }
 
     /// Recompute the hyperlink under the pointer; when it changes, repaint to
     /// move the hover underline and update the pointer to a hand over a link.
     fn update_hover(&mut self, pointer: &wl_pointer::WlPointer) {
-        let link = self.link_under_pointer();
-        if link == self.hovered_link {
+        let idx = self.focused_window;
+        let link = self.link_under_pointer(idx);
+        if link == self.windows[idx].hovered_link {
             return;
         }
-        self.hovered_link = link;
+        self.windows[idx].hovered_link = link;
         // The hover underline lives in every buffer's snapshot; drop the ring so
         // the affected rows repaint with (or without) it.
-        self.frames.clear();
-        self.needs_draw = true;
+        self.windows[idx].frames.clear();
+        self.windows[idx].needs_draw = true;
         let shape = if link.is_some() {
             Shape::Pointer
         } else {
             Shape::Text
         };
+        let serial = self.windows[idx].pointer_enter_serial;
         if let Some(device) = self
             .seats
             .iter()
             .find(|s| s.pointer.as_ref() == Some(pointer))
             .and_then(|s| s.cursor_shape_device.as_ref())
         {
-            device.set_shape(self.pointer_enter_serial, shape);
+            device.set_shape(serial, shape);
         }
     }
 
     /// If the left button was pressed and released on the same hyperlinked cell
     /// (a click, not a drag), open the link.
     fn maybe_open_clicked_link(&mut self) {
-        let release = self.cell_at(self.pointer_pos.0, self.pointer_pos.1);
+        let idx = self.focused_window;
+        let (px, py) = self.windows[idx].pointer_pos;
+        let release = self.cell_at(idx, px, py);
         let Some((row, col)) = release else { return };
-        if self.press_cell != Some((row, col)) {
+        if self.windows[idx].press_cell != Some((row, col)) {
             return;
         }
-        let uri = self
+        let uri = self.windows[idx]
             .session
             .as_ref()
             .and_then(|s| s.term.grid().link_at(row, col).map(|id| (s, id)))
@@ -1140,78 +1211,85 @@ impl App {
         }
     }
 
-    /// Scale a logical pixel length to physical (buffer) pixels at the current
-    /// fractional scale, rounding to nearest.
-    fn to_phys(&self, v: u32) -> u32 {
-        ((u64::from(v) * u64::from(self.scale120) + 60) / 120) as u32
+    /// Scale a logical pixel length to physical (buffer) pixels at window `idx`'s
+    /// current fractional scale, rounding to nearest.
+    fn to_phys(&self, idx: usize, v: u32) -> u32 {
+        ((u64::from(v) * u64::from(self.windows[idx].scale120) + 60) / 120) as u32
     }
 
-    /// Physical (buffer) pixel size at the current scale.
-    fn phys_dims(&self) -> (u32, u32) {
+    /// Physical (buffer) pixel size of window `idx` at its current scale.
+    fn phys_dims(&self, idx: usize) -> (u32, u32) {
+        let win = &self.windows[idx];
         (
-            self.to_phys(self.width).max(1),
-            self.to_phys(self.height).max(1),
+            self.to_phys(idx, win.width).max(1),
+            self.to_phys(idx, win.height).max(1),
         )
     }
 
-    /// Columns and rows for the current physical size, metrics, and padding.
+    /// Columns and rows for window `idx`'s physical size, metrics, and padding.
     /// Scale-invariant: every term scales together so the cell count is stable.
-    fn grid_dims(&self) -> (u16, u16) {
-        let (pw, ph) = self.phys_dims();
+    fn grid_dims(&self, idx: usize) -> (u16, u16) {
+        let (pw, ph) = self.phys_dims(idx);
         grid_size(
             self.renderer.metrics(),
             pw,
             ph,
             (
-                self.to_phys(self.config.main.pad_x),
-                self.to_phys(self.config.main.pad_y),
+                self.to_phys(idx, self.config.main.pad_x),
+                self.to_phys(idx, self.config.main.pad_y),
             ),
         )
     }
 
-    /// Re-rasterize the font and padding at the current scale × the logical
-    /// font size, so glyphs are crisp at fractional scales.
-    fn rescale_render(&mut self) {
+    /// Re-rasterize the font and padding at window `idx`'s current scale × the
+    /// logical font size, so glyphs are crisp at fractional scales.
+    fn rescale_render(&mut self, idx: usize) {
         self.renderer.set_padding(
-            self.to_phys(self.config.main.pad_x),
-            self.to_phys(self.config.main.pad_y),
+            self.to_phys(idx, self.config.main.pad_x),
+            self.to_phys(idx, self.config.main.pad_y),
         );
-        let px = self.to_phys(self.font_size).max(1);
+        let px = self.to_phys(idx, self.font_size).max(1);
         if let Err(err) = self.renderer.set_font(&self.config.main.font, px) {
-            tracing::warn!("rasterize font at scale {}: {err:#}", self.scale120);
+            tracing::warn!(
+                "rasterize font at scale {}: {err:#}",
+                self.windows[idx].scale120
+            );
         }
     }
 
-    /// Adopt a new preferred scale (in 120ths): re-rasterize, re-derive the grid
-    /// geometry, and update the viewport so the logical size stays put.
-    fn set_scale(&mut self, scale120: u32) {
+    /// Adopt a new preferred scale (in 120ths) for window `idx`: re-rasterize,
+    /// re-derive the grid geometry, and update the viewport so the logical size
+    /// stays put.
+    fn set_scale(&mut self, idx: usize, scale120: u32) {
         let scale120 = scale120.max(1);
-        if scale120 == self.scale120 {
+        if scale120 == self.windows[idx].scale120 {
             return;
         }
-        self.scale120 = scale120;
-        self.rescale_render();
-        self.frames.clear();
-        self.buf_dims = (0, 0);
-        if let Some(vp) = &self.viewport {
-            vp.set_destination(self.width.max(1) as i32, self.height.max(1) as i32);
+        self.windows[idx].scale120 = scale120;
+        self.rescale_render(idx);
+        self.windows[idx].frames.clear();
+        self.windows[idx].buf_dims = (0, 0);
+        if let Some(vp) = &self.windows[idx].viewport {
+            let (w, h) = (self.windows[idx].width, self.windows[idx].height);
+            vp.set_destination(w.max(1) as i32, h.max(1) as i32);
         }
-        self.resize_grid();
-        self.needs_draw = true;
+        self.resize_grid(idx);
+        self.windows[idx].needs_draw = true;
     }
 
-    /// Inner padding `(x, y)` in physical pixels (pointer coords are converted
-    /// to physical before use).
-    fn padding(&self) -> (f64, f64) {
+    /// Inner padding `(x, y)` in physical pixels for window `idx` (pointer coords
+    /// are converted to physical before use).
+    fn padding(&self, idx: usize) -> (f64, f64) {
         (
-            f64::from(self.to_phys(self.config.main.pad_x)),
-            f64::from(self.to_phys(self.config.main.pad_y)),
+            f64::from(self.to_phys(idx, self.config.main.pad_x)),
+            f64::from(self.to_phys(idx, self.config.main.pad_y)),
         )
     }
 
-    /// Convert a logical surface coordinate to a physical buffer coordinate.
-    fn to_phys_f(&self, v: f64) -> f64 {
-        v * f64::from(self.scale120) / 120.0
+    /// Convert a logical surface coordinate to a physical buffer coordinate for
+    /// window `idx`.
+    fn to_phys_f(&self, idx: usize, v: f64) -> f64 {
+        v * f64::from(self.windows[idx].scale120) / 120.0
     }
 
     /// The active seat (the one that most recently produced input).
@@ -1291,12 +1369,12 @@ impl App {
         }
     }
 
-    /// Map window pixel coordinates to an absolute `(row, col)` grid point.
-    fn cell_at(&self, px: f64, py: f64) -> Option<(usize, usize)> {
-        let session = self.session.as_ref()?;
+    /// Map window `idx` pixel coordinates to an absolute `(row, col)` grid point.
+    fn cell_at(&self, idx: usize, px: f64, py: f64) -> Option<(usize, usize)> {
+        let session = self.windows[idx].session.as_ref()?;
         let m = self.renderer.metrics();
-        let (pad_x, pad_y) = self.padding();
-        let (px, py) = (self.to_phys_f(px), self.to_phys_f(py));
+        let (pad_x, pad_y) = self.padding(idx);
+        let (px, py) = (self.to_phys_f(idx, px), self.to_phys_f(idx, py));
         let grid = session.term.grid();
         let col =
             ((px - pad_x).max(0.0) as usize / m.width as usize).min(grid.cols().saturating_sub(1));
@@ -1307,10 +1385,12 @@ impl App {
 
     /// Left-button press: start (or word/line-extend) a selection.
     fn pointer_press(&mut self, time: u32) {
-        let Some((row, col)) = self.cell_at(self.pointer_pos.0, self.pointer_pos.1) else {
+        let idx = self.focused_window;
+        let (px, py) = self.windows[idx].pointer_pos;
+        let Some((row, col)) = self.cell_at(idx, px, py) else {
             return;
         };
-        let count = match self.last_click {
+        let count = match self.windows[idx].last_click {
             Some((t, r, c, n))
                 if time.wrapping_sub(t) <= MULTI_CLICK_MS && r == row && c == col =>
             {
@@ -1318,11 +1398,12 @@ impl App {
             }
             _ => 1,
         };
-        self.last_click = Some((time, row, col, count));
-        let Some(session) = self.session.as_mut() else {
+        self.windows[idx].last_click = Some((time, row, col, count));
+        let ctrl = self.modifiers.ctrl;
+        let win = &mut self.windows[idx];
+        let Some(session) = win.session.as_mut() else {
             return;
         };
-        let ctrl = self.modifiers.ctrl;
         let grid = session.term.grid_mut();
         match count {
             2 => grid.select_word(row, col),
@@ -1331,39 +1412,49 @@ impl App {
             _ if ctrl => grid.start_block_selection(row, col),
             _ => grid.start_selection(row, col),
         }
-        self.selecting = true;
-        self.needs_draw = true;
+        win.selecting = true;
+        win.needs_draw = true;
     }
 
     /// Pointer motion during a drag: extend the selection head and, if the
     /// pointer has left the top/bottom edge, start autoscrolling.
     fn pointer_drag(&mut self) {
-        if !self.selecting {
+        let idx = self.focused_window;
+        if !self.windows[idx].selecting {
             return;
         }
-        let Some((row, col)) = self.cell_at(self.pointer_pos.0, self.pointer_pos.1) else {
+        let (px, py) = self.windows[idx].pointer_pos;
+        let Some((row, col)) = self.cell_at(idx, px, py) else {
             return;
         };
-        if let Some(session) = self.session.as_mut() {
-            session.term.grid_mut().extend_selection(row, col);
-            self.needs_draw = true;
+        {
+            let win = &mut self.windows[idx];
+            if let Some(session) = win.session.as_mut() {
+                session.term.grid_mut().extend_selection(row, col);
+                win.needs_draw = true;
+            }
         }
         self.update_autoscroll();
     }
 
     /// Arm or disarm edge autoscroll based on the pointer's vertical position.
     fn update_autoscroll(&mut self) {
-        let dir = if self.pointer_pos.1 < 0.0 {
+        let idx = self.focused_window;
+        let (py, height) = {
+            let win = &self.windows[idx];
+            (win.pointer_pos.1, win.height)
+        };
+        let dir = if py < 0.0 {
             1 // above the top: reveal older lines
-        } else if self.pointer_pos.1 >= f64::from(self.height) {
+        } else if py >= f64::from(height) {
             -1 // below the bottom: advance toward the live screen
         } else {
             0
         };
-        self.autoscroll = dir;
-        if dir != 0 && self.autoscroll_timer.is_none() {
+        self.windows[idx].autoscroll = dir;
+        if dir != 0 && self.windows[idx].autoscroll_timer.is_none() {
             let timer = Timer::immediate();
-            self.autoscroll_timer = self
+            self.windows[idx].autoscroll_timer = self
                 .loop_handle
                 .insert_source(timer, |_, _, app: &mut App| app.autoscroll_step())
                 .ok();
@@ -1374,35 +1465,44 @@ impl App {
     /// the edge cell under the pointer. Reschedules until the drag ends or the
     /// pointer returns inside the window.
     fn autoscroll_step(&mut self) -> TimeoutAction {
-        if !self.selecting || self.autoscroll == 0 {
-            self.autoscroll_timer = None;
+        let idx = self.focused_window;
+        if !self.windows[idx].selecting || self.windows[idx].autoscroll == 0 {
+            self.windows[idx].autoscroll_timer = None;
             return TimeoutAction::Drop;
         }
-        if let Some(session) = self.session.as_mut() {
-            session.term.scroll_view(self.autoscroll);
+        let ascroll = self.windows[idx].autoscroll;
+        {
+            let win = &mut self.windows[idx];
+            if let Some(session) = win.session.as_mut() {
+                session.term.scroll_view(ascroll);
+            }
         }
-        let edge_y = if self.autoscroll > 0 {
+        let height = self.windows[idx].height;
+        let edge_y = if ascroll > 0 {
             0.0
         } else {
-            f64::from(self.height) - 1.0
+            f64::from(height) - 1.0
         };
-        if let Some((row, col)) = self.cell_at(self.pointer_pos.0, edge_y)
-            && let Some(session) = self.session.as_mut()
-        {
-            session.term.grid_mut().extend_selection(row, col);
+        let px = self.windows[idx].pointer_pos.0;
+        if let Some((row, col)) = self.cell_at(idx, px, edge_y) {
+            let win = &mut self.windows[idx];
+            if let Some(session) = win.session.as_mut() {
+                session.term.grid_mut().extend_selection(row, col);
+            }
         }
-        self.needs_draw = true;
+        self.windows[idx].needs_draw = true;
         TimeoutAction::ToDuration(Duration::from_millis(AUTOSCROLL_MS))
     }
 
     /// Left-button release: stop autoscrolling and publish the primary selection.
     fn pointer_release(&mut self, qh: &QueueHandle<App>) {
-        if !self.selecting {
+        let idx = self.focused_window;
+        if !self.windows[idx].selecting {
             return;
         }
-        self.selecting = false;
-        self.autoscroll = 0;
-        if let Some(token) = self.autoscroll_timer.take() {
+        self.windows[idx].selecting = false;
+        self.windows[idx].autoscroll = 0;
+        if let Some(token) = self.windows[idx].autoscroll_timer.take() {
             self.loop_handle.remove(token);
         }
         self.set_primary(qh);
@@ -1410,21 +1510,22 @@ impl App {
 
     /// Whether the application wants mouse reports and the user is not holding
     /// Shift (which forces local selection regardless of mode).
-    fn mouse_reporting(&self) -> bool {
-        self.session
+    fn mouse_reporting(&self, idx: usize) -> bool {
+        self.windows[idx]
+            .session
             .as_ref()
             .is_some_and(|s| s.term.grid().mouse_protocol() != MouseProtocol::Off)
             && !self.modifiers.shift
     }
 
     /// The viewport cell `(col, row)` under the pointer, clamped to the screen.
-    fn report_screen_cell(&self) -> Option<(usize, usize)> {
-        let session = self.session.as_ref()?;
+    fn report_screen_cell(&self, idx: usize) -> Option<(usize, usize)> {
+        let session = self.windows[idx].session.as_ref()?;
         let m = self.renderer.metrics();
-        let (pad_x, pad_y) = self.padding();
+        let (pad_x, pad_y) = self.padding(idx);
         let (ppx, ppy) = (
-            self.to_phys_f(self.pointer_pos.0),
-            self.to_phys_f(self.pointer_pos.1),
+            self.to_phys_f(idx, self.windows[idx].pointer_pos.0),
+            self.to_phys_f(idx, self.windows[idx].pointer_pos.1),
         );
         let grid = session.term.grid();
         let col =
@@ -1437,18 +1538,19 @@ impl App {
     /// Report a button press/release to the application, if reporting is active.
     /// Returns whether the event was consumed (so local handling is skipped).
     fn try_report_button(&mut self, code: u8, pressed: bool) -> bool {
-        let Some(session) = self.session.as_ref() else {
+        let idx = self.focused_window;
+        let Some((proto, enc)) = self.windows[idx].session.as_ref().map(|s| {
+            let grid = s.term.grid();
+            (grid.mouse_protocol(), grid.mouse_encoding())
+        }) else {
             return false;
         };
-        let grid = session.term.grid();
-        let proto = grid.mouse_protocol();
         if proto == MouseProtocol::Off || self.modifiers.shift {
             return false;
         }
-        let enc = grid.mouse_encoding();
         // X10 (mode 9) reports presses only; a release is swallowed, not sent.
         if (pressed || proto != MouseProtocol::X10)
-            && let Some((col, row)) = self.report_screen_cell()
+            && let Some((col, row)) = self.report_screen_cell(idx)
         {
             let bytes = beer_protocols::mouse::encode_mouse(
                 enc,
@@ -1460,7 +1562,7 @@ impl App {
                 self.modifiers,
             );
             self.write_to_pty(&bytes);
-            self.last_report_cell = Some((col, row));
+            self.windows[idx].last_report_cell = Some((col, row));
         }
         true
     }
@@ -1468,26 +1570,27 @@ impl App {
     /// Report pointer motion to the application when the active mode wants it.
     /// Returns whether reporting consumed the motion (suppressing local drag).
     fn try_report_motion(&mut self) -> bool {
-        let Some(session) = self.session.as_ref() else {
+        let idx = self.focused_window;
+        let Some((proto, enc)) = self.windows[idx].session.as_ref().map(|s| {
+            let grid = s.term.grid();
+            (grid.mouse_protocol(), grid.mouse_encoding())
+        }) else {
             return false;
         };
-        let grid = session.term.grid();
-        let proto = grid.mouse_protocol();
         if proto == MouseProtocol::Off || self.modifiers.shift {
             return false;
         }
-        let enc = grid.mouse_encoding();
         let wants = match proto {
             MouseProtocol::Any => true,
-            MouseProtocol::Button => self.pressed_button.is_some(),
+            MouseProtocol::Button => self.windows[idx].pressed_button.is_some(),
             _ => false,
         };
         if wants
-            && let Some((col, row)) = self.report_screen_cell()
-            && self.last_report_cell != Some((col, row))
+            && let Some((col, row)) = self.report_screen_cell(idx)
+            && self.windows[idx].last_report_cell != Some((col, row))
         {
             // Any-event motion with no button held uses the "no button" code 3.
-            let code = self.pressed_button.unwrap_or(3);
+            let code = self.windows[idx].pressed_button.unwrap_or(3);
             let bytes = beer_protocols::mouse::encode_mouse(
                 enc,
                 code,
@@ -1498,14 +1601,14 @@ impl App {
                 self.modifiers,
             );
             self.write_to_pty(&bytes);
-            self.last_report_cell = Some((col, row));
+            self.windows[idx].last_report_cell = Some((col, row));
         }
         true
     }
 
     /// Send focus in/out (DECSET 1004) to the application when it asked for it.
     fn report_focus(&mut self, focused: bool) {
-        if self
+        if self.windows[self.focused_window]
             .session
             .as_ref()
             .is_some_and(|s| s.term.grid().focus_events())
@@ -1518,29 +1621,36 @@ impl App {
     /// current focus: inhibit only while focused, so a backgrounded terminal
     /// still lets the screen blank. Idempotent; called on every focus change.
     fn sync_idle_inhibit(&mut self) {
-        let want = self.config.main.idle_inhibit && self.focused;
-        if want && self.idle_inhibitor.is_none() {
+        let idx = self.focused_window;
+        let want = self.config.main.idle_inhibit && self.windows[idx].focused;
+        if want && self.windows[idx].idle_inhibitor.is_none() {
             if let Some(mgr) = &self.idle_inhibit_manager {
-                self.idle_inhibitor =
-                    Some(mgr.create_inhibitor(self.window.wl_surface(), &self.qh, ()));
+                let inhibitor =
+                    mgr.create_inhibitor(self.windows[idx].window.wl_surface(), &self.qh, ());
+                self.windows[idx].idle_inhibitor = Some(inhibitor);
             }
-        } else if !want && let Some(inhibitor) = self.idle_inhibitor.take() {
+        } else if !want && let Some(inhibitor) = self.windows[idx].idle_inhibitor.take() {
             inhibitor.destroy();
         }
     }
 
-    /// Write bytes to the PTY master, logging on failure.
+    /// Write bytes to the focused window's PTY master, logging on failure.
     fn write_to_pty(&mut self, bytes: &[u8]) {
-        if let Some(session) = self.session.as_mut()
+        if let Some(session) = self.windows[self.focused_window].session.as_mut()
             && let Err(err) = write_all(session.pty.master(), bytes)
         {
             tracing::warn!("write to pty: {err}");
         }
     }
 
-    /// The current selection text, if any and non-empty.
-    fn selection_text(&self) -> Option<String> {
-        let text = self.session.as_ref()?.term.grid().selection_text()?;
+    /// The current selection text in window `idx`, if any and non-empty.
+    fn selection_text(&self, idx: usize) -> Option<String> {
+        let text = self.windows[idx]
+            .session
+            .as_ref()?
+            .term
+            .grid()
+            .selection_text()?;
         (!text.is_empty()).then_some(text)
     }
 
@@ -1571,30 +1681,30 @@ impl App {
 
     /// Claim the clipboard (CLIPBOARD) with the current selection (Ctrl+Shift+C).
     fn set_clipboard(&mut self, qh: &QueueHandle<App>) {
-        if let Some(text) = self.selection_text() {
+        if let Some(text) = self.selection_text(self.focused_window) {
             self.claim_clipboard(text, qh);
         }
     }
 
     /// Claim the primary selection with the current selection (select-to-copy).
     fn set_primary(&mut self, qh: &QueueHandle<App>) {
-        if let Some(text) = self.selection_text() {
+        if let Some(text) = self.selection_text(self.focused_window) {
             self.claim_primary(text, qh);
         }
     }
 
-    /// Point the IME's candidate popup at the terminal cursor, in logical
-    /// surface coordinates (the renderer works in physical pixels, so divide
-    /// the physical cell rectangle back down by the scale).
-    fn ime_set_cursor_rect(&self, ti: &ZwpTextInputV3) {
-        let Some(session) = self.session.as_ref() else {
+    /// Point the IME's candidate popup at window `idx`'s terminal cursor, in
+    /// logical surface coordinates (the renderer works in physical pixels, so
+    /// divide the physical cell rectangle back down by the scale).
+    fn ime_set_cursor_rect(&self, idx: usize, ti: &ZwpTextInputV3) {
+        let Some(session) = self.windows[idx].session.as_ref() else {
             return;
         };
         let (cx, cy) = session.term.grid().cursor();
         let m = self.renderer.metrics();
-        let s = f64::from(self.scale120) / 120.0;
-        let pad_x = f64::from(self.to_phys(self.config.main.pad_x));
-        let pad_y = f64::from(self.to_phys(self.config.main.pad_y));
+        let s = f64::from(self.windows[idx].scale120) / 120.0;
+        let pad_x = f64::from(self.to_phys(idx, self.config.main.pad_x));
+        let pad_y = f64::from(self.to_phys(idx, self.config.main.pad_y));
         let x = ((pad_x + cx as f64 * f64::from(m.width)) / s) as i32;
         let y = ((pad_y + cy as f64 * f64::from(m.height)) / s) as i32;
         let w = (f64::from(m.width) / s) as i32;
@@ -1605,15 +1715,20 @@ impl App {
     /// Apply one IME transaction: commit any committed text to the shell, adopt
     /// the new preedit, then re-commit our state (cursor rectangle) to the IME.
     fn ime_done(&mut self, ti: &ZwpTextInputV3) {
-        let commit = std::mem::take(&mut self.ime_commit_pending);
-        // Preedit is replaced wholesale each cycle; an absent preedit clears it.
-        self.preedit = std::mem::take(&mut self.ime_preedit_pending);
+        let idx = self.focused_window;
+        let commit = {
+            let win = &mut self.windows[idx];
+            let commit = std::mem::take(&mut win.ime_commit_pending);
+            // Preedit is replaced wholesale each cycle; an absent preedit clears it.
+            win.preedit = std::mem::take(&mut win.ime_preedit_pending);
+            commit
+        };
         if !commit.is_empty() {
             self.send_to_shell(commit.as_bytes());
         }
-        self.ime_set_cursor_rect(ti);
+        self.ime_set_cursor_rect(idx, ti);
         ti.commit();
-        self.needs_draw = true;
+        self.windows[idx].needs_draw = true;
     }
 
     /// Act on the OSC 52 clipboard requests an application made: take ownership
@@ -1716,11 +1831,12 @@ impl App {
     /// Write pasted bytes to the PTY, framing them for bracketed-paste mode and
     /// snapping the viewport to the live screen.
     fn paste_bytes(&mut self, data: &[u8]) {
-        let Some(session) = self.session.as_mut() else {
+        let win = &mut self.windows[self.focused_window];
+        let Some(session) = win.session.as_mut() else {
             return;
         };
         session.term.scroll_to_bottom();
-        self.needs_draw = true;
+        win.needs_draw = true;
         let bracketed = session.term.grid().bracketed_paste();
         // Strip control bytes a terminal must never receive raw from a paste;
         // keep tab and newlines (CR is what the shell expects for Enter).
@@ -1743,27 +1859,32 @@ impl App {
         }
     }
 
-    /// After parsing child output: send any replies, sync the title, repaint.
-    fn after_feed(&mut self) {
-        let Some(session) = self.session.as_mut() else {
-            return;
-        };
-        let reply = session.term.take_response();
-        if !reply.is_empty()
-            && let Err(err) = write_all(session.pty.master(), &reply)
-        {
-            tracing::warn!("write to pty: {err}");
-        }
+    /// After parsing window `idx`'s child output: send any replies, sync the
+    /// title, repaint.
+    fn after_feed(&mut self, idx: usize) {
+        let (rang, ops, notifications) = {
+            let win = &mut self.windows[idx];
+            let Some(session) = win.session.as_mut() else {
+                return;
+            };
+            let reply = session.term.take_response();
+            if !reply.is_empty()
+                && let Err(err) = write_all(session.pty.master(), &reply)
+            {
+                tracing::warn!("write to pty: {err}");
+            }
 
-        let new_title = session.term.title().map(str::to_owned);
-        if new_title.as_deref() != self.title.as_deref() {
-            self.title = new_title;
-            self.window
-                .set_title(self.title.clone().unwrap_or_default());
-        }
-        let rang = session.term.take_bell();
-        let ops = session.term.take_clipboard_ops();
-        let notifications = session.term.take_notifications();
+            let new_title = session.term.title().map(str::to_owned);
+            if new_title.as_deref() != win.title.as_deref() {
+                win.title = new_title;
+                win.window.set_title(win.title.clone().unwrap_or_default());
+            }
+            (
+                session.term.take_bell(),
+                session.term.take_clipboard_ops(),
+                session.term.take_notifications(),
+            )
+        };
         if !ops.is_empty() {
             self.handle_clipboard_ops(ops);
         }
@@ -1773,7 +1894,7 @@ impl App {
         if rang {
             self.ring_bell();
         }
-        self.needs_draw = true;
+        self.windows[idx].needs_draw = true;
     }
 
     /// React to a `BEL`: optionally flash, run the configured bell command, and
@@ -1791,7 +1912,7 @@ impl App {
                 .spawn()
                 .inspect_err(|err| tracing::warn!("bell command: {err}"));
         }
-        if self.config.bell.urgent && !self.focused {
+        if self.config.bell.urgent && !self.windows[self.focused_window].focused {
             self.request_attention();
         }
     }
@@ -1805,7 +1926,7 @@ impl App {
         let title = note
             .title
             .clone()
-            .or_else(|| self.title.clone())
+            .or_else(|| self.windows[self.focused_window].title.clone())
             .unwrap_or_else(|| "beer".to_string());
         let _ = std::process::Command::new(program)
             .args(args)
@@ -1830,7 +1951,12 @@ impl App {
         let data = smithay_client_toolkit::activation::RequestData {
             app_id: Some("dev.notashelf.beer".to_string()),
             seat_and_serial,
-            surface: Some(self.window.wl_surface().clone()),
+            surface: Some(
+                self.windows[self.focused_window]
+                    .window
+                    .wl_surface()
+                    .clone(),
+            ),
         };
         activation.request_token::<App>(&self.qh, data);
     }
@@ -1838,31 +1964,33 @@ impl App {
     /// Begin a visual-bell flash: invert the screen for a moment. Clearing the
     /// buffer ring forces a full repaint with the inverted theme.
     fn start_flash(&mut self) {
-        self.flashing = true;
-        self.frames.clear();
-        self.needs_draw = true;
-        if self.flash_timer.is_none() {
+        let idx = self.focused_window;
+        self.windows[idx].flashing = true;
+        self.windows[idx].frames.clear();
+        self.windows[idx].needs_draw = true;
+        if self.windows[idx].flash_timer.is_none() {
             let timer = Timer::from_duration(Duration::from_millis(FLASH_MS));
-            self.flash_timer = self
+            self.windows[idx].flash_timer = self
                 .loop_handle
-                .insert_source(timer, |_, _, app: &mut App| {
-                    app.flashing = false;
-                    app.frames.clear();
-                    app.needs_draw = true;
-                    app.flash_timer = None;
+                .insert_source(timer, move |_, _, app: &mut App| {
+                    app.windows[idx].flashing = false;
+                    app.windows[idx].frames.clear();
+                    app.windows[idx].needs_draw = true;
+                    app.windows[idx].flash_timer = None;
                     TimeoutAction::Drop
                 })
                 .ok();
         }
     }
 
-    /// Recompute the grid size for the current window and tell the grid and the
-    /// PTY about it if it changed.
-    fn resize_grid(&mut self) {
-        let (cols, rows) = self.grid_dims();
+    /// Recompute window `idx`'s grid size and tell the grid and the PTY about it
+    /// if it changed.
+    fn resize_grid(&mut self, idx: usize) {
+        let (cols, rows) = self.grid_dims(idx);
         let m = self.renderer.metrics();
         let cell = (m.width as u16, m.height as u16);
-        let Some(session) = self.session.as_mut() else {
+        let win = &mut self.windows[idx];
+        let Some(session) = win.session.as_mut() else {
             return;
         };
         if (cols as usize, rows as usize)
@@ -1876,10 +2004,10 @@ impl App {
         }
     }
 
-    /// The child shell has gone away; reap it, capture its code, and tear the
-    /// window down.
-    fn child_exited(&mut self) {
-        if let Some(session) = self.session.as_mut() {
+    /// Window `idx`'s child shell has gone away; reap it, capture its code, and
+    /// tear the window down.
+    fn child_exited(&mut self, idx: usize) {
+        if let Some(session) = self.windows[idx].session.as_mut() {
             match session.pty.wait() {
                 Ok(status) => {
                     tracing::info!("shell exited: {status}");
@@ -1895,38 +2023,41 @@ impl App {
         self.exit = true;
     }
 
-    /// Present a frame if one is wanted and the compositor is ready for it.
+    /// Present window `idx`'s frame if one is wanted and the compositor is ready.
     /// Called after every event-loop wake; the frame-callback gate keeps draws
     /// paced to the display instead of one per PTY read. While the app holds
     /// synchronized output (DECSET 2026) we withhold the frame, but arm a
     /// timeout so a stuck `2026h` cannot freeze the window.
-    fn flush(&mut self) {
-        let sync = self
+    fn flush(&mut self, idx: usize) {
+        let sync = self.windows[idx]
             .session
             .as_ref()
             .is_some_and(|s| s.term.grid().sync_active());
         if sync {
-            if self.sync_timeout.is_none() {
+            if self.windows[idx].sync_timeout.is_none() {
                 let timer = Timer::from_duration(Duration::from_millis(SYNC_TIMEOUT_MS));
-                self.sync_timeout = self
+                self.windows[idx].sync_timeout = self
                     .loop_handle
-                    .insert_source(timer, |_, _, app: &mut App| {
-                        if let Some(session) = app.session.as_mut() {
+                    .insert_source(timer, move |_, _, app: &mut App| {
+                        if let Some(session) = app.windows[idx].session.as_mut() {
                             session.term.grid_mut().set_sync(false);
                         }
-                        app.sync_timeout = None;
-                        app.needs_draw = true;
+                        app.windows[idx].sync_timeout = None;
+                        app.windows[idx].needs_draw = true;
                         TimeoutAction::Drop
                     })
                     .ok();
             }
             return;
         }
-        if let Some(token) = self.sync_timeout.take() {
+        if let Some(token) = self.windows[idx].sync_timeout.take() {
             self.loop_handle.remove(token);
         }
-        if self.needs_draw && !self.frame_pending && self.session.is_some() {
-            self.present();
+        if self.windows[idx].needs_draw
+            && !self.windows[idx].frame_pending
+            && self.windows[idx].session.is_some()
+        {
+            self.present(idx);
         }
     }
 }
