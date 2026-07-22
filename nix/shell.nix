@@ -26,7 +26,7 @@ mkShell {
     cargo
     rustc
     clippy
-    rustfmt
+    (rustfmt.override {asNightly = true;})
     taplo
     rust-analyzer
     cargo-deny

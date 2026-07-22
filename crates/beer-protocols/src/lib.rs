@@ -36,5 +36,11 @@ pub mod style;
 pub mod text_size;
 
 pub use style::{
-    Color, CursorShape, MouseEncoding, MouseProtocol, PromptKind, Underline, prompt_kind,
+  Color,
+  CursorShape,
+  MouseEncoding,
+  MouseProtocol,
+  PromptKind,
+  Underline,
+  prompt_kind,
 };

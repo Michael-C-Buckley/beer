@@ -7,625 +7,671 @@
 
 use std::num::NonZeroU16;
 
-use beer_protocols::graphics::{PLACEHOLDER, diacritic_value};
-use beer_protocols::text_size::{HAlign, VAlign};
+use beer_protocols::{
+  graphics::{PLACEHOLDER, diacritic_value},
+  text_size::{HAlign, VAlign},
+};
 
-use crate::font::{CellMetrics, Fonts, Glyph, GlyphData, Style};
-use crate::grid::{Cell, Color, CursorShape, Flags, Grid, Underline};
-use crate::theme::{Plane, Rgb, Theme};
+use crate::{
+  font::{CellMetrics, Fonts, Glyph, GlyphData, Style},
+  grid::{Cell, Color, CursorShape, Flags, Grid, Underline},
+  theme::{Plane, Rgb, Theme},
+};
 
 /// A mutable view over a BGRA pixel buffer.
 struct Canvas<'a> {
-    pixels: &'a mut [u8],
-    width: usize,
-    height: usize,
+  pixels: &'a mut [u8],
+  width:  usize,
+  height: usize,
 }
 
 impl Canvas<'_> {
-    fn index(&self, x: i32, y: i32) -> Option<usize> {
-        if x < 0 || y < 0 || x as usize >= self.width || y as usize >= self.height {
-            return None;
-        }
-        Some((y as usize * self.width + x as usize) * 4)
+  fn index(&self, x: i32, y: i32) -> Option<usize> {
+    if x < 0 || y < 0 || x as usize >= self.width || y as usize >= self.height {
+      return None;
     }
+    Some((y as usize * self.width + x as usize) * 4)
+  }
 
-    fn fill_rect(&mut self, x0: i32, y0: i32, w: u32, h: u32, c: Rgb) {
-        self.fill_rect_a(x0, y0, w, h, c, 0xff);
-    }
+  fn fill_rect(&mut self, x0: i32, y0: i32, w: u32, h: u32, c: Rgb) {
+    self.fill_rect_a(x0, y0, w, h, c, 0xFF);
+  }
 
-    /// Fill a rectangle with colour `c` at opacity `alpha`. The shm buffer is
-    /// premultiplied ARGB, so a translucent fill stores `rgb * alpha`.
-    fn fill_rect_a(&mut self, x0: i32, y0: i32, w: u32, h: u32, c: Rgb, alpha: u8) {
-        let x_start = x0.max(0) as usize;
-        let x_end = ((x0 + w as i32).max(0) as usize).min(self.width);
-        let y_start = y0.max(0) as usize;
-        let y_end = ((y0 + h as i32).max(0) as usize).min(self.height);
-        if x_start >= x_end {
-            return;
-        }
-        let a = u32::from(alpha);
-        let pm = |v: u8| ((u32::from(v) * a) / 255) as u8;
-        let bytes = [pm(c.2), pm(c.1), pm(c.0), alpha];
-        for y in y_start..y_end {
-            let row =
-                &mut self.pixels[(y * self.width + x_start) * 4..(y * self.width + x_end) * 4];
-            for px in row.chunks_exact_mut(4) {
-                px.copy_from_slice(&bytes);
-            }
-        }
+  /// Fill a rectangle with colour `c` at opacity `alpha`. The shm buffer is
+  /// premultiplied ARGB, so a translucent fill stores `rgb * alpha`.
+  fn fill_rect_a(
+    &mut self,
+    x0: i32,
+    y0: i32,
+    w: u32,
+    h: u32,
+    c: Rgb,
+    alpha: u8,
+  ) {
+    let x_start = x0.max(0) as usize;
+    let x_end = ((x0 + w as i32).max(0) as usize).min(self.width);
+    let y_start = y0.max(0) as usize;
+    let y_end = ((y0 + h as i32).max(0) as usize).min(self.height);
+    if x_start >= x_end {
+      return;
     }
+    let a = u32::from(alpha);
+    let pm = |v: u8| ((u32::from(v) * a) / 255) as u8;
+    let bytes = [pm(c.2), pm(c.1), pm(c.0), alpha];
+    for y in y_start..y_end {
+      let row = &mut self.pixels
+        [(y * self.width + x_start) * 4..(y * self.width + x_end) * 4];
+      for px in row.chunks_exact_mut(4) {
+        px.copy_from_slice(&bytes);
+      }
+    }
+  }
 
-    /// Alpha-blend `fg` over the existing pixel with coverage `a`.
-    fn blend(&mut self, x: i32, y: i32, fg: Rgb, a: u8) {
-        let Some(i) = self.index(x, y) else { return };
-        let (a, inv) = (u32::from(a), u32::from(255 - a));
-        let mix = |src: u8, dst: u8| ((u32::from(src) * a + u32::from(dst) * inv) / 255) as u8;
-        self.pixels[i] = mix(fg.2, self.pixels[i]);
-        self.pixels[i + 1] = mix(fg.1, self.pixels[i + 1]);
-        self.pixels[i + 2] = mix(fg.0, self.pixels[i + 2]);
-        self.pixels[i + 3] = 0xff;
-    }
+  /// Alpha-blend `fg` over the existing pixel with coverage `a`.
+  fn blend(&mut self, x: i32, y: i32, fg: Rgb, a: u8) {
+    let Some(i) = self.index(x, y) else { return };
+    let (a, inv) = (u32::from(a), u32::from(255 - a));
+    let mix = |src: u8, dst: u8| {
+      ((u32::from(src) * a + u32::from(dst) * inv) / 255) as u8
+    };
+    self.pixels[i] = mix(fg.2, self.pixels[i]);
+    self.pixels[i + 1] = mix(fg.1, self.pixels[i + 1]);
+    self.pixels[i + 2] = mix(fg.0, self.pixels[i + 2]);
+    self.pixels[i + 3] = 0xFF;
+  }
 
-    /// Set a single opaque pixel.
-    fn put(&mut self, x: i32, y: i32, c: Rgb) {
-        if let Some(i) = self.index(x, y) {
-            self.pixels[i] = c.2;
-            self.pixels[i + 1] = c.1;
-            self.pixels[i + 2] = c.0;
-            self.pixels[i + 3] = 0xff;
-        }
+  /// Set a single opaque pixel.
+  fn put(&mut self, x: i32, y: i32, c: Rgb) {
+    if let Some(i) = self.index(x, y) {
+      self.pixels[i] = c.2;
+      self.pixels[i + 1] = c.1;
+      self.pixels[i + 2] = c.0;
+      self.pixels[i + 3] = 0xFF;
     }
+  }
 
-    fn hline(&mut self, x0: i32, y: i32, w: u32, c: Rgb) {
-        self.fill_rect(x0, y, w, 1, c);
-    }
+  fn hline(&mut self, x0: i32, y: i32, w: u32, c: Rgb) {
+    self.fill_rect(x0, y, w, 1, c);
+  }
 
-    /// Composite one straight-alpha RGBA source pixel over the destination.
-    fn blend_rgba(&mut self, x: i32, y: i32, rgba: [u8; 4]) {
-        let a = u32::from(rgba[3]);
-        if a == 0 {
-            return;
-        }
-        let Some(i) = self.index(x, y) else { return };
-        let inv = 255 - a;
-        let mix = |src: u8, dst: u8| ((u32::from(src) * a + u32::from(dst) * inv) / 255) as u8;
-        self.pixels[i] = mix(rgba[2], self.pixels[i]);
-        self.pixels[i + 1] = mix(rgba[1], self.pixels[i + 1]);
-        self.pixels[i + 2] = mix(rgba[0], self.pixels[i + 2]);
-        self.pixels[i + 3] = 0xff;
+  /// Composite one straight-alpha RGBA source pixel over the destination.
+  fn blend_rgba(&mut self, x: i32, y: i32, rgba: [u8; 4]) {
+    let a = u32::from(rgba[3]);
+    if a == 0 {
+      return;
     }
+    let Some(i) = self.index(x, y) else { return };
+    let inv = 255 - a;
+    let mix = |src: u8, dst: u8| {
+      ((u32::from(src) * a + u32::from(dst) * inv) / 255) as u8
+    };
+    self.pixels[i] = mix(rgba[2], self.pixels[i]);
+    self.pixels[i + 1] = mix(rgba[1], self.pixels[i + 1]);
+    self.pixels[i + 2] = mix(rgba[0], self.pixels[i + 2]);
+    self.pixels[i + 3] = 0xFF;
+  }
 
-    /// Composite one pre-multiplied BGRA source pixel over the destination.
-    fn over(&mut self, x: i32, y: i32, src: &[u8]) {
-        let Some(i) = self.index(x, y) else { return };
-        let inv = u32::from(255 - src[3]);
-        let comp = |s: u8, dst: u8| (u32::from(s) + u32::from(dst) * inv / 255).min(255) as u8;
-        self.pixels[i] = comp(src[0], self.pixels[i]);
-        self.pixels[i + 1] = comp(src[1], self.pixels[i + 1]);
-        self.pixels[i + 2] = comp(src[2], self.pixels[i + 2]);
-        self.pixels[i + 3] = 0xff;
-    }
+  /// Composite one pre-multiplied BGRA source pixel over the destination.
+  fn over(&mut self, x: i32, y: i32, src: &[u8]) {
+    let Some(i) = self.index(x, y) else { return };
+    let inv = u32::from(255 - src[3]);
+    let comp = |s: u8, dst: u8| {
+      (u32::from(s) + u32::from(dst) * inv / 255).min(255) as u8
+    };
+    self.pixels[i] = comp(src[0], self.pixels[i]);
+    self.pixels[i + 1] = comp(src[1], self.pixels[i + 1]);
+    self.pixels[i + 2] = comp(src[2], self.pixels[i + 2]);
+    self.pixels[i + 3] = 0xFF;
+  }
 }
 
 /// Per-frame constants shared by every row: the colour scheme, focus, and the
 /// current blink phase.
 #[derive(Clone, Copy, Debug)]
 pub struct Frame<'a> {
-    pub theme: &'a Theme,
-    pub focused: bool,
-    pub blink_on: bool,
-    /// Hyperlink currently under the pointer; its cells get a hover underline.
-    pub hovered_link: Option<NonZeroU16>,
-    /// The graphics engine, source of image pixels and placement geometry.
-    pub images: &'a crate::graphics::Graphics,
+  pub theme:        &'a Theme,
+  pub focused:      bool,
+  pub blink_on:     bool,
+  /// Hyperlink currently under the pointer; its cells get a hover underline.
+  pub hovered_link: Option<NonZeroU16>,
+  /// The graphics engine, source of image pixels and placement geometry.
+  pub images:       &'a crate::graphics::Graphics,
 }
 
 #[derive(Debug)]
 pub struct Renderer {
-    fonts: Fonts,
-    /// Inner padding `(x, y)` in pixels between the window edge and the grid.
-    pad: (i32, i32),
+  fonts: Fonts,
+  /// Inner padding `(x, y)` in pixels between the window edge and the grid.
+  pad:   (i32, i32),
 }
 
 impl Renderer {
-    pub fn new(fonts: Fonts) -> Self {
-        Self { fonts, pad: (0, 0) }
-    }
+  pub fn new(fonts: Fonts) -> Self {
+    Self { fonts, pad: (0, 0) }
+  }
 
-    pub fn metrics(&self) -> CellMetrics {
-        self.fonts.metrics()
-    }
+  pub fn metrics(&self) -> CellMetrics {
+    self.fonts.metrics()
+  }
 
-    pub fn set_padding(&mut self, pad_x: u32, pad_y: u32) {
-        self.pad = (pad_x as i32, pad_y as i32);
-    }
+  pub fn set_padding(&mut self, pad_x: u32, pad_y: u32) {
+    self.pad = (pad_x as i32, pad_y as i32);
+  }
 
-    /// Rebuild the font set at a new size (font-resize bindings).
-    pub fn set_font(&mut self, family: &str, size_px: u32) -> Result<(), crate::font::FontError> {
-        self.fonts = Fonts::new(family, size_px)?;
-        Ok(())
-    }
+  /// Rebuild the font set at a new size (font-resize bindings).
+  pub fn set_font(
+    &mut self,
+    family: &str,
+    size_px: u32,
+  ) -> Result<(), crate::font::FontError> {
+    self.fonts = Fonts::new(family, size_px)?;
+    Ok(())
+  }
 
-    /// Fill the whole buffer (including the padding margins) with the background
-    /// colour. Called once per fresh shm buffer; per-row repaints then leave the
-    /// margins untouched.
-    pub fn clear(&self, pixels: &mut [u8], dims: (usize, usize), theme: &Theme) {
-        let (width, height) = dims;
-        let mut canvas = Canvas {
-            pixels,
-            width,
-            height,
-        };
-        canvas.fill_rect_a(0, 0, width as u32, height as u32, theme.bg, theme.alpha);
-    }
+  /// Fill the whole buffer (including the padding margins) with the background
+  /// colour. Called once per fresh shm buffer; per-row repaints then leave the
+  /// margins untouched.
+  pub fn clear(&self, pixels: &mut [u8], dims: (usize, usize), theme: &Theme) {
+    let (width, height) = dims;
+    let mut canvas = Canvas {
+      pixels,
+      width,
+      height,
+    };
+    canvas.fill_rect_a(
+      0,
+      0,
+      width as u32,
+      height as u32,
+      theme.bg,
+      theme.alpha,
+    );
+  }
 
-    /// Repaint a single grid row `y` into `pixels` (BGRA, `width`×`height` px):
-    /// clear the row band, fill backgrounds (and selection), draw glyphs and
-    /// decorations, then the cursor if it sits on this row. `blink_on` is the
-    /// current blink phase; blinking cells and a blinking cursor vanish when it
-    /// is `false`. Painting one row at a time is what lets the caller damage
-    /// only the rows that actually changed.
-    pub fn render_row(
-        &mut self,
-        pixels: &mut [u8],
-        dims: (usize, usize),
-        grid: &Grid,
-        frame: &Frame,
-        y: usize,
-    ) {
-        let (theme, focused, blink_on) = (frame.theme, frame.focused, frame.blink_on);
-        let (width, height) = dims;
-        let mut canvas = Canvas {
-            pixels,
-            width,
-            height,
-        };
-        let m = self.fonts.metrics();
-        let (pad_x, pad_y) = self.pad;
-        let cols = grid.cols();
-        let row_top = pad_y + y as i32 * m.height as i32;
-        canvas.fill_rect_a(0, row_top, width as u32, m.height, theme.bg, theme.alpha);
+  /// Repaint a single grid row `y` into `pixels` (BGRA, `width`×`height` px):
+  /// clear the row band, fill backgrounds (and selection), draw glyphs and
+  /// decorations, then the cursor if it sits on this row. `blink_on` is the
+  /// current blink phase; blinking cells and a blinking cursor vanish when it
+  /// is `false`. Painting one row at a time is what lets the caller damage
+  /// only the rows that actually changed.
+  pub fn render_row(
+    &mut self,
+    pixels: &mut [u8],
+    dims: (usize, usize),
+    grid: &Grid,
+    frame: &Frame,
+    y: usize,
+  ) {
+    let (theme, focused, blink_on) =
+      (frame.theme, frame.focused, frame.blink_on);
+    let (width, height) = dims;
+    let mut canvas = Canvas {
+      pixels,
+      width,
+      height,
+    };
+    let m = self.fonts.metrics();
+    let (pad_x, pad_y) = self.pad;
+    let cols = grid.cols();
+    let row_top = pad_y + y as i32 * m.height as i32;
+    canvas.fill_rect_a(
+      0,
+      row_top,
+      width as u32,
+      m.height,
+      theme.bg,
+      theme.alpha,
+    );
 
-        // Rows come through the scrollback viewport and may be shorter than
-        // `cols` after a resize, so clamp with `take`.
-        let abs = grid.view_to_abs(y);
-        let cells = grid.view_row(y);
-        let search = grid.search_spans_on(abs);
-        let match_at = |x: usize| -> Option<bool> {
-            search
-                .iter()
-                .find(|(lo, hi, _)| x >= *lo && x <= *hi)
-                .map(|(_, _, current)| *current)
-        };
-        for (x, cell) in cells.iter().take(cols).enumerate() {
-            // Focused match > selection > other match > the cell's own bg.
-            let bg = match match_at(x) {
-                Some(true) => theme.current_match_bg,
-                _ if grid.is_selected(abs, x) => theme.selection_bg,
-                Some(false) => theme.match_bg,
-                None => cell_colors(cell, theme).1,
-            };
-            if bg != theme.bg {
-                canvas.fill_rect(
-                    pad_x + x as i32 * m.width as i32,
-                    row_top,
-                    m.width,
-                    m.height,
-                    bg,
-                );
-            }
-        }
-
-        // Graphics images stacked below the text (negative z-index).
-        draw_image_cells(
-            &mut canvas,
-            frame.images,
-            cells,
-            cols,
-            pad_x,
-            row_top,
-            m,
-            |z| z < 0,
+    // Rows come through the scrollback viewport and may be shorter than
+    // `cols` after a resize, so clamp with `take`.
+    let abs = grid.view_to_abs(y);
+    let cells = grid.view_row(y);
+    let search = grid.search_spans_on(abs);
+    let match_at = |x: usize| -> Option<bool> {
+      search
+        .iter()
+        .find(|(lo, hi, _)| x >= *lo && x <= *hi)
+        .map(|(_, _, current)| *current)
+    };
+    for (x, cell) in cells.iter().take(cols).enumerate() {
+      // Focused match > selection > other match > the cell's own bg.
+      let bg = match match_at(x) {
+        Some(true) => theme.current_match_bg,
+        _ if grid.is_selected(abs, x) => theme.selection_bg,
+        Some(false) => theme.match_bg,
+        None => cell_colors(cell, theme).1,
+      };
+      if bg != theme.bg {
+        canvas.fill_rect(
+          pad_x + x as i32 * m.width as i32,
+          row_top,
+          m.width,
+          m.height,
+          bg,
         );
-
-        for (x, cell) in cells.iter().take(cols).enumerate() {
-            if cell.flags.contains(Flags::WIDE_CONT) {
-                continue;
-            }
-            // Text-sizing (OSC 66) blocks are drawn from their per-row left edge,
-            // clipped to this row's band; every other block cell is skipped.
-            if let Some(sized) = &cell.sized {
-                if sized.dx == 0
-                    && let Some((lead, dy)) = grid.sized_lead(y, x)
-                {
-                    let origin_x = pad_x + x as i32 * m.width as i32;
-                    let (fg, _) = cell_colors(lead, theme);
-                    self.draw_sized(&mut canvas, lead, dy, (origin_x, row_top), m, fg);
-                }
-                continue;
-            }
-            if cell.flags.contains(Flags::BLINK) && !blink_on {
-                continue;
-            }
-            // A Unicode placeholder cell shows an image slice, drawn in its own
-            // pass below; never paint the placeholder code point as a glyph.
-            if cell.c == PLACEHOLDER {
-                continue;
-            }
-            let (fg, _) = cell_colors(cell, theme);
-            let origin_x = pad_x + x as i32 * m.width as i32;
-            let style = cell_style(cell);
-            // A cell carrying combining marks is shaped as a cluster so the
-            // marks land where the font's GPOS table wants them. Shaping returns
-            // None for braille (drawn directly) and for clusters the face does
-            // not fully cover, both of which fall through to the legacy path.
-            let shaped = match &cell.combining {
-                Some(marks) if !is_braille(cell.c) => {
-                    self.fonts.shape_cluster(cell.c, marks, style)
-                }
-                _ => None,
-            };
-            if let Some(shaped) = shaped {
-                for placed in &shaped.glyphs {
-                    if let Ok(glyph) = self.fonts.glyph_indexed(shaped.face_idx, placed.gid, style)
-                    {
-                        blit_glyph(
-                            &mut canvas,
-                            glyph,
-                            m,
-                            origin_x + placed.x,
-                            row_top,
-                            placed.y,
-                            fg,
-                        );
-                    }
-                }
-            } else if is_braille(cell.c) {
-                // Drawn directly so the dots are crisp and fill the cell, the
-                // way tools like btop expect, rather than however the fallback
-                // font happens to size its braille glyphs.
-                draw_braille(&mut canvas, cell.c, origin_x, row_top, m, fg);
-            } else {
-                if cell.c != ' ' {
-                    self.draw_glyph(&mut canvas, cell.c, style, origin_x, row_top, fg);
-                }
-                // No shaper available for this cluster: stack the marks over the
-                // base using each mark glyph's own bearings.
-                if let Some(marks) = &cell.combining {
-                    for mark in marks.chars() {
-                        self.draw_glyph(&mut canvas, mark, style, origin_x, row_top, fg);
-                    }
-                }
-            }
-            draw_decorations(&mut canvas, cell, theme, origin_x, row_top, m, fg);
-            // Underline an OSC 8 hyperlink while the pointer hovers over it.
-            if cell.link.is_some() && cell.link == frame.hovered_link {
-                canvas.hline(origin_x, row_top + m.height as i32 - 2, m.width, fg);
-            }
-        }
-
-        // Graphics images stacked above the text (z-index >= 0).
-        draw_image_cells(
-            &mut canvas,
-            frame.images,
-            cells,
-            cols,
-            pad_x,
-            row_top,
-            m,
-            |z| z >= 0,
-        );
-        // Unicode-placeholder image cells.
-        draw_placeholders(&mut canvas, frame.images, cells, cols, pad_x, row_top, m);
-
-        // The cursor belongs to the live screen; hide it while scrolled back.
-        if grid.view_at_bottom() && grid.cursor().1 == y {
-            self.draw_cursor(&mut canvas, grid, theme, m, focused, blink_on);
-        }
+      }
     }
 
-    /// Draw the incremental-search prompt across the bottom row, over whatever
-    /// grid content was there. The caller marks the bottom row dirty so this
-    /// repaints whenever the query or match count changes.
-    pub fn render_search_bar(
-        &mut self,
-        pixels: &mut [u8],
-        dims: (usize, usize),
-        theme: &Theme,
-        row: usize,
-        text: &str,
-    ) {
-        let (width, height) = dims;
-        let mut canvas = Canvas {
-            pixels,
-            width,
-            height,
-        };
-        let m = self.fonts.metrics();
-        let (pad_x, pad_y) = self.pad;
-        let row_top = pad_y + row as i32 * m.height as i32;
-        canvas.fill_rect(0, row_top, width as u32, m.height, theme.search_bar_bg);
-        let style = Style {
-            bold: false,
-            italic: false,
-        };
-        let mut x = pad_x;
-        for c in text.chars() {
-            if x as usize + m.width as usize > width {
-                break;
-            }
-            if c != ' ' {
-                self.draw_glyph(&mut canvas, c, style, x, row_top, theme.fg);
-            }
-            x += m.width as i32;
+    // Graphics images stacked below the text (negative z-index).
+    draw_image_cells(
+      &mut canvas,
+      frame.images,
+      cells,
+      cols,
+      pad_x,
+      row_top,
+      m,
+      |z| z < 0,
+    );
+
+    for (x, cell) in cells.iter().take(cols).enumerate() {
+      if cell.flags.contains(Flags::WIDE_CONT) {
+        continue;
+      }
+      // Text-sizing (OSC 66) blocks are drawn from their per-row left edge,
+      // clipped to this row's band; every other block cell is skipped.
+      if let Some(sized) = &cell.sized {
+        if sized.dx == 0
+          && let Some((lead, dy)) = grid.sized_lead(y, x)
+        {
+          let origin_x = pad_x + x as i32 * m.width as i32;
+          let (fg, _) = cell_colors(lead, theme);
+          self.draw_sized(&mut canvas, lead, dy, (origin_x, row_top), m, fg);
         }
+        continue;
+      }
+      if cell.flags.contains(Flags::BLINK) && !blink_on {
+        continue;
+      }
+      // A Unicode placeholder cell shows an image slice, drawn in its own
+      // pass below; never paint the placeholder code point as a glyph.
+      if cell.c == PLACEHOLDER {
+        continue;
+      }
+      let (fg, _) = cell_colors(cell, theme);
+      let origin_x = pad_x + x as i32 * m.width as i32;
+      let style = cell_style(cell);
+      // A cell carrying combining marks is shaped as a cluster so the
+      // marks land where the font's GPOS table wants them. Shaping returns
+      // None for braille (drawn directly) and for clusters the face does
+      // not fully cover, both of which fall through to the legacy path.
+      let shaped = match &cell.combining {
+        Some(marks) if !is_braille(cell.c) => {
+          self.fonts.shape_cluster(cell.c, marks, style)
+        },
+        _ => None,
+      };
+      if let Some(shaped) = shaped {
+        for placed in &shaped.glyphs {
+          if let Ok(glyph) =
+            self.fonts.glyph_indexed(shaped.face_idx, placed.gid, style)
+          {
+            blit_glyph(
+              &mut canvas,
+              glyph,
+              m,
+              origin_x + placed.x,
+              row_top,
+              placed.y,
+              fg,
+            );
+          }
+        }
+      } else if is_braille(cell.c) {
+        // Drawn directly so the dots are crisp and fill the cell, the
+        // way tools like btop expect, rather than however the fallback
+        // font happens to size its braille glyphs.
+        draw_braille(&mut canvas, cell.c, origin_x, row_top, m, fg);
+      } else {
+        if cell.c != ' ' {
+          self.draw_glyph(&mut canvas, cell.c, style, origin_x, row_top, fg);
+        }
+        // No shaper available for this cluster: stack the marks over the
+        // base using each mark glyph's own bearings.
+        if let Some(marks) = &cell.combining {
+          for mark in marks.chars() {
+            self.draw_glyph(&mut canvas, mark, style, origin_x, row_top, fg);
+          }
+        }
+      }
+      draw_decorations(&mut canvas, cell, theme, origin_x, row_top, m, fg);
+      // Underline an OSC 8 hyperlink while the pointer hovers over it.
+      if cell.link.is_some() && cell.link == frame.hovered_link {
+        canvas.hline(origin_x, row_top + m.height as i32 - 2, m.width, fg);
+      }
     }
 
-    /// Draw a URL hint label (e.g. `a`, `bc`) as a highlighted tag starting at
-    /// viewport cell `(row, col)`, over whatever was there.
-    pub fn render_label(
-        &mut self,
-        pixels: &mut [u8],
-        dims: (usize, usize),
-        theme: &Theme,
-        row: usize,
-        col: usize,
-        text: &str,
-    ) {
-        let (width, height) = dims;
-        let mut canvas = Canvas {
-            pixels,
-            width,
-            height,
-        };
-        let m = self.fonts.metrics();
-        let (pad_x, pad_y) = self.pad;
-        let row_top = pad_y + row as i32 * m.height as i32;
-        let style = Style {
-            bold: true,
-            italic: false,
-        };
-        let mut x = pad_x + col as i32 * m.width as i32;
-        for c in text.chars() {
-            if x as usize + m.width as usize > width {
-                break;
-            }
-            canvas.fill_rect(x, row_top, m.width, m.height, theme.current_match_bg);
-            if c != ' ' {
-                self.draw_glyph(&mut canvas, c, style, x, row_top, theme.bg);
-            }
-            x += m.width as i32;
-        }
+    // Graphics images stacked above the text (z-index >= 0).
+    draw_image_cells(
+      &mut canvas,
+      frame.images,
+      cells,
+      cols,
+      pad_x,
+      row_top,
+      m,
+      |z| z >= 0,
+    );
+    // Unicode-placeholder image cells.
+    draw_placeholders(
+      &mut canvas,
+      frame.images,
+      cells,
+      cols,
+      pad_x,
+      row_top,
+      m,
+    );
+
+    // The cursor belongs to the live screen; hide it while scrolled back.
+    if grid.view_at_bottom() && grid.cursor().1 == y {
+      self.draw_cursor(&mut canvas, grid, theme, m, focused, blink_on);
+    }
+  }
+
+  /// Draw the incremental-search prompt across the bottom row, over whatever
+  /// grid content was there. The caller marks the bottom row dirty so this
+  /// repaints whenever the query or match count changes.
+  pub fn render_search_bar(
+    &mut self,
+    pixels: &mut [u8],
+    dims: (usize, usize),
+    theme: &Theme,
+    row: usize,
+    text: &str,
+  ) {
+    let (width, height) = dims;
+    let mut canvas = Canvas {
+      pixels,
+      width,
+      height,
+    };
+    let m = self.fonts.metrics();
+    let (pad_x, pad_y) = self.pad;
+    let row_top = pad_y + row as i32 * m.height as i32;
+    canvas.fill_rect(0, row_top, width as u32, m.height, theme.search_bar_bg);
+    let style = Style {
+      bold:   false,
+      italic: false,
+    };
+    let mut x = pad_x;
+    for c in text.chars() {
+      if x as usize + m.width as usize > width {
+        break;
+      }
+      if c != ' ' {
+        self.draw_glyph(&mut canvas, c, style, x, row_top, theme.fg);
+      }
+      x += m.width as i32;
+    }
+  }
+
+  /// Draw a URL hint label (e.g. `a`, `bc`) as a highlighted tag starting at
+  /// viewport cell `(row, col)`, over whatever was there.
+  pub fn render_label(
+    &mut self,
+    pixels: &mut [u8],
+    dims: (usize, usize),
+    theme: &Theme,
+    row: usize,
+    col: usize,
+    text: &str,
+  ) {
+    let (width, height) = dims;
+    let mut canvas = Canvas {
+      pixels,
+      width,
+      height,
+    };
+    let m = self.fonts.metrics();
+    let (pad_x, pad_y) = self.pad;
+    let row_top = pad_y + row as i32 * m.height as i32;
+    let style = Style {
+      bold:   true,
+      italic: false,
+    };
+    let mut x = pad_x + col as i32 * m.width as i32;
+    for c in text.chars() {
+      if x as usize + m.width as usize > width {
+        break;
+      }
+      canvas.fill_rect(x, row_top, m.width, m.height, theme.current_match_bg);
+      if c != ' ' {
+        self.draw_glyph(&mut canvas, c, style, x, row_top, theme.bg);
+      }
+      x += m.width as i32;
+    }
+  }
+
+  /// Draw the IME preedit string inline, starting at grid cell `start_col` of
+  /// row `row`, over whatever was there. The preedit sits on the selection
+  /// background and is underlined so it reads as uncommitted, in-flight text.
+  pub fn render_preedit(
+    &mut self,
+    pixels: &mut [u8],
+    dims: (usize, usize),
+    theme: &Theme,
+    row: usize,
+    start_col: usize,
+    text: &str,
+  ) {
+    let (width, height) = dims;
+    let mut canvas = Canvas {
+      pixels,
+      width,
+      height,
+    };
+    let m = self.fonts.metrics();
+    let (pad_x, pad_y) = self.pad;
+    let row_top = pad_y + row as i32 * m.height as i32;
+    let style = Style {
+      bold:   false,
+      italic: false,
+    };
+    let mut x = pad_x + start_col as i32 * m.width as i32;
+    for c in text.chars() {
+      if x < 0 || x as usize + m.width as usize > width {
+        break;
+      }
+      canvas.fill_rect(x, row_top, m.width, m.height, theme.selection_bg);
+      if c != ' ' {
+        self.draw_glyph(&mut canvas, c, style, x, row_top, theme.fg);
+      }
+      // Underline the run a row above the cell bottom.
+      canvas.hline(x, row_top + m.height as i32 - 2, m.width, theme.fg);
+      x += m.width as i32;
+    }
+  }
+
+  /// Draw the cursor: a solid block/underline/beam when focused, a hollow
+  /// outline when not. A blinking cursor shape is only drawn while `blink_on`.
+  fn draw_cursor(
+    &mut self,
+    canvas: &mut Canvas,
+    grid: &Grid,
+    theme: &Theme,
+    m: CellMetrics,
+    focused: bool,
+    blink_on: bool,
+  ) {
+    if !grid.cursor_visible() || (grid.cursor_blink() && !blink_on) {
+      return;
+    }
+    let (cx, cy) = grid.cursor();
+    let x0 = self.pad.0 + cx as i32 * m.width as i32;
+    let top = self.pad.1 + cy as i32 * m.height as i32;
+    // OSC 12 cursor colour wins, then the configured cursor colour, then fg.
+    let color = grid
+      .cursor_color()
+      .map(|(r, g, b)| Rgb(r, g, b))
+      .or(theme.cursor)
+      .unwrap_or(theme.fg);
+
+    if !focused {
+      let right = x0 + m.width as i32 - 1;
+      let bottom = top + m.height as i32 - 1;
+      canvas.hline(x0, top, m.width, color);
+      canvas.hline(x0, bottom, m.width, color);
+      canvas.fill_rect(x0, top, 1, m.height, color);
+      canvas.fill_rect(right, top, 1, m.height, color);
+      return;
     }
 
-    /// Draw the IME preedit string inline, starting at grid cell `start_col` of
-    /// row `row`, over whatever was there. The preedit sits on the selection
-    /// background and is underlined so it reads as uncommitted, in-flight text.
-    pub fn render_preedit(
-        &mut self,
-        pixels: &mut [u8],
-        dims: (usize, usize),
-        theme: &Theme,
-        row: usize,
-        start_col: usize,
-        text: &str,
-    ) {
-        let (width, height) = dims;
-        let mut canvas = Canvas {
-            pixels,
-            width,
-            height,
-        };
-        let m = self.fonts.metrics();
-        let (pad_x, pad_y) = self.pad;
-        let row_top = pad_y + row as i32 * m.height as i32;
-        let style = Style {
-            bold: false,
-            italic: false,
-        };
-        let mut x = pad_x + start_col as i32 * m.width as i32;
-        for c in text.chars() {
-            if x < 0 || x as usize + m.width as usize > width {
-                break;
-            }
-            canvas.fill_rect(x, row_top, m.width, m.height, theme.selection_bg);
-            if c != ' ' {
-                self.draw_glyph(&mut canvas, c, style, x, row_top, theme.fg);
-            }
-            // Underline the run a row above the cell bottom.
-            canvas.hline(x, row_top + m.height as i32 - 2, m.width, theme.fg);
-            x += m.width as i32;
+    match grid.cursor_shape() {
+      CursorShape::Block => {
+        canvas.fill_rect(x0, top, m.width, m.height, color);
+        let cell = grid.cell(cx, cy);
+        if cell.c != ' ' && !cell.flags.contains(Flags::WIDE_CONT) {
+          let (_, bg) = cell_colors(cell, theme);
+          self.draw_glyph(canvas, cell.c, cell_style(cell), x0, top, bg);
         }
+      },
+      CursorShape::Underline => {
+        canvas.fill_rect(x0, top + m.height as i32 - 2, m.width, 2, color);
+      },
+      CursorShape::Beam => canvas.fill_rect(x0, top, 2, m.height, color),
     }
+  }
 
-    /// Draw the cursor: a solid block/underline/beam when focused, a hollow
-    /// outline when not. A blinking cursor shape is only drawn while `blink_on`.
-    fn draw_cursor(
-        &mut self,
-        canvas: &mut Canvas,
-        grid: &Grid,
-        theme: &Theme,
-        m: CellMetrics,
-        focused: bool,
-        blink_on: bool,
-    ) {
-        if !grid.cursor_visible() || (grid.cursor_blink() && !blink_on) {
-            return;
-        }
-        let (cx, cy) = grid.cursor();
-        let x0 = self.pad.0 + cx as i32 * m.width as i32;
-        let top = self.pad.1 + cy as i32 * m.height as i32;
-        // OSC 12 cursor colour wins, then the configured cursor colour, then fg.
-        let color = grid
-            .cursor_color()
-            .map(|(r, g, b)| Rgb(r, g, b))
-            .or(theme.cursor)
-            .unwrap_or(theme.fg);
+  fn draw_glyph(
+    &mut self,
+    canvas: &mut Canvas,
+    c: char,
+    style: Style,
+    origin_x: i32,
+    cell_top: i32,
+    fg: Rgb,
+  ) {
+    let m = self.fonts.metrics();
+    let glyph = match self.fonts.glyph(c, style) {
+      Ok(glyph) => glyph,
+      Err(err) => {
+        tracing::debug!("glyph {c:?}: {err}");
+        return;
+      },
+    };
+    blit_glyph(canvas, glyph, m, origin_x, cell_top, 0, fg);
+  }
 
-        if !focused {
-            let right = x0 + m.width as i32 - 1;
-            let bottom = top + m.height as i32 - 1;
-            canvas.hline(x0, top, m.width, color);
-            canvas.hline(x0, bottom, m.width, color);
-            canvas.fill_rect(x0, top, 1, m.height, color);
-            canvas.fill_rect(right, top, 1, m.height, color);
-            return;
-        }
+  /// Draw the slice of a text-sizing (`OSC 66`) block that falls in one row.
+  ///
+  /// `lead` is the block's leading cell (holding the run text); `dy` is this
+  /// row's offset within the block; `pos` is this row's left edge and top in
+  /// pixels. The full block is `cols * width` by `rows * height` pixels,
+  /// starting `dy` rows above the row top; glyphs are rasterized at the block's
+  /// font scale and clipped to this row's band, so the block paints correctly
+  /// across its several per-row repaints.
+  fn draw_sized(
+    &mut self,
+    canvas: &mut Canvas,
+    lead: &Cell,
+    dy: usize,
+    pos: (i32, i32),
+    m: CellMetrics,
+    fg: Rgb,
+  ) {
+    let (block_left_x, row_top) = pos;
+    let Some(s) = lead.sized.as_deref() else {
+      return;
+    };
+    let scale = s.size.font_scale();
+    let (cols, rows) = (s.cols as i32, s.rows as i32);
+    let block_top = row_top - dy as i32 * m.height as i32;
+    let (block_w, block_h) = (cols * m.width as i32, rows * m.height as i32);
+    let clip = (row_top, row_top + m.height as i32);
 
-        match grid.cursor_shape() {
-            CursorShape::Block => {
-                canvas.fill_rect(x0, top, m.width, m.height, color);
-                let cell = grid.cell(cx, cy);
-                if cell.c != ' ' && !cell.flags.contains(Flags::WIDE_CONT) {
-                    let (_, bg) = cell_colors(cell, theme);
-                    self.draw_glyph(canvas, cell.c, cell_style(cell), x0, top, bg);
-                }
-            }
-            CursorShape::Underline => {
-                canvas.fill_rect(x0, top + m.height as i32 - 2, m.width, 2, color);
-            }
-            CursorShape::Beam => canvas.fill_rect(x0, top, 2, m.height, color),
-        }
+    let advance = (m.width as f32 * scale).round().max(1.0) as i32;
+    let render_h = (m.height as f32 * scale).round().max(1.0) as i32;
+
+    // The run: a packed string (w>0) or the leading grapheme (w==0).
+    let run: Vec<char> = match s.run.as_deref() {
+      Some(text) => text.chars().collect(),
+      None => vec![lead.c],
+    };
+    let render_w = advance * run.len() as i32;
+
+    // A fractional scale renders into an area smaller than the block, placed
+    // by the v/h alignment; a whole scale fills the block (offsets zero).
+    let (ox, oy) = if s.size.has_fraction() {
+      let ox = match s.size.halign {
+        HAlign::Left => 0,
+        HAlign::Right => block_w - render_w,
+        HAlign::Center => (block_w - render_w) / 2,
+      };
+      let oy = match s.size.valign {
+        VAlign::Top => 0,
+        VAlign::Bottom => block_h - render_h,
+        VAlign::Middle => (block_h - render_h) / 2,
+      };
+      (ox.max(0), oy.max(0))
+    } else {
+      (0, 0)
+    };
+
+    let baseline = block_top + oy + (m.ascent as f32 * scale).round() as i32;
+    let style = cell_style(lead);
+    let mut pen_x = block_left_x + ox;
+    for c in run {
+      if c != ' '
+        && let Ok(glyph) = self.fonts.glyph_scaled(c, style, scale)
+      {
+        blit_glyph_clipped(canvas, &glyph, pen_x, baseline, clip, fg, render_h);
+      }
+      pen_x += advance;
     }
-
-    fn draw_glyph(
-        &mut self,
-        canvas: &mut Canvas,
-        c: char,
-        style: Style,
-        origin_x: i32,
-        cell_top: i32,
-        fg: Rgb,
-    ) {
-        let m = self.fonts.metrics();
-        let glyph = match self.fonts.glyph(c, style) {
-            Ok(glyph) => glyph,
-            Err(err) => {
-                tracing::debug!("glyph {c:?}: {err}");
-                return;
-            }
-        };
-        blit_glyph(canvas, glyph, m, origin_x, cell_top, 0, fg);
-    }
-
-    /// Draw the slice of a text-sizing (`OSC 66`) block that falls in one row.
-    ///
-    /// `lead` is the block's leading cell (holding the run text); `dy` is this
-    /// row's offset within the block; `pos` is this row's left edge and top in
-    /// pixels. The full block is `cols * width` by `rows * height` pixels,
-    /// starting `dy` rows above the row top; glyphs are rasterized at the block's
-    /// font scale and clipped to this row's band, so the block paints correctly
-    /// across its several per-row repaints.
-    fn draw_sized(
-        &mut self,
-        canvas: &mut Canvas,
-        lead: &Cell,
-        dy: usize,
-        pos: (i32, i32),
-        m: CellMetrics,
-        fg: Rgb,
-    ) {
-        let (block_left_x, row_top) = pos;
-        let Some(s) = lead.sized.as_deref() else {
-            return;
-        };
-        let scale = s.size.font_scale();
-        let (cols, rows) = (s.cols as i32, s.rows as i32);
-        let block_top = row_top - dy as i32 * m.height as i32;
-        let (block_w, block_h) = (cols * m.width as i32, rows * m.height as i32);
-        let clip = (row_top, row_top + m.height as i32);
-
-        let advance = (m.width as f32 * scale).round().max(1.0) as i32;
-        let render_h = (m.height as f32 * scale).round().max(1.0) as i32;
-
-        // The run: a packed string (w>0) or the leading grapheme (w==0).
-        let run: Vec<char> = match s.run.as_deref() {
-            Some(text) => text.chars().collect(),
-            None => vec![lead.c],
-        };
-        let render_w = advance * run.len() as i32;
-
-        // A fractional scale renders into an area smaller than the block, placed
-        // by the v/h alignment; a whole scale fills the block (offsets zero).
-        let (ox, oy) = if s.size.has_fraction() {
-            let ox = match s.size.halign {
-                HAlign::Left => 0,
-                HAlign::Right => block_w - render_w,
-                HAlign::Center => (block_w - render_w) / 2,
-            };
-            let oy = match s.size.valign {
-                VAlign::Top => 0,
-                VAlign::Bottom => block_h - render_h,
-                VAlign::Middle => (block_h - render_h) / 2,
-            };
-            (ox.max(0), oy.max(0))
-        } else {
-            (0, 0)
-        };
-
-        let baseline = block_top + oy + (m.ascent as f32 * scale).round() as i32;
-        let style = cell_style(lead);
-        let mut pen_x = block_left_x + ox;
-        for c in run {
-            if c != ' '
-                && let Ok(glyph) = self.fonts.glyph_scaled(c, style, scale)
-            {
-                blit_glyph_clipped(canvas, &glyph, pen_x, baseline, clip, fg, render_h);
-            }
-            pen_x += advance;
-        }
-    }
+  }
 }
 
-/// Composite a rasterized glyph, clipping to the vertical band `clip = (y0, y1)`
-/// so a tall text-sizing glyph paints only the part belonging to the current
-/// row. Mask glyphs are tinted with `fg`; colour glyphs are scaled to
+/// Composite a rasterized glyph, clipping to the vertical band `clip = (y0,
+/// y1)` so a tall text-sizing glyph paints only the part belonging to the
+/// current row. Mask glyphs are tinted with `fg`; colour glyphs are scaled to
 /// `target_h` (the outline transform does not scale embedded bitmaps).
 fn blit_glyph_clipped(
-    canvas: &mut Canvas,
-    glyph: &Glyph,
-    pen_x: i32,
-    baseline: i32,
-    clip: (i32, i32),
-    fg: Rgb,
-    target_h: i32,
+  canvas: &mut Canvas,
+  glyph: &Glyph,
+  pen_x: i32,
+  baseline: i32,
+  clip: (i32, i32),
+  fg: Rgb,
+  target_h: i32,
 ) {
-    let (gw, gh) = (glyph.width as i32, glyph.height as i32);
-    match &glyph.data {
-        GlyphData::Mask(mask) => {
-            for gy in 0..gh {
-                let py = baseline - glyph.top + gy;
-                if py < clip.0 || py >= clip.1 {
-                    continue;
-                }
-                for gx in 0..gw {
-                    let a = mask[(gy * gw + gx) as usize];
-                    if a != 0 {
-                        canvas.blend(pen_x + glyph.left + gx, py, fg, a);
-                    }
-                }
-            }
+  let (gw, gh) = (glyph.width as i32, glyph.height as i32);
+  match &glyph.data {
+    GlyphData::Mask(mask) => {
+      for gy in 0..gh {
+        let py = baseline - glyph.top + gy;
+        if py < clip.0 || py >= clip.1 {
+          continue;
         }
-        GlyphData::Color(bgra) if gh > 0 => {
-            let sc = target_h as f32 / gh as f32;
-            let tw = (gw as f32 * sc).round() as i32;
-            // Place the scaled bitmap so most of it sits above the baseline.
-            let top = baseline - target_h * 4 / 5;
-            for ty in 0..target_h {
-                let py = top + ty;
-                if py < clip.0 || py >= clip.1 {
-                    continue;
-                }
-                let sy = ((ty as f32 / sc) as i32).min(gh - 1);
-                for tx in 0..tw {
-                    let sx = ((tx as f32 / sc) as i32).min(gw - 1);
-                    let i = ((sy * gw + sx) * 4) as usize;
-                    canvas.over(pen_x + tx, py, &bgra[i..i + 4]);
-                }
-            }
+        for gx in 0..gw {
+          let a = mask[(gy * gw + gx) as usize];
+          if a != 0 {
+            canvas.blend(pen_x + glyph.left + gx, py, fg, a);
+          }
         }
-        GlyphData::Color(_) => {}
-    }
+      }
+    },
+    GlyphData::Color(bgra) if gh > 0 => {
+      let sc = target_h as f32 / gh as f32;
+      let tw = (gw as f32 * sc).round() as i32;
+      // Place the scaled bitmap so most of it sits above the baseline.
+      let top = baseline - target_h * 4 / 5;
+      for ty in 0..target_h {
+        let py = top + ty;
+        if py < clip.0 || py >= clip.1 {
+          continue;
+        }
+        let sy = ((ty as f32 / sc) as i32).min(gh - 1);
+        for tx in 0..tw {
+          let sx = ((tx as f32 / sc) as i32).min(gw - 1);
+          let i = ((sy * gw + sx) * 4) as usize;
+          canvas.over(pen_x + tx, py, &bgra[i..i + 4]);
+        }
+      }
+    },
+    GlyphData::Color(_) => {},
+  }
 }
 
 /// Composite the graphics-image cells of one row whose placement z-index passes
@@ -633,38 +679,38 @@ fn blit_glyph_clipped(
 /// `(dx, dy)` in the placement; the engine supplies the pixels and geometry.
 #[allow(clippy::too_many_arguments)]
 fn draw_image_cells(
-    canvas: &mut Canvas,
-    images: &crate::graphics::Graphics,
-    cells: &[Cell],
-    cols: usize,
-    pad_x: i32,
-    row_top: i32,
-    m: CellMetrics,
-    z_filter: impl Fn(i32) -> bool,
+  canvas: &mut Canvas,
+  images: &crate::graphics::Graphics,
+  cells: &[Cell],
+  cols: usize,
+  pad_x: i32,
+  row_top: i32,
+  m: CellMetrics,
+  z_filter: impl Fn(i32) -> bool,
 ) {
-    for (x, cell) in cells.iter().take(cols).enumerate() {
-        let Some(r) = cell.image else { continue };
-        let Some(p) = images.placement(r.image, r.placement) else {
-            continue;
-        };
-        if !z_filter(p.z) {
-            continue;
-        }
-        let Some(img) = images.image(p.image) else {
-            continue;
-        };
-        let origin_x = pad_x + x as i32 * m.width as i32;
-        blit_image_cell(
-            canvas,
-            img,
-            p,
-            r.dx as i32,
-            r.dy as i32,
-            origin_x,
-            row_top,
-            m,
-        );
+  for (x, cell) in cells.iter().take(cols).enumerate() {
+    let Some(r) = cell.image else { continue };
+    let Some(p) = images.placement(r.image, r.placement) else {
+      continue;
+    };
+    if !z_filter(p.z) {
+      continue;
     }
+    let Some(img) = images.image(p.image) else {
+      continue;
+    };
+    let origin_x = pad_x + x as i32 * m.width as i32;
+    blit_image_cell(
+      canvas,
+      img,
+      p,
+      r.dx as i32,
+      r.dy as i32,
+      origin_x,
+      row_top,
+      m,
+    );
+  }
 }
 
 /// Composite the Unicode-placeholder cells of one row. A placeholder cell holds
@@ -672,191 +718,209 @@ fn draw_image_cells(
 /// combining diacritics; a missing row/column/id-byte is inherited from the
 /// placeholder to the left, the way the protocol specifies.
 fn draw_placeholders(
-    canvas: &mut Canvas,
-    images: &crate::graphics::Graphics,
-    cells: &[Cell],
-    cols: usize,
-    pad_x: i32,
-    row_top: i32,
-    m: CellMetrics,
+  canvas: &mut Canvas,
+  images: &crate::graphics::Graphics,
+  cells: &[Cell],
+  cols: usize,
+  pad_x: i32,
+  row_top: i32,
+  m: CellMetrics,
 ) {
-    // The left neighbour's (row, column, id high byte, foreground), for cells
-    // that omit diacritics and continue the run.
-    let mut prev: Option<(u32, u32, u32, Color)> = None;
-    for (x, cell) in cells.iter().take(cols).enumerate() {
-        if cell.c != PLACEHOLDER {
-            prev = None;
-            continue;
-        }
-        let Some(base_id) = placeholder_id(cell.fg) else {
-            prev = None;
-            continue;
-        };
-        let marks: Vec<char> = cell.combining.as_deref().unwrap_or("").chars().collect();
-        let d0 = marks.first().copied().and_then(diacritic_value);
-        let d1 = marks.get(1).copied().and_then(diacritic_value);
-        let d2 = marks.get(2).copied().and_then(diacritic_value);
-        let same_fg = prev.is_some_and(|p| p.3 == cell.fg);
-        let (row, col, msb) = match (d0, d1, d2, prev) {
-            // No diacritics: continue the previous cell's row, next column.
-            (None, None, None, Some(p)) if same_fg => (p.0, p.1 + 1, p.2),
-            // Only the row: same row continues, next column.
-            (Some(r), None, None, Some(p)) if same_fg && p.0 == r => (r, p.1 + 1, p.2),
-            // Row and column given, id byte inherited from an adjacent run.
-            (Some(r), Some(c), None, Some(p)) if same_fg && p.0 == r && p.1 + 1 == c => (r, c, p.2),
-            // Otherwise take whatever was given, defaulting the rest to zero.
-            (r, c, msb, _) => (r.unwrap_or(0), c.unwrap_or(0), msb.unwrap_or(0)),
-        };
-        prev = Some((row, col, msb, cell.fg));
-
-        let id = base_id | (msb << 24);
-        let Some(p) = images.placement(id, 0) else {
-            continue;
-        };
-        let Some(img) = images.image(p.image) else {
-            continue;
-        };
-        let origin_x = pad_x + x as i32 * m.width as i32;
-        blit_image_cell(canvas, img, p, col as i32, row as i32, origin_x, row_top, m);
+  // The left neighbour's (row, column, id high byte, foreground), for cells
+  // that omit diacritics and continue the run.
+  let mut prev: Option<(u32, u32, u32, Color)> = None;
+  for (x, cell) in cells.iter().take(cols).enumerate() {
+    if cell.c != PLACEHOLDER {
+      prev = None;
+      continue;
     }
+    let Some(base_id) = placeholder_id(cell.fg) else {
+      prev = None;
+      continue;
+    };
+    let marks: Vec<char> =
+      cell.combining.as_deref().unwrap_or("").chars().collect();
+    let d0 = marks.first().copied().and_then(diacritic_value);
+    let d1 = marks.get(1).copied().and_then(diacritic_value);
+    let d2 = marks.get(2).copied().and_then(diacritic_value);
+    let same_fg = prev.is_some_and(|p| p.3 == cell.fg);
+    let (row, col, msb) = match (d0, d1, d2, prev) {
+      // No diacritics: continue the previous cell's row, next column.
+      (None, None, None, Some(p)) if same_fg => (p.0, p.1 + 1, p.2),
+      // Only the row: same row continues, next column.
+      (Some(r), None, None, Some(p)) if same_fg && p.0 == r => {
+        (r, p.1 + 1, p.2)
+      },
+      // Row and column given, id byte inherited from an adjacent run.
+      (Some(r), Some(c), None, Some(p))
+        if same_fg && p.0 == r && p.1 + 1 == c =>
+      {
+        (r, c, p.2)
+      },
+      // Otherwise take whatever was given, defaulting the rest to zero.
+      (r, c, msb, _) => (r.unwrap_or(0), c.unwrap_or(0), msb.unwrap_or(0)),
+    };
+    prev = Some((row, col, msb, cell.fg));
+
+    let id = base_id | (msb << 24);
+    let Some(p) = images.placement(id, 0) else {
+      continue;
+    };
+    let Some(img) = images.image(p.image) else {
+      continue;
+    };
+    let origin_x = pad_x + x as i32 * m.width as i32;
+    blit_image_cell(
+      canvas, img, p, col as i32, row as i32, origin_x, row_top, m,
+    );
+  }
 }
 
 /// The image id a placeholder cell's foreground colour encodes: an indexed
 /// colour is the id directly, a truecolor is its packed 24-bit value. A default
 /// foreground carries no id.
 fn placeholder_id(fg: Color) -> Option<u32> {
-    match fg {
-        Color::Indexed(n) => Some(u32::from(n)),
-        Color::Rgb(r, g, b) => Some(u32::from(r) << 16 | u32::from(g) << 8 | u32::from(b)),
-        Color::Default => None,
-    }
+  match fg {
+    Color::Indexed(n) => Some(u32::from(n)),
+    Color::Rgb(r, g, b) => {
+      Some(u32::from(r) << 16 | u32::from(g) << 8 | u32::from(b))
+    },
+    Color::Default => None,
+  }
 }
 
 /// Composite one cell's slice of an image placement. The placement's source
 /// rectangle is scaled to its full cell-pixel area; this cell shows the
-/// sub-rectangle for its `(dx, dy)`, sampled nearest-neighbour and alpha-blended.
+/// sub-rectangle for its `(dx, dy)`, sampled nearest-neighbour and
+/// alpha-blended.
 #[allow(clippy::too_many_arguments)]
 fn blit_image_cell(
-    canvas: &mut Canvas,
-    img: &crate::graphics::Image,
-    p: &crate::graphics::Placement,
-    dx: i32,
-    dy: i32,
-    origin_x: i32,
-    row_top: i32,
-    m: CellMetrics,
+  canvas: &mut Canvas,
+  img: &crate::graphics::Image,
+  p: &crate::graphics::Placement,
+  dx: i32,
+  dy: i32,
+  origin_x: i32,
+  row_top: i32,
+  m: CellMetrics,
 ) {
-    let (cell_w, cell_h) = (m.width as i32, m.height as i32);
-    // The source rectangle is scaled to the cell area less the first-cell pixel
-    // offset, so a non-zero X/Y shifts the image inward from the top-left cell.
-    let span_w = (p.cols as i32 * cell_w - p.off_x as i32).max(1);
-    let span_h = (p.rows as i32 * cell_h - p.off_y as i32).max(1);
-    let src_w = if p.src_w == 0 { img.width } else { p.src_w } as i32;
-    let src_h = if p.src_h == 0 { img.height } else { p.src_h } as i32;
-    let (iw, ih) = (img.width as i32, img.height as i32);
-    for cy in 0..cell_h {
-        // Map this cell row to a source row through the placement's scale.
-        let placed_y = dy * cell_h + cy - p.off_y as i32;
-        if placed_y < 0 {
-            continue;
-        }
-        let sy = p.src_y as i32 + placed_y * src_h / span_h;
-        if sy < 0 || sy >= ih {
-            continue;
-        }
-        for cx in 0..cell_w {
-            let placed_x = dx * cell_w + cx - p.off_x as i32;
-            if placed_x < 0 {
-                continue;
-            }
-            let sx = p.src_x as i32 + placed_x * src_w / span_w;
-            if sx < 0 || sx >= iw {
-                continue;
-            }
-            let i = ((sy * iw + sx) * 4) as usize;
-            let px = &img.current_rgba()[i..i + 4];
-            canvas.blend_rgba(origin_x + cx, row_top + cy, [px[0], px[1], px[2], px[3]]);
-        }
+  let (cell_w, cell_h) = (m.width as i32, m.height as i32);
+  // The source rectangle is scaled to the cell area less the first-cell pixel
+  // offset, so a non-zero X/Y shifts the image inward from the top-left cell.
+  let span_w = (p.cols as i32 * cell_w - p.off_x as i32).max(1);
+  let span_h = (p.rows as i32 * cell_h - p.off_y as i32).max(1);
+  let src_w = if p.src_w == 0 { img.width } else { p.src_w } as i32;
+  let src_h = if p.src_h == 0 { img.height } else { p.src_h } as i32;
+  let (iw, ih) = (img.width as i32, img.height as i32);
+  for cy in 0..cell_h {
+    // Map this cell row to a source row through the placement's scale.
+    let placed_y = dy * cell_h + cy - p.off_y as i32;
+    if placed_y < 0 {
+      continue;
     }
+    let sy = p.src_y as i32 + placed_y * src_h / span_h;
+    if sy < 0 || sy >= ih {
+      continue;
+    }
+    for cx in 0..cell_w {
+      let placed_x = dx * cell_w + cx - p.off_x as i32;
+      if placed_x < 0 {
+        continue;
+      }
+      let sx = p.src_x as i32 + placed_x * src_w / span_w;
+      if sx < 0 || sx >= iw {
+        continue;
+      }
+      let i = ((sy * iw + sx) * 4) as usize;
+      let px = &img.current_rgba()[i..i + 4];
+      canvas
+        .blend_rgba(origin_x + cx, row_top + cy, [px[0], px[1], px[2], px[3]]);
+    }
+  }
 }
 
 /// Composite a rasterized glyph into the canvas. `origin_x`/`cell_top` are the
 /// cell's top-left; `rise` lifts the glyph above the baseline (HarfBuzz's
 /// vertical offset, 0 for the unshaped path).
 fn blit_glyph(
-    canvas: &mut Canvas,
-    glyph: &Glyph,
-    m: CellMetrics,
-    origin_x: i32,
-    cell_top: i32,
-    rise: i32,
-    fg: Rgb,
+  canvas: &mut Canvas,
+  glyph: &Glyph,
+  m: CellMetrics,
+  origin_x: i32,
+  cell_top: i32,
+  rise: i32,
+  fg: Rgb,
 ) {
-    let (gw, gh) = (glyph.width as i32, glyph.height as i32);
-    match &glyph.data {
-        GlyphData::Mask(mask) => {
-            let baseline = cell_top + m.ascent as i32 - rise;
-            for gy in 0..gh {
-                for gx in 0..gw {
-                    let a = mask[(gy * gw + gx) as usize];
-                    if a != 0 {
-                        canvas.blend(origin_x + glyph.left + gx, baseline - glyph.top + gy, fg, a);
-                    }
-                }
-            }
+  let (gw, gh) = (glyph.width as i32, glyph.height as i32);
+  match &glyph.data {
+    GlyphData::Mask(mask) => {
+      let baseline = cell_top + m.ascent as i32 - rise;
+      for gy in 0..gh {
+        for gx in 0..gw {
+          let a = mask[(gy * gw + gx) as usize];
+          if a != 0 {
+            canvas.blend(
+              origin_x + glyph.left + gx,
+              baseline - glyph.top + gy,
+              fg,
+              a,
+            );
+          }
         }
-        // Colour glyphs (emoji) come from a fixed strike at native size;
-        // scale them to the line height with nearest-neighbour sampling.
-        GlyphData::Color(bgra) if gh > 0 => {
-            let scale = m.height as f32 / gh as f32;
-            let target_w = (gw as f32 * scale) as i32;
-            for ty in 0..m.height as i32 {
-                let sy = ((ty as f32 / scale) as i32).min(gh - 1);
-                for tx in 0..target_w {
-                    let sx = ((tx as f32 / scale) as i32).min(gw - 1);
-                    let i = ((sy * gw + sx) * 4) as usize;
-                    canvas.over(origin_x + tx, cell_top + ty, &bgra[i..i + 4]);
-                }
-            }
+      }
+    },
+    // Colour glyphs (emoji) come from a fixed strike at native size;
+    // scale them to the line height with nearest-neighbour sampling.
+    GlyphData::Color(bgra) if gh > 0 => {
+      let scale = m.height as f32 / gh as f32;
+      let target_w = (gw as f32 * scale) as i32;
+      for ty in 0..m.height as i32 {
+        let sy = ((ty as f32 / scale) as i32).min(gh - 1);
+        for tx in 0..target_w {
+          let sx = ((tx as f32 / scale) as i32).min(gw - 1);
+          let i = ((sy * gw + sx) * 4) as usize;
+          canvas.over(origin_x + tx, cell_top + ty, &bgra[i..i + 4]);
         }
-        GlyphData::Color(_) => {}
-    }
+      }
+    },
+    GlyphData::Color(_) => {},
+  }
 }
 
 fn cell_style(cell: &Cell) -> Style {
-    Style {
-        bold: cell.flags.contains(Flags::BOLD),
-        italic: cell.flags.contains(Flags::ITALIC),
-    }
+  Style {
+    bold:   cell.flags.contains(Flags::BOLD),
+    italic: cell.flags.contains(Flags::ITALIC),
+  }
 }
 
 /// Resolve a cell's (foreground, background) RGB, applying reverse video,
 /// bold-as-bright, dim, and hidden.
 fn cell_colors(cell: &Cell, theme: &Theme) -> (Rgb, Rgb) {
-    let bold = cell.flags.contains(Flags::BOLD);
-    let mut fg = theme.resolve(cell.fg, Plane::Fg, bold);
-    let mut bg = theme.resolve(cell.bg, Plane::Bg, false);
-    if cell.flags.contains(Flags::REVERSE) {
-        std::mem::swap(&mut fg, &mut bg);
-    }
-    if cell.flags.contains(Flags::DIM) {
-        fg = blend_rgb(fg, bg);
-    }
-    if cell.flags.contains(Flags::HIDDEN) {
-        fg = bg;
-    }
-    (fg, bg)
+  let bold = cell.flags.contains(Flags::BOLD);
+  let mut fg = theme.resolve(cell.fg, Plane::Fg, bold);
+  let mut bg = theme.resolve(cell.bg, Plane::Bg, false);
+  if cell.flags.contains(Flags::REVERSE) {
+    std::mem::swap(&mut fg, &mut bg);
+  }
+  if cell.flags.contains(Flags::DIM) {
+    fg = blend_rgb(fg, bg);
+  }
+  if cell.flags.contains(Flags::HIDDEN) {
+    fg = bg;
+  }
+  (fg, bg)
 }
 
 /// Mix `c` two-thirds of the way from `toward`, used for the dim attribute.
 fn blend_rgb(c: Rgb, toward: Rgb) -> Rgb {
-    let mix = |a: u8, b: u8| ((u32::from(a) * 2 + u32::from(b)) / 3) as u8;
-    Rgb(mix(c.0, toward.0), mix(c.1, toward.1), mix(c.2, toward.2))
+  let mix = |a: u8, b: u8| ((u32::from(a) * 2 + u32::from(b)) / 3) as u8;
+  Rgb(mix(c.0, toward.0), mix(c.1, toward.1), mix(c.2, toward.2))
 }
 
 /// Whether `c` is a Braille Patterns codepoint (U+2800-U+28FF).
 fn is_braille(c: char) -> bool {
-    ('\u{2800}'..='\u{28ff}').contains(&c)
+  ('\u{2800}'..='\u{28ff}').contains(&c)
 }
 
 /// Braille dot geometry for a `width`×`height` cell: the square dot side `w`,
@@ -865,61 +929,61 @@ fn is_braille(c: char) -> bool {
 /// then leftover pixels distributed (dot → margin → spacing → margin → dot) so
 /// dots land on exact pixels with no rounding drift.
 fn braille_geometry(width: i32, height: i32) -> (u32, [i32; 2], [i32; 4]) {
-    let mut w = (width / 4).min(height / 8);
-    let mut x_spacing = width / 4;
-    let mut y_spacing = height / 8;
-    let mut x_margin = x_spacing / 2;
-    let mut y_margin = y_spacing / 2;
+  let mut w = (width / 4).min(height / 8);
+  let mut x_spacing = width / 4;
+  let mut y_spacing = height / 8;
+  let mut x_margin = x_spacing / 2;
+  let mut y_margin = y_spacing / 2;
 
-    let mut x_left = width - 2 * x_margin - x_spacing - 2 * w;
-    let mut y_left = height - 2 * y_margin - 3 * y_spacing - 4 * w;
+  let mut x_left = width - 2 * x_margin - x_spacing - 2 * w;
+  let mut y_left = height - 2 * y_margin - 3 * y_spacing - 4 * w;
 
-    // First, try hard to ensure a non-zero dot width.
-    if x_left >= 2 && y_left >= 4 && w == 0 {
-        w += 1;
-        x_left -= 2;
-        y_left -= 4;
-    }
-    // Second, prefer a non-zero margin.
-    if x_left >= 2 && x_margin == 0 {
-        x_margin = 1;
-        x_left -= 2;
-    }
-    if y_left >= 2 && y_margin == 0 {
-        y_margin = 1;
-        y_left -= 2;
-    }
-    // Third, increase spacing.
-    if x_left >= 1 {
-        x_spacing += 1;
-        x_left -= 1;
-    }
-    if y_left >= 3 {
-        y_spacing += 1;
-        y_left -= 3;
-    }
-    // Fourth, the side margins.
-    if x_left >= 2 {
-        x_margin += 1;
-        x_left -= 2;
-    }
-    if y_left >= 2 {
-        y_margin += 1;
-        y_left -= 2;
-    }
-    // Last, increase the dot width.
-    if x_left >= 2 && y_left >= 4 {
-        w += 1;
-    }
+  // First, try hard to ensure a non-zero dot width.
+  if x_left >= 2 && y_left >= 4 && w == 0 {
+    w += 1;
+    x_left -= 2;
+    y_left -= 4;
+  }
+  // Second, prefer a non-zero margin.
+  if x_left >= 2 && x_margin == 0 {
+    x_margin = 1;
+    x_left -= 2;
+  }
+  if y_left >= 2 && y_margin == 0 {
+    y_margin = 1;
+    y_left -= 2;
+  }
+  // Third, increase spacing.
+  if x_left >= 1 {
+    x_spacing += 1;
+    x_left -= 1;
+  }
+  if y_left >= 3 {
+    y_spacing += 1;
+    y_left -= 3;
+  }
+  // Fourth, the side margins.
+  if x_left >= 2 {
+    x_margin += 1;
+    x_left -= 2;
+  }
+  if y_left >= 2 {
+    y_margin += 1;
+    y_left -= 2;
+  }
+  // Last, increase the dot width.
+  if x_left >= 2 && y_left >= 4 {
+    w += 1;
+  }
 
-    let xs = [x_margin, x_margin + w + x_spacing];
-    let ys = [
-        y_margin,
-        y_margin + w + y_spacing,
-        y_margin + 2 * (w + y_spacing),
-        y_margin + 3 * (w + y_spacing),
-    ];
-    (w.max(0) as u32, xs, ys)
+  let xs = [x_margin, x_margin + w + x_spacing];
+  let ys = [
+    y_margin,
+    y_margin + w + y_spacing,
+    y_margin + 2 * (w + y_spacing),
+    y_margin + 3 * (w + y_spacing),
+  ];
+  (w.max(0) as u32, xs, ys)
 }
 
 /// Draw a braille pattern as a 2×4 grid of `w`×`w` square dots. Geometry ported
@@ -927,91 +991,99 @@ fn braille_geometry(width: i32, height: i32) -> (u32, [i32; 2], [i32; 4]) {
 /// derived from the cell, then leftover pixels are distributed (dot width →
 /// margins → spacing → …) so dots land on exact pixels with no rounding drift.
 /// The low eight bits of the codepoint select dots: bits 0-2 are the left
-/// column rows 0-2, bits 3-5 the right column rows 0-2, bits 6-7 the bottom row.
-fn draw_braille(canvas: &mut Canvas, c: char, x0: i32, top: i32, m: CellMetrics, fg: Rgb) {
-    let (w, xs, ys) = braille_geometry(m.width as i32, m.height as i32);
-    let sym = ((c as u32) - 0x2800) as u8;
-    // (bit mask, column index, row index).
-    const DOTS: [(u8, usize, usize); 8] = [
-        (0x01, 0, 0),
-        (0x02, 0, 1),
-        (0x04, 0, 2),
-        (0x08, 1, 0),
-        (0x10, 1, 1),
-        (0x20, 1, 2),
-        (0x40, 0, 3),
-        (0x80, 1, 3),
-    ];
-    for (mask, col, row) in DOTS {
-        if sym & mask != 0 {
-            canvas.fill_rect(x0 + xs[col], top + ys[row], w, w, fg);
-        }
+/// column rows 0-2, bits 3-5 the right column rows 0-2, bits 6-7 the bottom
+/// row.
+fn draw_braille(
+  canvas: &mut Canvas,
+  c: char,
+  x0: i32,
+  top: i32,
+  m: CellMetrics,
+  fg: Rgb,
+) {
+  let (w, xs, ys) = braille_geometry(m.width as i32, m.height as i32);
+  let sym = ((c as u32) - 0x2800) as u8;
+  // (bit mask, column index, row index).
+  const DOTS: [(u8, usize, usize); 8] = [
+    (0x01, 0, 0),
+    (0x02, 0, 1),
+    (0x04, 0, 2),
+    (0x08, 1, 0),
+    (0x10, 1, 1),
+    (0x20, 1, 2),
+    (0x40, 0, 3),
+    (0x80, 1, 3),
+  ];
+  for (mask, col, row) in DOTS {
+    if sym & mask != 0 {
+      canvas.fill_rect(x0 + xs[col], top + ys[row], w, w, fg);
     }
+  }
 }
 
 /// Draw underline, strikethrough, and overline for one cell.
 fn draw_decorations(
-    canvas: &mut Canvas,
-    cell: &Cell,
-    theme: &Theme,
-    x0: i32,
-    top: i32,
-    m: CellMetrics,
-    fg: Rgb,
+  canvas: &mut Canvas,
+  cell: &Cell,
+  theme: &Theme,
+  x0: i32,
+  top: i32,
+  m: CellMetrics,
+  fg: Rgb,
 ) {
-    let w = m.width;
-    let baseline = top + m.ascent as i32;
-    let uy = (baseline + 1).min(top + m.height as i32 - 1);
-    // A `Default` underline colour follows the cell's foreground.
-    let uc = match cell.underline_color {
-        crate::grid::Color::Default => fg,
-        other => theme.resolve(other, Plane::Fg, false),
-    };
-    match cell.underline {
-        Underline::None => {}
-        Underline::Single => canvas.hline(x0, uy, w, uc),
-        Underline::Double => {
-            canvas.hline(x0, uy, w, uc);
-            canvas.hline(x0, (uy - 2).max(top), w, uc);
+  let w = m.width;
+  let baseline = top + m.ascent as i32;
+  let uy = (baseline + 1).min(top + m.height as i32 - 1);
+  // A `Default` underline colour follows the cell's foreground.
+  let uc = match cell.underline_color {
+    crate::grid::Color::Default => fg,
+    other => theme.resolve(other, Plane::Fg, false),
+  };
+  match cell.underline {
+    Underline::None => {},
+    Underline::Single => canvas.hline(x0, uy, w, uc),
+    Underline::Double => {
+      canvas.hline(x0, uy, w, uc);
+      canvas.hline(x0, (uy - 2).max(top), w, uc);
+    },
+    Underline::Curly => {
+      for dx in 0..w as i32 {
+        let wobble = if (dx / 2) % 2 == 0 { 0 } else { 1 };
+        canvas.put(x0 + dx, uy - wobble, uc);
+      }
+    },
+    Underline::Dotted => {
+      for dx in (0..w as i32).step_by(2) {
+        canvas.put(x0 + dx, uy, uc);
+      }
+    },
+    Underline::Dashed => {
+      for dx in 0..w as i32 {
+        if (dx / 3) % 2 == 0 {
+          canvas.put(x0 + dx, uy, uc);
         }
-        Underline::Curly => {
-            for dx in 0..w as i32 {
-                let wobble = if (dx / 2) % 2 == 0 { 0 } else { 1 };
-                canvas.put(x0 + dx, uy - wobble, uc);
-            }
-        }
-        Underline::Dotted => {
-            for dx in (0..w as i32).step_by(2) {
-                canvas.put(x0 + dx, uy, uc);
-            }
-        }
-        Underline::Dashed => {
-            for dx in 0..w as i32 {
-                if (dx / 3) % 2 == 0 {
-                    canvas.put(x0 + dx, uy, uc);
-                }
-            }
-        }
-    }
-    if cell.flags.contains(Flags::OVERLINE) {
-        canvas.hline(x0, top, w, fg);
-    }
-    if cell.flags.contains(Flags::STRIKE) {
-        canvas.hline(x0, top + m.ascent as i32 * 2 / 3, w, fg);
-    }
+      }
+    },
+  }
+  if cell.flags.contains(Flags::OVERLINE) {
+    canvas.hline(x0, top, w, fg);
+  }
+  if cell.flags.contains(Flags::STRIKE) {
+    canvas.hline(x0, top + m.ascent as i32 * 2 / 3, w, fg);
+  }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::braille_geometry;
+  use super::braille_geometry;
 
-    // Pinned to foot box-drawing.c draw_braille output (cross-checked numerically
-    // identical across cell sizes 4..30 x 6..48); guards against drift.
-    #[test]
-    fn braille_geometry_matches_foot() {
-        assert_eq!(braille_geometry(8, 18), (2, [1, 5], [2, 6, 10, 14]));
-        assert_eq!(braille_geometry(10, 20), (2, [1, 6], [1, 6, 11, 16]));
-        assert_eq!(braille_geometry(12, 27), (3, [1, 8], [1, 8, 15, 22]));
-        assert_eq!(braille_geometry(7, 15), (1, [1, 4], [2, 5, 8, 11]));
-    }
+  // Pinned to foot box-drawing.c draw_braille output (cross-checked numerically
+  // identical across cell sizes 4..30 x 6..48); guards against drift.
+  #[test]
+  fn braille_geometry_matches_foot() {
+    assert_eq!(braille_geometry(8, 18), (2, [1, 5], [2, 6, 10, 14]));
+    assert_eq!(braille_geometry(10, 20), (2, [1, 6], [1, 6, 11, 16]));
+    assert_eq!(braille_geometry(12, 27), (3, [1, 8], [1, 8, 15, 22]));
+    assert_eq!(braille_geometry(7, 15), (1, [1, 4], [2, 5, 8, 11]));
+  }
 }
