@@ -1,0 +1,95 @@
+# Example beer configuration.
+#
+# Copy to $XDG_CONFIG_HOME/beer/beer.toml (or ~/.config/beer/beer.toml) and
+# uncomment what you want to change. Every value shown is the built-in default,
+# so an empty file behaves exactly like this one. See beer.toml(5) for the full
+# reference and beer-themes(7) for colour theming.
+#
+# Colours are X11 specs: "#rrggbb" or "rgb:rr/gg/bb".
+
+[main]
+font            = "monospace"           # primary family, resolved via fontconfig
+font-size       = 16                    # pixels
+subpixel        = "none"                # LCD antialiasing: none, rgb, or bgr
+term            = "beer"                # TERM exported to the child shell
+initial-cols    = 80
+initial-rows    = 24
+pad-x           = 2                     # inner padding, pixels
+pad-y           = 2
+word-delimiters = " ,│`|:\"'()[]{}<>\t" # unset keeps the built-in set
+idle-inhibit    = false                 # hold off screen blanking while focused
+server-resident = true                  # a --server process outlives its last window
+
+[colors]
+foreground = "#c5c8c6"
+background = "#181818"
+cursor = "#c5c8c6" # unset: invert the cell under the cursor
+selection-foreground = "#181818"
+selection-background = "#44475a"
+match-background = "#ffd700"
+match-current-background = "#ff8c00"
+alpha = 1.0 # 0.0 transparent .. 1.0 opaque
+bold-as-bright = true
+regular = [
+  "#282828",
+  "#cc241d",
+  "#98971a",
+  "#d79921",
+  "#458588",
+  "#b16286",
+  "#689d6a",
+  "#a89984",
+]
+bright = [
+  "#928374",
+  "#fb4934",
+  "#b8bb26",
+  "#fabd2f",
+  "#83a598",
+  "#d3869b",
+  "#8ec07c",
+  "#ebdbb2",
+]
+
+[cursor]
+style = "block" # block | beam (bar) | underline
+blink = false
+
+[scrollback]
+lines = 10000 # history retained on the main screen
+
+[bell]
+visual  = false # flash the screen on the bell
+command = []    # e.g. ["paplay", "/usr/share/sounds/bell.oga"]
+urgent  = false # request attention when unfocused
+
+[mouse]
+scroll-multiplier = 1.0
+alternate-scroll  = true # wheel -> cursor keys on the alt screen
+
+[shell-integration]
+pipe-command = [] # target of the pipe-command-output action, e.g. ["less"]
+
+[url]
+launch = ["xdg-open"] # the URL is appended as the last argument
+
+[notify]
+command = ["notify-send"] # title and body appended as the last two arguments
+
+# Chord -> action, merged over the built-in defaults. "none" unbinds a chord.
+# Actions: copy, paste, paste-primary, scrollback-up, scrollback-down,
+# scrollback-top, scrollback-bottom, search, font-increase, font-decrease,
+# font-reset, fullscreen, new-window, jump-prompt-up, jump-prompt-down,
+# pipe-command-output, url-mode, unicode-input.
+[key-bindings]
+"Ctrl+Shift+C" = "copy"
+"Ctrl+Shift+V" = "paste"
+
+# Mouse chord -> action.
+# Buttons: Left, Middle, Right (Left drag is built in).
+[mouse-bindings]
+"Middle" = "paste-primary"
+
+# Chord -> literal text, with the escapes \e \n \r \t \\ \xNN.
+[text-bindings]
+"Ctrl+Shift+Return" = "\\x1b\r"
