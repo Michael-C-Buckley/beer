@@ -21,8 +21,15 @@ pub struct Pty {
 impl Pty {
     /// Open a PTY, size it to `cols`x`rows` (with `cell` giving the cell size in
     /// pixels, so the kernel reports a pixel geometry for graphics clients), and
-    /// exec the user's login shell on the slave end with `TERM=term`.
-    pub fn spawn(cols: u16, rows: u16, cell: (u16, u16), term: &str) -> anyhow::Result<Self> {
+    /// exec the user's login shell on the slave end with `TERM=term`. When `cwd`
+    /// is set the child starts there, so a new window inherits its parent's cwd.
+    pub fn spawn(
+        cols: u16,
+        rows: u16,
+        cell: (u16, u16),
+        term: &str,
+        cwd: Option<&Path>,
+    ) -> anyhow::Result<Self> {
         let master = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC)
             .context("open pty master")?;
         grantpt(&master).context("grantpt")?;
@@ -57,6 +64,9 @@ impl Pty {
             .stdin(Stdio::from(stdin))
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr));
+        if let Some(dir) = cwd {
+            cmd.current_dir(dir);
+        }
 
         // SAFETY: setsid and the TIOCSCTTY ioctl are async-signal-safe raw
         // syscalls; ctty is a valid fd captured by move. We touch no parent

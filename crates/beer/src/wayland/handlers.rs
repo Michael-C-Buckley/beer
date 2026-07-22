@@ -60,10 +60,12 @@ impl CompositorHandler for App {
 
 impl WindowHandler for App {
     fn request_close(&mut self, _: &Connection, _: &QueueHandle<Self>, window: &XdgWindow) {
-        // Single window: closing it exits the process. Route to the matching
-        // window first so per-window teardown can generalize later.
-        let _ = self.window_index(window.wl_surface());
-        self.exit = true;
+        // Tear down only the closed window; the process exits when the last one
+        // goes (handled by `close_window`).
+        if let Some(idx) = self.window_index(window.wl_surface()) {
+            let id = self.windows[idx].id;
+            self.close_window(id);
+        }
     }
 
     fn configure(

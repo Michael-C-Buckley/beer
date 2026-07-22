@@ -11,6 +11,7 @@ use std::io::{Read as _, Write as _};
 use std::num::NonZeroU16;
 use std::os::fd::OwnedFd;
 use std::os::unix::process::ExitStatusExt;
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use std::time::Duration;
@@ -175,52 +176,19 @@ pub fn run(config: Config, config_paths: Vec<std::path::PathBuf>) -> anyhow::Res
     let primary_manager = PrimarySelectionManagerState::bind(&globals, &qh).ok();
     let cursor_shape_manager = CursorShapeManager::bind(&globals, &qh).ok();
 
-    let surface = compositor.create_surface(&qh);
-    let window = xdg_shell.create_window(surface, WindowDecorations::RequestServer, &qh);
-    window.set_title("beer");
-    window.set_app_id("dev.notashelf.beer");
-    window.set_min_size(Some((1, 1)));
-
-    // Decorrelate buffer pixels from surface size so we can render at the
-    // compositor's preferred fractional scale (crisp glyphs on a 150% output)
-    // and present at the logical size. Both are optional; without them the
-    // window falls back to integer buffer scaling via `scale_factor_changed`.
-    let viewport = bind_global::<WpViewporter>(&globals, &qh)
-        .map(|vp| vp.get_viewport(window.wl_surface(), &qh, ()));
-    // Fractional scaling needs a viewport to present the scaled buffer back at
-    // the logical size; without one we can only do integer buffer scaling.
-    let fractional_scale = viewport.as_ref().and_then(|_| {
-        bind_global::<WpFractionalScaleManagerV1>(&globals, &qh)
-            .map(|mgr| mgr.get_fractional_scale(window.wl_surface(), &qh, ()))
-    });
+    // Surface-creation infrastructure lives on `App` so `open_window` can make
+    // new toplevels after startup. The viewport/fractional-scale/content-type
+    // objects are created per surface from these managers.
+    let viewporter = bind_global::<WpViewporter>(&globals, &qh);
+    let fractional_manager = bind_global::<WpFractionalScaleManagerV1>(&globals, &qh);
+    let content_type_manager = bind_global::<WpContentTypeManagerV1>(&globals, &qh);
     let text_input_manager = bind_global::<ZwpTextInputManagerV3>(&globals, &qh);
     let activation = ActivationState::bind(&globals, &qh).ok();
     let idle_inhibit_manager = bind_global::<ZwpIdleInhibitManagerV1>(&globals, &qh);
-    // Tag the surface as plain content (a terminal is none of photo/video/game)
-    // so the compositor applies no media-specific treatment. Applies on commit.
-    let content_type = bind_global::<WpContentTypeManagerV1>(&globals, &qh)
-        .map(|mgr| mgr.get_surface_content_type(window.wl_surface(), &qh, ()));
-    if let Some(ct) = &content_type {
-        ct.set_content_type(wp_content_type_v1::Type::None);
-    }
-
-    // First commit with no buffer kicks off the initial configure.
-    window.commit();
 
     let fonts = Fonts::new(&config.main.font, config.main.font_size).context("load font")?;
     let mut renderer = Renderer::new(fonts);
     renderer.set_padding(config.main.pad_x, config.main.pad_y);
-
-    // Start at the configured cell geometry plus padding; the compositor may
-    // override it on the first configure.
-    let m = renderer.metrics();
-    let width = (u32::from(config.main.initial_cols) * m.width + 2 * config.main.pad_x).max(1);
-    let height = (u32::from(config.main.initial_rows) * m.height + 2 * config.main.pad_y).max(1);
-    let pool = SlotPool::new(
-        (width * height * 4).max(DEFAULT_W * DEFAULT_H) as usize,
-        &shm,
-    )
-    .context("create shm slot pool")?;
 
     let bindings = crate::bindings::Bindings::from_config(
         &config.key_bindings,
@@ -228,54 +196,6 @@ pub fn run(config: Config, config_paths: Vec<std::path::PathBuf>) -> anyhow::Res
         &config.mouse_bindings,
     );
     let font_size = config.main.font_size;
-
-    // The single window's per-window state. The PTY is spawned on the first
-    // configure, once the real window size is known, so the shell starts at the
-    // final size and is not hit by a startup SIGWINCH storm that makes it
-    // reprint its prompt.
-    let win = Window {
-        pool,
-        window,
-        idle_inhibitor: None,
-        content_type,
-        viewport,
-        fractional_scale,
-        scale120: 120,
-        session: None,
-        title: None,
-        fullscreen: false,
-        width,
-        height,
-        needs_draw: false,
-        frame_pending: false,
-        frames: Vec::new(),
-        buf_dims: (0, 0),
-        sync_timeout: None,
-        flashing: false,
-        flash_timer: None,
-        preedit: String::new(),
-        ime_preedit_pending: String::new(),
-        ime_commit_pending: String::new(),
-        selecting: false,
-        hovered_link: None,
-        pointer_enter_serial: 0,
-        press_cell: None,
-        pressed_button: None,
-        last_report_cell: None,
-        autoscroll: 0,
-        autoscroll_timer: None,
-        pointer_pos: (0.0, 0.0),
-        last_click: None,
-        searching: false,
-        url_mode: false,
-        url_hits: Vec::new(),
-        url_labels: Vec::new(),
-        url_input: String::new(),
-        unicode_input: None,
-        keys_down: std::collections::HashSet::new(),
-        touch_scroll: None,
-        focused: true,
-    };
 
     let mut app = App {
         registry_state: RegistryState::new(&globals),
@@ -285,6 +205,11 @@ pub fn run(config: Config, config_paths: Vec<std::path::PathBuf>) -> anyhow::Res
         renderer,
         loop_handle: event_loop.handle(),
         qh: qh.clone(),
+        compositor,
+        xdg_shell,
+        viewporter,
+        fractional_manager,
+        content_type_manager,
         data_device_manager,
         primary_manager,
         cursor_shape_manager,
@@ -306,9 +231,15 @@ pub fn run(config: Config, config_paths: Vec<std::path::PathBuf>) -> anyhow::Res
         blink_on: true,
         exit: false,
         exit_code: ExitCode::SUCCESS,
-        windows: vec![win],
+        windows: Vec::new(),
         focused_window: 0,
+        next_window_id: 1,
     };
+
+    // The initial window. The PTY spawns on its first configure, once the real
+    // window size is known, so the shell starts at the final size and is not hit
+    // by a startup SIGWINCH storm that makes it reprint its prompt.
+    app.open_window(None);
 
     // Toggle the blink phase on a timer so blinking text and cursors animate.
     let blink = Timer::from_duration(Duration::from_millis(BLINK_MS));
@@ -375,8 +306,14 @@ pub fn run(config: Config, config_paths: Vec<std::path::PathBuf>) -> anyhow::Res
         event_loop
             .dispatch(None, &mut app)
             .context("dispatch event loop")?;
-        let idx = app.focused_window;
-        app.flush(idx);
+        // Flush every window; resolve each by id since a flush cannot change the
+        // window set but keeping ids is robust if that ever changes.
+        let ids: Vec<WindowId> = app.windows.iter().map(|w| w.id).collect();
+        for id in ids {
+            if let Some(idx) = app.window_index_by_id(id) {
+                app.flush(idx);
+            }
+        }
     }
     Ok(app.exit_code)
 }
@@ -457,11 +394,18 @@ struct TouchScroll {
     acc: f64,
 }
 
+/// Stable identifier for a window, so calloop sources and timers can name the
+/// window they belong to without depending on its shifting `Vec` index.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct WindowId(u64);
+
 /// Per-window state: the surface, its shm buffers, the terminal behind it, and
 /// all the input/paint bookkeeping scoped to one toplevel. `App` owns a `Vec`
-/// of these; today there is exactly one.
+/// of these.
 #[derive(Debug)]
 struct Window {
+    /// Stable id, assigned at creation and never reused.
+    id: WindowId,
     pool: SlotPool,
     window: XdgWindow,
     /// idle-inhibitor held while this window is focused when the
@@ -482,6 +426,11 @@ struct Window {
     scale120: u32,
     /// `None` until the first configure spawns the shell.
     session: Option<Session>,
+    /// Directory the shell starts in, seeded when the session spawns; a new
+    /// window inherits the focused window's reported cwd.
+    pending_cwd: Option<PathBuf>,
+    /// Calloop token for the PTY read source, removed on teardown.
+    pty_token: Option<RegistrationToken>,
     /// Last title applied to the toplevel, to avoid redundant requests.
     title: Option<String>,
     /// Whether the toplevel is fullscreen.
@@ -557,6 +506,16 @@ struct App {
     renderer: Renderer,
     loop_handle: LoopHandle<'static, App>,
     qh: QueueHandle<App>,
+    /// Surface-creation infrastructure, kept so `open_window` can build new
+    /// toplevels after startup.
+    compositor: CompositorState,
+    xdg_shell: XdgShell,
+    /// Per-surface viewport source (fractional-scale presentation).
+    viewporter: Option<WpViewporter>,
+    /// Per-surface fractional-scale source.
+    fractional_manager: Option<WpFractionalScaleManagerV1>,
+    /// Per-surface content-type hint source.
+    content_type_manager: Option<WpContentTypeManagerV1>,
     data_device_manager: DataDeviceManagerState,
     primary_manager: Option<PrimarySelectionManagerState>,
     /// Sets the pointer to an I-beam over the window (cursor-shape-v1).
@@ -592,10 +551,12 @@ struct App {
     exit: bool,
     /// Exit code to return, taken from the shell when it exits.
     exit_code: ExitCode,
-    /// Hosted windows. Today there is exactly one.
+    /// Hosted windows; the process exits when the last one closes.
     windows: Vec<Window>,
-    /// Index into `windows` of the focused window (always 0 while single-window).
+    /// Index into `windows` of the focused window.
     focused_window: usize,
+    /// Next window id to hand out; increases monotonically.
+    next_window_id: u64,
 }
 
 impl App {
@@ -607,12 +568,167 @@ impl App {
             .position(|w| w.window.wl_surface() == surface)
     }
 
+    /// Allocate a fresh, never-reused window id.
+    fn alloc_window_id(&mut self) -> WindowId {
+        let id = WindowId(self.next_window_id);
+        self.next_window_id += 1;
+        id
+    }
+
+    /// The index of the window with `id`, if it is still open.
+    fn window_index_by_id(&self, id: WindowId) -> Option<usize> {
+        self.windows.iter().position(|w| w.id == id)
+    }
+
+    /// Create a new toplevel surface and its per-window state, returning its id.
+    /// The session spawns on the first configure (unchanged), so the shell starts
+    /// at the final size; `cwd` seeds the child's working directory then.
+    fn open_window(&mut self, cwd: Option<PathBuf>) -> WindowId {
+        let id = self.alloc_window_id();
+        let surface = self.compositor.create_surface(&self.qh);
+        let window =
+            self.xdg_shell
+                .create_window(surface, WindowDecorations::RequestServer, &self.qh);
+        window.set_title("beer");
+        window.set_app_id("dev.notashelf.beer");
+        window.set_min_size(Some((1, 1)));
+
+        // Decorrelate buffer pixels from surface size so we can render at the
+        // compositor's preferred fractional scale (crisp glyphs on a 150% output)
+        // and present at the logical size. Both are optional; without them the
+        // window falls back to integer buffer scaling via `scale_factor_changed`.
+        let viewport = self
+            .viewporter
+            .as_ref()
+            .map(|vp| vp.get_viewport(window.wl_surface(), &self.qh, ()));
+        // Fractional scaling needs a viewport to present the scaled buffer back at
+        // the logical size; without one we can only do integer buffer scaling.
+        let fractional_scale = viewport.as_ref().and_then(|_| {
+            self.fractional_manager
+                .as_ref()
+                .map(|mgr| mgr.get_fractional_scale(window.wl_surface(), &self.qh, ()))
+        });
+        // Tag the surface as plain content (a terminal is none of photo/video/game)
+        // so the compositor applies no media-specific treatment. Applies on commit.
+        let content_type = self
+            .content_type_manager
+            .as_ref()
+            .map(|mgr| mgr.get_surface_content_type(window.wl_surface(), &self.qh, ()));
+        if let Some(ct) = &content_type {
+            ct.set_content_type(wp_content_type_v1::Type::None);
+        }
+
+        // Start at the configured cell geometry plus padding; the compositor may
+        // override it on the first configure.
+        let m = self.renderer.metrics();
+        let width = (u32::from(self.config.main.initial_cols) * m.width
+            + 2 * self.config.main.pad_x)
+            .max(1);
+        let height = (u32::from(self.config.main.initial_rows) * m.height
+            + 2 * self.config.main.pad_y)
+            .max(1);
+        let pool = match SlotPool::new(
+            (width * height * 4).max(DEFAULT_W * DEFAULT_H) as usize,
+            &self.shm,
+        ) {
+            Ok(pool) => pool,
+            Err(err) => {
+                // Without a buffer pool the window cannot draw; skip it. When it is
+                // the only window the loop then exits, mirroring a startup failure.
+                tracing::error!("create shm slot pool: {err}");
+                if self.windows.is_empty() {
+                    self.exit = true;
+                }
+                return id;
+            }
+        };
+
+        let win = Window {
+            id,
+            pool,
+            window,
+            idle_inhibitor: None,
+            content_type,
+            viewport,
+            fractional_scale,
+            scale120: 120,
+            session: None,
+            pending_cwd: cwd,
+            pty_token: None,
+            title: None,
+            fullscreen: false,
+            width,
+            height,
+            needs_draw: false,
+            frame_pending: false,
+            frames: Vec::new(),
+            buf_dims: (0, 0),
+            sync_timeout: None,
+            flashing: false,
+            flash_timer: None,
+            preedit: String::new(),
+            ime_preedit_pending: String::new(),
+            ime_commit_pending: String::new(),
+            selecting: false,
+            hovered_link: None,
+            pointer_enter_serial: 0,
+            press_cell: None,
+            pressed_button: None,
+            last_report_cell: None,
+            autoscroll: 0,
+            autoscroll_timer: None,
+            pointer_pos: (0.0, 0.0),
+            last_click: None,
+            searching: false,
+            url_mode: false,
+            url_hits: Vec::new(),
+            url_labels: Vec::new(),
+            url_input: String::new(),
+            unicode_input: None,
+            keys_down: std::collections::HashSet::new(),
+            touch_scroll: None,
+            focused: false,
+        };
+        // First commit with no buffer kicks off the initial configure.
+        win.window.commit();
+        self.windows.push(win);
+        id
+    }
+
+    /// Tear down one window: drop its long-lived calloop sources, remove it, and
+    /// exit the process once the last window is gone.
+    fn close_window(&mut self, id: WindowId) {
+        let Some(idx) = self.window_index_by_id(id) else {
+            return;
+        };
+        // Deregister the window's own loop sources before dropping it; the timer
+        // closures also guard on an id lookup, so a pending fire is a no-op.
+        let win = &mut self.windows[idx];
+        let tokens = [
+            win.pty_token.take(),
+            win.autoscroll_timer.take(),
+            win.flash_timer.take(),
+            win.sync_timeout.take(),
+        ];
+        for token in tokens.into_iter().flatten() {
+            self.loop_handle.remove(token);
+        }
+        self.windows.remove(idx);
+        if self.windows.is_empty() {
+            self.exit = true;
+        } else if self.focused_window >= self.windows.len() {
+            self.focused_window = 0;
+        }
+    }
+
     /// Spawn the shell at window `idx`'s current size and start reading output.
     fn spawn_session(&mut self, idx: usize) {
         let (cols, rows) = self.grid_dims(idx);
         let m = self.renderer.metrics();
         let cell = (m.width as u16, m.height as u16);
-        let pty = match Pty::spawn(cols, rows, cell, &self.config.main.term) {
+        let id = self.windows[idx].id;
+        let cwd = self.windows[idx].pending_cwd.clone();
+        let pty = match Pty::spawn(cols, rows, cell, &self.config.main.term, cwd.as_deref()) {
             Ok(pty) => pty,
             Err(err) => {
                 tracing::error!("spawn shell: {err:#}");
@@ -634,10 +750,14 @@ impl App {
         let registered = self
             .loop_handle
             .insert_source(source, move |_, fd, app: &mut App| {
+                // Resolve the window each fire; if it is gone the source is stale.
+                let Some(idx) = app.window_index_by_id(id) else {
+                    return Ok(PostAction::Remove);
+                };
                 let mut buf = [0u8; 4096];
                 let n = match rustix::io::read(&*fd, &mut buf) {
                     Ok(0) => {
-                        app.child_exited(idx);
+                        app.child_exited(id);
                         return Ok(PostAction::Remove);
                     }
                     Ok(n) => n,
@@ -645,7 +765,7 @@ impl App {
                         return Ok(PostAction::Continue);
                     }
                     Err(_) => {
-                        app.child_exited(idx);
+                        app.child_exited(id);
                         return Ok(PostAction::Remove);
                     }
                 };
@@ -658,10 +778,13 @@ impl App {
                 app.after_feed(idx);
                 Ok(PostAction::Continue)
             });
-        if let Err(err) = registered {
-            tracing::error!("register pty in event loop: {err}");
-            self.exit = true;
-            return;
+        match registered {
+            Ok(token) => self.windows[idx].pty_token = Some(token),
+            Err(err) => {
+                tracing::error!("register pty in event loop: {err}");
+                self.exit = true;
+                return;
+            }
         }
 
         let mut term = Term::new(cols as usize, rows as usize);
@@ -958,35 +1081,15 @@ impl App {
         }
     }
 
-    /// Launch another beer process in the shell's reported working directory
-    /// (OSC 7), inheriting the same config. The child is fully detached.
+    /// Open a new in-process window in the focused shell's reported working
+    /// directory (OSC 7), sharing this process's config and event loop.
     fn spawn_new_window(&mut self) {
-        let idx = self.focused_window;
-        let exe = match std::env::current_exe() {
-            Ok(exe) => exe,
-            Err(err) => {
-                tracing::warn!("locate beer executable: {err}");
-                return;
-            }
-        };
-        let mut cmd = std::process::Command::new(exe);
-        for path in &self.config_paths {
-            cmd.arg("--config").arg(path);
-        }
-        if let Some(cwd) = self.windows[idx]
+        let cwd = self.windows[self.focused_window]
             .session
             .as_ref()
             .and_then(|s| s.term.cwd())
-        {
-            cmd.current_dir(cwd);
-        }
-        cmd.stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .env_remove("BEER_CONFIG");
-        if let Err(err) = cmd.spawn() {
-            tracing::warn!("spawn new window: {err}");
-        }
+            .map(PathBuf::from);
+        self.open_window(cwd);
     }
 
     /// Send `count` cursor-up/down keys to the shell for alternate-scroll,
@@ -1965,6 +2068,7 @@ impl App {
     /// buffer ring forces a full repaint with the inverted theme.
     fn start_flash(&mut self) {
         let idx = self.focused_window;
+        let id = self.windows[idx].id;
         self.windows[idx].flashing = true;
         self.windows[idx].frames.clear();
         self.windows[idx].needs_draw = true;
@@ -1973,10 +2077,13 @@ impl App {
             self.windows[idx].flash_timer = self
                 .loop_handle
                 .insert_source(timer, move |_, _, app: &mut App| {
-                    app.windows[idx].flashing = false;
-                    app.windows[idx].frames.clear();
-                    app.windows[idx].needs_draw = true;
-                    app.windows[idx].flash_timer = None;
+                    // Resolve by id: the window may have closed since arming.
+                    if let Some(idx) = app.window_index_by_id(id) {
+                        app.windows[idx].flashing = false;
+                        app.windows[idx].frames.clear();
+                        app.windows[idx].needs_draw = true;
+                        app.windows[idx].flash_timer = None;
+                    }
                     TimeoutAction::Drop
                 })
                 .ok();
@@ -2004,23 +2111,30 @@ impl App {
         }
     }
 
-    /// Window `idx`'s child shell has gone away; reap it, capture its code, and
-    /// tear the window down.
-    fn child_exited(&mut self, idx: usize) {
+    /// The child shell of window `id` has gone away; reap it, capture its code
+    /// when it is the last window (so a single-window session still propagates
+    /// the shell's status), and tear the window down.
+    fn child_exited(&mut self, id: WindowId) {
+        let Some(idx) = self.window_index_by_id(id) else {
+            return;
+        };
+        let last = self.windows.len() == 1;
         if let Some(session) = self.windows[idx].session.as_mut() {
             match session.pty.wait() {
                 Ok(status) => {
                     tracing::info!("shell exited: {status}");
                     // Mirror the shell's status: its code, or 128+signal if killed.
-                    let code = status
-                        .code()
-                        .unwrap_or_else(|| 128 + status.signal().unwrap_or(0));
-                    self.exit_code = ExitCode::from(code as u8);
+                    if last {
+                        let code = status
+                            .code()
+                            .unwrap_or_else(|| 128 + status.signal().unwrap_or(0));
+                        self.exit_code = ExitCode::from(code as u8);
+                    }
                 }
                 Err(err) => tracing::warn!("reap shell: {err}"),
             }
         }
-        self.exit = true;
+        self.close_window(id);
     }
 
     /// Present window `idx`'s frame if one is wanted and the compositor is ready.
@@ -2035,15 +2149,19 @@ impl App {
             .is_some_and(|s| s.term.grid().sync_active());
         if sync {
             if self.windows[idx].sync_timeout.is_none() {
+                let id = self.windows[idx].id;
                 let timer = Timer::from_duration(Duration::from_millis(SYNC_TIMEOUT_MS));
                 self.windows[idx].sync_timeout = self
                     .loop_handle
                     .insert_source(timer, move |_, _, app: &mut App| {
-                        if let Some(session) = app.windows[idx].session.as_mut() {
-                            session.term.grid_mut().set_sync(false);
+                        // Resolve by id: the window may have closed since arming.
+                        if let Some(idx) = app.window_index_by_id(id) {
+                            if let Some(session) = app.windows[idx].session.as_mut() {
+                                session.term.grid_mut().set_sync(false);
+                            }
+                            app.windows[idx].sync_timeout = None;
+                            app.windows[idx].needs_draw = true;
                         }
-                        app.windows[idx].sync_timeout = None;
-                        app.windows[idx].needs_draw = true;
                         TimeoutAction::Drop
                     })
                     .ok();
