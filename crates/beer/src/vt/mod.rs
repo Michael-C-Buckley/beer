@@ -2,6 +2,8 @@
 
 mod perform;
 
+#[cfg(test)] mod conformance;
+
 use std::io::Write as _;
 
 use beer_protocols::{
