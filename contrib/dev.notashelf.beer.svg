@@ -1,18 +1,34 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
   <rect x="4" y="4" width="120" height="120" rx="24" fill="#181818"/>
+  <g transform="translate(-5 -6)">
   <!-- beer mug -->
   <g stroke="#c5c8c6" stroke-width="6" stroke-linejoin="round" fill="none">
     <!-- handle -->
-    <path d="M84 52 h14 a12 12 0 0 1 12 12 v10 a12 12 0 0 1 -12 12 h-14"/>
+    <path d="M84 46 h16 a8 8 0 0 1 8 8 v28 a8 8 0 0 1 -8 8 h-16"/>
     <!-- body -->
-    <rect x="30" y="40" width="54" height="60" rx="6" fill="#1d1f21"/>
+    <rect x="30" y="40" width="54" height="60" rx="10" fill="#1d1f21"/>
   </g>
-  <!-- foam -->
-  <path d="M33 46 a8 8 0 0 1 12 -6 a9 9 0 0 1 16 0 a8 8 0 0 1 12 6 z" fill="#ebdbb2"/>
+  <!-- foam fills the whole liquid column; the beer overlays it up to a wavy line -->
+  <rect x="36" y="46" width="42" height="48" rx="4" fill="#ebdbb2"/>
   <!-- beer fill -->
-  <rect x="36" y="52" width="42" height="42" rx="3" fill="#d79921"/>
+  <path d="M36 57 C43 62 49 52 56 56 C63 60 71 52 78 57 L78 90 A4 4 0 0 1 74 94 L40 94 A4 4 0 0 1 36 90 Z" fill="#d79921"/>
+  <!-- foam bubbles -->
+  <g fill="#d3bd8f">
+    <circle cx="42" cy="51" r="0.6"/>
+    <circle cx="45" cy="49" r="0.5"/>
+    <circle cx="48" cy="51" r="0.7"/>
+    <circle cx="51" cy="49" r="0.5"/>
+    <circle cx="54" cy="50" r="0.6"/>
+    <circle cx="57" cy="51" r="0.7"/>
+    <circle cx="60" cy="49" r="0.5"/>
+    <circle cx="63" cy="50" r="0.6"/>
+    <circle cx="66" cy="51" r="0.5"/>
+    <circle cx="69" cy="49" r="0.6"/>
+    <circle cx="72" cy="50" r="0.5"/>
+  </g>
   <!-- terminal prompt on the glass -->
   <path d="M44 66 l8 7 l-8 7" stroke="#181818" stroke-width="5" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
   <line x1="58" y1="82" x2="70" y2="82" stroke="#181818" stroke-width="5" stroke-linecap="round"/>
+  </g>
 </svg>
