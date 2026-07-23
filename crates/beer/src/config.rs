@@ -226,7 +226,7 @@ impl Config {
         },
       };
       report_unknown_keys(&text, path);
-      let value = match text.parse::<toml::Value>() {
+      let value = match toml::from_str::<toml::Value>(&text) {
         Ok(v) => v,
         Err(err) => {
           tracing::warn!("config {}: {err}; skipping", path.display());
@@ -353,5 +353,24 @@ mod tests {
     assert!(unknown.iter().any(|k| k == "made-up"), "{unknown:?}");
     // ...yet the valid key still loaded.
     assert_eq!(c.main.font, "JetBrains Mono");
+  }
+
+  #[test]
+  fn load_reads_a_file_with_table_headers() {
+    // `Config::load` must parse the whole document, not a single TOML value.
+    // `str::parse::<toml::Value>()` reads only one value and rejects a leading
+    // `[table]` header ("unexpected content").
+    let path = std::env::temp_dir()
+      .join(format!("beer-config-{}.toml", std::process::id()));
+    std::fs::write(
+      &path,
+      "[main]\nfont = \"JetBrains Mono\"\nfont-size = 20\n\n\
+       [colors]\nbackground = \"#171717\"\nalpha = 0.8\n",
+    )
+    .unwrap();
+    let c = Config::load(std::slice::from_ref(&path));
+    std::fs::remove_file(&path).ok();
+    assert_eq!(c.main.font, "JetBrains Mono");
+    assert_eq!(c.main.font_size, 20);
   }
 }
