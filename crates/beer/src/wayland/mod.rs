@@ -3,23 +3,22 @@
 //! Uses smithay-client-toolkit for protocol boilerplate and calloop for the
 //! event loop, so the PTY master fd and timers share one loop.
 
+mod daemon;
 mod handlers;
 mod rendering;
 
 use std::{
+  collections::HashMap,
   fs::{self, File},
   io::{ErrorKind, Read as _, Write as _},
   num::NonZeroU16,
   os::{
     fd::OwnedFd,
-    unix::{
-      net::{UnixListener, UnixStream},
-      process::ExitStatusExt,
-    },
+    unix::{net::UnixStream, process::ExitStatusExt},
   },
   path::PathBuf,
   process::ExitCode,
-  time::Duration,
+  time::{Duration, Instant},
 };
 
 use anyhow::Context;
@@ -34,6 +33,7 @@ use calloop::{
   timer::{TimeoutAction, Timer},
 };
 use calloop_wayland_source::WaylandSource;
+use daemon::bind_server_socket;
 use handlers::{cursor_shape_from, hint_labels};
 use rendering::FrameBuf;
 use smithay_client_toolkit::{
@@ -298,6 +298,8 @@ pub fn run(
     exit_code: ExitCode::SUCCESS,
     windows: Vec::new(),
     focused_window: 0,
+    pending_ipc_clients: HashMap::new(),
+    next_ipc_client_id: 1,
     next_window_id: 1,
     resident,
   };
@@ -398,60 +400,6 @@ pub fn run(
   Ok(app.exit_code)
 }
 
-/// Bind the daemon socket and register a calloop source that opens a window per
-/// client connection. Returns the socket path so the caller can unlink it on
-/// exit.
-///
-/// # Errors
-///
-/// Fails if another server already owns the socket, or if binding or
-/// registering the listener fails.
-fn bind_server_socket(event_loop: &EventLoop<App>) -> anyhow::Result<PathBuf> {
-  let path = ipc::socket_path();
-  // A connectable socket means a live server already owns this display; a
-  // dangling one is stale and safe to replace.
-  if UnixStream::connect(&path).is_ok() {
-    anyhow::bail!("a beer server is already running at {}", path.display());
-  }
-  let _ = fs::remove_file(&path);
-  let listener = UnixListener::bind(&path)
-    .with_context(|| format!("bind socket {}", path.display()))?;
-  listener
-    .set_nonblocking(true)
-    .context("set socket non-blocking")?;
-
-  let source = Generic::new(listener, Interest::READ, Mode::Level);
-  event_loop
-    .handle()
-    .insert_source(source, |_, listener, app: &mut App| {
-      // Drain every pending connection; the listener is level-triggered.
-      loop {
-        match listener.accept() {
-          Ok((mut stream, _)) => {
-            // The request is a small frame sent right after connect,
-            // so a brief blocking read of it is fine.
-            let _ = stream.set_nonblocking(false);
-            match ipc::read_request(&mut stream) {
-              Ok(req) => {
-                let cwd = req.cwd.map(PathBuf::from);
-                app.open_window(cwd, req.env, Some(stream));
-              },
-              Err(err) => tracing::warn!("bad client request: {err}"),
-            }
-          },
-          Err(err) if err.kind() == ErrorKind::WouldBlock => break,
-          Err(err) => {
-            tracing::warn!("accept client: {err}");
-            break;
-          },
-        }
-      }
-      Ok(PostAction::Continue)
-    })
-    .map_err(|e| anyhow::anyhow!("register socket source: {e}"))?;
-  Ok(path)
-}
-
 /// Bind a singleton global at version 1 with `()` user-data, or `None` if the
 /// compositor does not advertise it.
 fn bind_global<I>(globals: &GlobalList, qh: &QueueHandle<App>) -> Option<I>
@@ -465,6 +413,41 @@ where
       tracing::debug!("bind {}: {err}", I::interface().name);
       None
     },
+  }
+}
+
+/// Preserve focus on the same window when removing an earlier vector entry.
+/// If the focused window itself closes and has no successor, retain the
+/// existing first-window fallback.
+fn focused_after_removal(
+  focused: usize,
+  removed: usize,
+  remaining: usize,
+) -> usize {
+  if remaining == 0 {
+    return 0;
+  }
+  let focused = if removed < focused {
+    focused - 1
+  } else {
+    focused
+  };
+  if focused < remaining { focused } else { 0 }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::focused_after_removal;
+
+  #[test]
+  fn closing_an_earlier_window_preserves_focus_identity() {
+    // A, B, C with C focused; remove A and C remains focused at index 1.
+    assert_eq!(focused_after_removal(2, 0, 2), 1);
+  }
+
+  #[test]
+  fn closing_the_last_focused_window_uses_the_first_window() {
+    assert_eq!(focused_after_removal(2, 2, 2), 0);
   }
 }
 
@@ -697,6 +680,11 @@ struct App {
   windows:              Vec<Window>,
   /// Index into `windows` of the focused window.
   focused_window:       usize,
+  /// Accepted daemon clients whose initial request is still being read by a
+  /// non-blocking calloop source.
+  pending_ipc_clients:  HashMap<u64, (RegistrationToken, Instant)>,
+  /// Monotonic identity for pending IPC readers.
+  next_ipc_client_id:   u64,
   /// Next window id to hand out; increases monotonically.
   next_window_id:       u64,
   /// A server stays alive after its last window closes; a standalone process
@@ -886,8 +874,9 @@ impl App {
     // A resident server keeps running with no windows, waiting for clients.
     if self.windows.is_empty() {
       self.exit = !self.resident;
-    } else if self.focused_window >= self.windows.len() {
-      self.focused_window = 0;
+    } else {
+      self.focused_window =
+        focused_after_removal(self.focused_window, idx, self.windows.len());
     }
   }
 

@@ -7,9 +7,13 @@
 //! back when that window closes.
 
 use std::{
+  fs,
   io::{self, Read, Write},
-  os::unix::net::UnixStream,
-  path::PathBuf,
+  os::unix::{
+    fs::{FileTypeExt, MetadataExt, PermissionsExt},
+    net::{UnixListener, UnixStream},
+  },
+  path::{Path, PathBuf},
 };
 
 /// Upper bound on a request frame, so a bad client cannot make us allocate
@@ -25,15 +29,87 @@ pub struct OpenRequest {
   pub env: Vec<(String, String)>,
 }
 
-/// The daemon socket on `$XDG_RUNTIME_DIR/beer-$WAYLAND_DISPLAY.sock`, falling
-/// back to a temp dir and `wayland-0` when those variables are unset.
-pub fn socket_path() -> PathBuf {
+/// The daemon socket on `$XDG_RUNTIME_DIR/beer-$WAYLAND_DISPLAY.sock`.
+///
+/// Daemon IPC carries a client's environment and starts a shell as the server,
+/// so it must live in the user's private runtime directory rather than a
+/// shared temp directory.
+pub fn socket_path() -> io::Result<PathBuf> {
   let dir = std::env::var_os("XDG_RUNTIME_DIR")
+    .filter(|value| !value.is_empty())
     .map(PathBuf::from)
-    .unwrap_or_else(std::env::temp_dir);
+    .ok_or_else(|| {
+      io::Error::new(
+        io::ErrorKind::NotFound,
+        "XDG_RUNTIME_DIR is required for daemon IPC",
+      )
+    })?;
+  let metadata = fs::metadata(&dir)?;
+  if !metadata.is_dir()
+    || metadata.uid() != rustix::process::getuid().as_raw()
+    || metadata.mode() & 0o077 != 0
+  {
+    return Err(io::Error::new(
+      io::ErrorKind::PermissionDenied,
+      "XDG_RUNTIME_DIR must be a private directory owned by this user",
+    ));
+  }
   let display =
     std::env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "wayland-0".into());
-  dir.join(format!("beer-{display}.sock"))
+  socket_path_in(&dir, &display)
+}
+
+/// Bind the daemon listener with owner-only access, replacing only a stale
+/// socket at its exact path.
+pub fn bind_listener() -> io::Result<(UnixListener, PathBuf)> {
+  let path = socket_path()?;
+  let listener = bind_listener_at(&path)?;
+  Ok((listener, path))
+}
+
+fn socket_path_in(dir: &Path, display: &str) -> io::Result<PathBuf> {
+  if display.is_empty() || display.contains('/') {
+    return Err(io::Error::new(
+      io::ErrorKind::InvalidInput,
+      "WAYLAND_DISPLAY must be a socket name",
+    ));
+  }
+  Ok(dir.join(format!("beer-{display}.sock")))
+}
+
+fn bind_listener_at(path: &Path) -> io::Result<UnixListener> {
+  match UnixStream::connect(path) {
+    Ok(_) => {
+      return Err(io::Error::new(
+        io::ErrorKind::AddrInUse,
+        format!("a beer server is already running at {}", path.display()),
+      ));
+    },
+    Err(err)
+      if matches!(
+        err.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+      ) => {},
+    Err(err) => return Err(err),
+  }
+  match fs::symlink_metadata(path) {
+    Ok(metadata) if metadata.file_type().is_socket() => fs::remove_file(path)?,
+    Ok(_) => {
+      return Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!("refusing to replace non-socket {}", path.display()),
+      ));
+    },
+    Err(err) if err.kind() == io::ErrorKind::NotFound => {},
+    Err(err) => return Err(err),
+  }
+  let listener = UnixListener::bind(path)?;
+  restrict_socket_permissions(path)?;
+  Ok(listener)
+}
+
+fn restrict_socket_permissions(path: &Path) -> io::Result<()> {
+  fs::set_permissions(path, fs::Permissions::from_mode(0o600))
 }
 
 impl OpenRequest {
@@ -87,7 +163,7 @@ impl OpenRequest {
 ///
 /// Returns an error if no server is listening.
 pub fn run_client(req: &OpenRequest) -> io::Result<u8> {
-  let mut stream = UnixStream::connect(socket_path())?;
+  let mut stream = UnixStream::connect(socket_path()?)?;
   stream.write_all(&req.encode())?;
   let mut code = [0u8; 1];
   match stream.read_exact(&mut code) {
@@ -98,28 +174,59 @@ pub fn run_client(req: &OpenRequest) -> io::Result<u8> {
   }
 }
 
-/// Read one request frame from an accepted (blocking) client stream.
-///
-/// # Errors
-///
-/// Fails with [`io::ErrorKind::InvalidData`] when the length prefix exceeds the
-/// frame cap or the body is malformed, and propagates any underlying read
-/// error.
-pub fn read_request(stream: &mut UnixStream) -> io::Result<OpenRequest> {
-  let mut len = [0u8; 4];
-  stream.read_exact(&mut len)?;
-  let n = u32::from_be_bytes(len) as usize;
-  if n > MAX_REQUEST {
-    return Err(io::Error::new(
-      io::ErrorKind::InvalidData,
-      "request too large",
-    ));
+/// Incrementally read one request frame from a non-blocking client stream.
+#[derive(Default)]
+pub(crate) struct RequestReader {
+  len:       [u8; 4],
+  len_read:  usize,
+  body:      Option<Vec<u8>>,
+  body_read: usize,
+}
+
+impl RequestReader {
+  /// Consume available bytes. `Ok(None)` means the frame is incomplete.
+  pub fn read_from<R: Read>(
+    &mut self,
+    mut stream: R,
+  ) -> io::Result<Option<OpenRequest>> {
+    loop {
+      if self.len_read < self.len.len() {
+        match stream.read(&mut self.len[self.len_read..]) {
+          Ok(0) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
+          Ok(n) => self.len_read += n,
+          Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+            return Ok(None);
+          },
+          Err(err) => return Err(err),
+        }
+        continue;
+      }
+
+      if self.body.is_none() {
+        let len = u32::from_be_bytes(self.len) as usize;
+        if len > MAX_REQUEST {
+          return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "request too large",
+          ));
+        }
+        self.body = Some(vec![0; len]);
+      }
+
+      let body = self.body.as_mut().expect("body initialized above");
+      if self.body_read == body.len() {
+        return OpenRequest::decode(body).map(Some).ok_or_else(|| {
+          io::Error::new(io::ErrorKind::InvalidData, "malformed request")
+        });
+      }
+      match stream.read(&mut body[self.body_read..]) {
+        Ok(0) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
+        Ok(n) => self.body_read += n,
+        Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(None),
+        Err(err) => return Err(err),
+      }
+    }
   }
-  let mut body = vec![0u8; n];
-  stream.read_exact(&mut body)?;
-  OpenRequest::decode(&body).ok_or_else(|| {
-    io::Error::new(io::ErrorKind::InvalidData, "malformed request")
-  })
 }
 
 /// Server: send the final exit status to a client and drop the connection.
@@ -154,6 +261,33 @@ fn take_bytes<'a>(buf: &mut &'a [u8]) -> Option<&'a [u8]> {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[derive(Default)]
+  struct NonblockingReader {
+    bytes: Vec<u8>,
+    pos:   usize,
+  }
+
+  impl NonblockingReader {
+    fn push(&mut self, bytes: &[u8]) {
+      self.bytes.extend_from_slice(bytes);
+    }
+  }
+
+  impl Read for NonblockingReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+      let Some(available) = self.bytes.get(self.pos..) else {
+        return Err(io::Error::from(io::ErrorKind::WouldBlock));
+      };
+      if available.is_empty() {
+        return Err(io::Error::from(io::ErrorKind::WouldBlock));
+      }
+      let len = buf.len().min(available.len());
+      buf[..len].copy_from_slice(&available[..len]);
+      self.pos += len;
+      Ok(len)
+    }
+  }
 
   fn round_trip(req: &OpenRequest) {
     let frame = req.encode();
@@ -206,5 +340,58 @@ mod tests {
     // Chop the body short; decode must reject rather than panic.
     assert_eq!(OpenRequest::decode(&frame[4..frame.len() - 3]), None);
     assert_eq!(OpenRequest::decode(&[0, 0, 0]), None);
+  }
+
+  #[test]
+  fn request_reader_waits_for_a_complete_nonblocking_frame() {
+    let request = OpenRequest {
+      cwd: Some("/tmp".into()),
+      env: vec![("TERM".into(), "beer".into())],
+    };
+    let frame = request.encode();
+    let mut stream = NonblockingReader::default();
+    stream.push(&frame[..2]);
+
+    let mut reader = RequestReader::default();
+    assert_eq!(reader.read_from(&mut stream).unwrap(), None);
+
+    stream.push(&frame[2..]);
+    assert_eq!(reader.read_from(&mut stream).unwrap(), Some(request));
+  }
+
+  #[test]
+  fn request_reader_rejects_an_oversized_frame_before_allocating() {
+    let mut stream = NonblockingReader::default();
+    stream.push(&(MAX_REQUEST as u32 + 1).to_be_bytes());
+
+    let err = RequestReader::default().read_from(&mut stream).unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+  }
+
+  #[test]
+  fn socket_name_rejects_path_separators() {
+    let err =
+      socket_path_in(Path::new("/run/user/1000"), "../other").unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+  }
+
+  #[test]
+  fn socket_permission_helper_is_owner_only() {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let path = std::env::temp_dir().join(format!(
+      "beer-ipc-test-{}-{}",
+      std::process::id(),
+      std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos(),
+    ));
+    fs::File::create(&path).unwrap();
+    restrict_socket_permissions(&path).unwrap();
+
+    assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+
+    fs::remove_file(path).unwrap();
   }
 }

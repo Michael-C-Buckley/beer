@@ -107,7 +107,9 @@ notifications via *OSC 9*, *OSC 777*, and *OSC 99*.
 
 *beer --server* runs one process that hosts many windows, sharing a single
 Wayland connection and glyph cache. It listens on a Unix socket at
-_$XDG_RUNTIME_DIR/beer-$WAYLAND_DISPLAY.sock_.
+_$XDG_RUNTIME_DIR/beer-$WAYLAND_DISPLAY.sock_. The runtime directory must be
+private to the current user; the server refuses to use a shared temporary
+directory for this IPC channel.
 
 A plain *beer* (without *--server* or *--no-daemon*) is the client: it forwards
 its working directory and environment to a running server, which opens a window
