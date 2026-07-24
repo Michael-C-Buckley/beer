@@ -5,7 +5,7 @@
 //! then glyphs - so a wide glyph that overflows its cell is not clipped by the
 //! neighbouring cell's background fill.
 
-use std::num::NonZeroU16;
+use std::{num::NonZeroU16, sync::LazyLock};
 
 use beer_protocols::{
   graphics::{PLACEHOLDER, diacritic_value},
@@ -13,17 +13,59 @@ use beer_protocols::{
 };
 
 use crate::{
-  config::Subpixel,
+  config::{AlphaBlending, Subpixel},
   font::{CellMetrics, Fonts, Glyph, GlyphData, Style},
   grid::{Cell, Color, CursorShape, Flags, Grid, Underline},
   theme::{Plane, Rgb, Theme},
 };
+
+/// sRGB (8-bit) → linear-light [0,1] lookup, for gamma-correct compositing.
+static SRGB_TO_LINEAR: LazyLock<[f32; 256]> = LazyLock::new(|| {
+  let mut t = [0f32; 256];
+  for (i, v) in t.iter_mut().enumerate() {
+    *v = srgb_to_linear_f(i as f32 / 255.0);
+  }
+  t
+});
+
+/// sRGB transfer decode of a normalized [0,1] channel to linear light.
+fn srgb_to_linear_f(c: f32) -> f32 {
+  if c <= 0.04045 {
+    c / 12.92
+  } else {
+    ((c + 0.055) / 1.055).powf(2.4)
+  }
+}
+
+/// sRGB transfer encode of a linear [0,1] channel back to a normalized float.
+fn linear_to_srgb_f(c: f32) -> f32 {
+  let c = c.clamp(0.0, 1.0);
+  if c <= 0.0031308 {
+    c * 12.92
+  } else {
+    1.055 * c.powf(1.0 / 2.4) - 0.055
+  }
+}
+
+/// Encode a linear channel to an 8-bit sRGB value.
+fn linear_to_srgb(c: f32) -> u8 {
+  (linear_to_srgb_f(c) * 255.0).round().clamp(0.0, 255.0) as u8
+}
+
+/// Rec. 709 relative luminance of a linear RGB triple.
+fn luminance(rgb: [f32; 3]) -> f32 {
+  0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]
+}
 
 /// A mutable view over a BGRA pixel buffer.
 struct Canvas<'a> {
   pixels: &'a mut [u8],
   width:  usize,
   height: usize,
+  /// How coverage is composited (see [`AlphaBlending`]). Set to `Native` when
+  /// the destination is translucent, since linear blending needs an opaque
+  /// destination.
+  blend:  AlphaBlending,
 }
 
 impl Canvas<'_> {
@@ -68,16 +110,55 @@ impl Canvas<'_> {
     }
   }
 
-  /// Alpha-blend `fg` over the existing pixel with coverage `a`.
+  /// Alpha-blend `fg` over the existing pixel with coverage `a`, in the
+  /// configured [`AlphaBlending`] space. The buffer is BGRA: index 0 is blue,
+  /// index 2 is red.
   fn blend(&mut self, x: i32, y: i32, fg: Rgb, a: u8) {
     let Some(i) = self.index(x, y) else { return };
-    let (a, inv) = (u32::from(a), u32::from(255 - a));
-    let mix = |src: u8, dst: u8| {
-      ((u32::from(src) * a + u32::from(dst) * inv) / 255) as u8
-    };
-    self.pixels[i] = mix(fg.2, self.pixels[i]);
-    self.pixels[i + 1] = mix(fg.1, self.pixels[i + 1]);
-    self.pixels[i + 2] = mix(fg.0, self.pixels[i + 2]);
+    match self.blend {
+      AlphaBlending::Native => {
+        let (a, inv) = (u32::from(a), u32::from(255 - a));
+        let mix = |src: u8, dst: u8| {
+          ((u32::from(src) * a + u32::from(dst) * inv) / 255) as u8
+        };
+        self.pixels[i] = mix(fg.2, self.pixels[i]);
+        self.pixels[i + 1] = mix(fg.1, self.pixels[i + 1]);
+        self.pixels[i + 2] = mix(fg.0, self.pixels[i + 2]);
+      },
+      AlphaBlending::Linear | AlphaBlending::LinearCorrected => {
+        let lut = &*SRGB_TO_LINEAR;
+        // Foreground and destination in linear light.
+        let f = [lut[fg.0 as usize], lut[fg.1 as usize], lut[fg.2 as usize]];
+        let d = [
+          lut[self.pixels[i + 2] as usize],
+          lut[self.pixels[i + 1] as usize],
+          lut[self.pixels[i] as usize],
+        ];
+        let cov = f32::from(a) / 255.0;
+        // Linear-corrected remaps the coverage so the blended luminance matches
+        // what gamma-space (Native) blending would give, preserving perceived
+        // stroke weight while keeping colour edges clean.
+        let alpha = if self.blend == AlphaBlending::LinearCorrected {
+          let fl = luminance(f);
+          let bl = luminance(d);
+          if (fl - bl).abs() < 1e-6 {
+            cov
+          } else {
+            let target = srgb_to_linear_f(
+              linear_to_srgb_f(fl) * cov + linear_to_srgb_f(bl) * (1.0 - cov),
+            );
+            ((target - bl) / (fl - bl)).clamp(0.0, 1.0)
+          }
+        } else {
+          cov
+        };
+        let out =
+          |fc: f32, dc: f32| linear_to_srgb(fc * alpha + dc * (1.0 - alpha));
+        self.pixels[i] = out(f[2], d[2]);
+        self.pixels[i + 1] = out(f[1], d[1]);
+        self.pixels[i + 2] = out(f[0], d[0]);
+      },
+    }
     self.pixels[i + 3] = 0xFF;
   }
 
@@ -165,11 +246,18 @@ pub struct Renderer {
   fonts: Fonts,
   /// Inner padding `(x, y)` in pixels between the window edge and the grid.
   pad:   (i32, i32),
+  /// Configured coverage compositing mode (downgraded to `Native` per frame
+  /// when the background is translucent).
+  blend: AlphaBlending,
 }
 
 impl Renderer {
   pub fn new(fonts: Fonts) -> Self {
-    Self { fonts, pad: (0, 0) }
+    Self {
+      fonts,
+      pad: (0, 0),
+      blend: AlphaBlending::default(),
+    }
   }
 
   pub fn metrics(&self) -> CellMetrics {
@@ -178,6 +266,21 @@ impl Renderer {
 
   pub fn set_padding(&mut self, pad_x: u32, pad_y: u32) {
     self.pad = (pad_x as i32, pad_y as i32);
+  }
+
+  pub fn set_alpha_blending(&mut self, blend: AlphaBlending) {
+    self.blend = blend;
+  }
+
+  /// The compositing mode to use this frame: the configured mode when the
+  /// background is opaque, else `Native` (linear blending needs an opaque
+  /// destination to read).
+  fn blend_for(&self, theme: &Theme) -> AlphaBlending {
+    if theme.alpha == 0xFF {
+      self.blend
+    } else {
+      AlphaBlending::Native
+    }
   }
 
   /// Rebuild the font set at a new size (font-resize bindings).
@@ -200,6 +303,7 @@ impl Renderer {
       pixels,
       width,
       height,
+      blend: self.blend_for(theme),
     };
     canvas.fill_rect_a(
       0,
@@ -235,6 +339,7 @@ impl Renderer {
       pixels,
       width,
       height,
+      blend: self.blend_for(theme),
     };
     let m = self.fonts.metrics();
     let (pad_x, pad_y) = self.pad;
@@ -435,6 +540,7 @@ impl Renderer {
       pixels,
       width,
       height,
+      blend: self.blend_for(theme),
     };
     let m = self.fonts.metrics();
     let (pad_x, pad_y) = self.pad;
@@ -472,6 +578,7 @@ impl Renderer {
       pixels,
       width,
       height,
+      blend: self.blend_for(theme),
     };
     let m = self.fonts.metrics();
     let (pad_x, pad_y) = self.pad;
@@ -510,6 +617,7 @@ impl Renderer {
       pixels,
       width,
       height,
+      blend: self.blend_for(theme),
     };
     let m = self.fonts.metrics();
     let (pad_x, pad_y) = self.pad;
@@ -744,11 +852,11 @@ fn blit_glyph_clipped(
         if py < clip.0 || py >= clip.1 {
           continue;
         }
-        let sy = ((ty as f32 / sc) as i32).min(gh - 1);
+        let sy = (ty as f32 + 0.5) / sc - 0.5;
         for tx in 0..tw {
-          let sx = ((tx as f32 / sc) as i32).min(gw - 1);
-          let i = ((sy * gw + sx) * 4) as usize;
-          canvas.over(pen_x + tx, py, &bgra[i..i + 4]);
+          let sx = (tx as f32 + 0.5) / sc - 0.5;
+          let px = sample_bilinear(bgra, gw, gh, sx, sy);
+          canvas.over(pen_x + tx, py, &px);
         }
       }
     },
@@ -986,16 +1094,37 @@ fn blit_glyph(
       let scale = m.height as f32 / gh as f32;
       let target_w = (gw as f32 * scale) as i32;
       for ty in 0..m.height as i32 {
-        let sy = ((ty as f32 / scale) as i32).min(gh - 1);
+        let sy = (ty as f32 + 0.5) / scale - 0.5;
         for tx in 0..target_w {
-          let sx = ((tx as f32 / scale) as i32).min(gw - 1);
-          let i = ((sy * gw + sx) * 4) as usize;
-          canvas.over(origin_x + tx, cell_top + ty, &bgra[i..i + 4]);
+          let sx = (tx as f32 + 0.5) / scale - 0.5;
+          let px = sample_bilinear(bgra, gw, gh, sx, sy);
+          canvas.over(origin_x + tx, cell_top + ty, &px);
         }
       }
     },
     GlyphData::Color(_) => {},
   }
+}
+
+/// Bilinearly sample a premultiplied BGRA image at fractional `(fx, fy)`.
+/// Premultiplied colour interpolates linearly, so this is correct to blend.
+fn sample_bilinear(bgra: &[u8], w: i32, h: i32, fx: f32, fy: f32) -> [u8; 4] {
+  let x0f = fx.floor();
+  let y0f = fy.floor();
+  let (dx, dy) = (fx - x0f, fy - y0f);
+  let x0 = (x0f as i32).clamp(0, w - 1);
+  let y0 = (y0f as i32).clamp(0, h - 1);
+  let x1 = (x0 + 1).min(w - 1);
+  let y1 = (y0 + 1).min(h - 1);
+  let at =
+    |x: i32, y: i32, c: usize| f32::from(bgra[((y * w + x) * 4) as usize + c]);
+  let mut out = [0u8; 4];
+  for (c, o) in out.iter_mut().enumerate() {
+    let top = at(x0, y0, c) * (1.0 - dx) + at(x1, y0, c) * dx;
+    let bot = at(x0, y1, c) * (1.0 - dx) + at(x1, y1, c) * dx;
+    *o = (top * (1.0 - dy) + bot * dy).round().clamp(0.0, 255.0) as u8;
+  }
+  out
 }
 
 fn cell_style(cell: &Cell) -> Style {
@@ -1134,9 +1263,9 @@ fn draw_braille(
 
 /// Whether `c` is drawn geometrically by [`draw_box`]: box drawing
 /// (U+2500-257F), block elements (U+2580-259F), or the legacy-computing
-/// sextants (U+1FB00-1FB3B).
+/// sextants (U+1FB00-1FB3B) and octants (U+1CD00-1CDE5).
 fn is_box_draw(c: char) -> bool {
-  matches!(c as u32, 0x2500..=0x259F | 0x1FB00..=0x1FB3B)
+  matches!(c as u32, 0x2500..=0x259F | 0x1FB00..=0x1FB3B | 0x1CD00..=0x1CDE5)
 }
 
 /// Draw a box-drawing, block-element, or sextant glyph directly into the cell.
@@ -1159,6 +1288,10 @@ fn draw_box(
     },
     0x1FB00..=0x1FB3B => {
       draw_sextant(canvas, c as u32, x0, top, m, fg);
+      true
+    },
+    0x1CD00..=0x1CDE5 => {
+      draw_octant(canvas, c as u32, x0, top, m, fg);
       true
     },
     0x2500..=0x257F => draw_box_line(canvas, c as u32, x0, top, m, fg),
@@ -1314,6 +1447,54 @@ fn draw_sextant(
   }
 }
 
+/// Fill pattern per octant codepoint (index = `cp - 0x1CD00`, 0..229). Bits
+/// 0-3 are the left column top-to-bottom, bits 4-7 the right column. Transcribed
+/// verbatim from Kitty's `decorations.c` `octant()` mapping table.
+#[rustfmt::skip]
+const OCTANTS: [u8; 230] = [
+  0x02, 0x12, 0x13, 0x20, 0x21, 0x31, 0x22, 0x23, 0x32, 0x04, 0x05, 0x14, 0x15, 0x07, 0x16, 0x17,
+  0x24, 0x25, 0x34, 0x35, 0x26, 0x27, 0x36, 0x37, 0x40, 0x41, 0x50, 0x51, 0x42, 0x43, 0x52, 0x53,
+  0x61, 0x70, 0x71, 0x62, 0x63, 0x72, 0x73, 0x44, 0x45, 0x54, 0x55, 0x46, 0x47, 0x56, 0x57, 0x64,
+  0x65, 0x74, 0x75, 0x66, 0x67, 0x76, 0x09, 0x18, 0x19, 0x0a, 0x0b, 0x1a, 0x1b, 0x28, 0x29, 0x38,
+  0x39, 0x2a, 0x2b, 0x3a, 0x3b, 0x0d, 0x1c, 0x1d, 0x0e, 0x1e, 0x1f, 0x2c, 0x2d, 0x3d, 0x2e, 0x2f,
+  0x3e, 0x48, 0x49, 0x58, 0x59, 0x4a, 0x4b, 0x5a, 0x5b, 0x68, 0x69, 0x78, 0x79, 0x6a, 0x6b, 0x7a,
+  0x7b, 0x4c, 0x4d, 0x5c, 0x5d, 0x4e, 0x4f, 0x5e, 0x5f, 0x6c, 0x6d, 0x7c, 0x7d, 0x6e, 0x6f, 0x7e,
+  0x7f, 0x81, 0x90, 0x91, 0x82, 0x83, 0x92, 0x93, 0xa0, 0xa1, 0xb0, 0xb1, 0xa2, 0xa3, 0xb2, 0xb3,
+  0x84, 0x85, 0x94, 0x95, 0x86, 0x87, 0x96, 0x97, 0xa4, 0xa5, 0xb4, 0xb5, 0xa6, 0xa7, 0xb6, 0xb7,
+  0xc1, 0xd0, 0xd1, 0xc2, 0xd2, 0xd3, 0xe0, 0xe1, 0xf1, 0xe2, 0xe3, 0xf2, 0xc4, 0xc5, 0xd4, 0xd5,
+  0xc6, 0xc7, 0xd6, 0xd7, 0xe4, 0xe5, 0xf4, 0xf5, 0xe6, 0xe7, 0xf6, 0xf7, 0x89, 0x98, 0x99, 0x8a,
+  0x8b, 0x9a, 0x9b, 0xa8, 0xa9, 0xb8, 0xb9, 0xaa, 0xab, 0xba, 0xbb, 0x8c, 0x8d, 0x9c, 0x9d, 0x8e,
+  0x8f, 0x9e, 0x9f, 0xac, 0xad, 0xbc, 0xbd, 0xae, 0xaf, 0xbe, 0xbf, 0xc8, 0xc9, 0xd8, 0xd9, 0xca,
+  0xcb, 0xda, 0xdb, 0xe8, 0xe9, 0xf8, 0xf9, 0xea, 0xeb, 0xfa, 0xfb, 0xcd, 0xdc, 0xdd, 0xce, 0xde,
+  0xdf, 0xec, 0xed, 0xfd, 0xef, 0xfe,
+];
+
+/// Legacy-computing octants U+1CD00-1CDE5: a 2-column, 4-row block mosaic.
+fn draw_octant(
+  canvas: &mut Canvas,
+  cp: u32,
+  x0: i32,
+  top: i32,
+  m: CellMetrics,
+  fg: Rgb,
+) {
+  let (w, h) = (m.width as i32, m.height as i32);
+  let pat = OCTANTS[(cp - 0x1CD00) as usize];
+  let cx = w / 2;
+  let ry = |r: i32| top + (r * h) / 4;
+  for bit in 0..8u8 {
+    if pat & (1 << bit) == 0 {
+      continue;
+    }
+    let left = bit < 4;
+    let row = (bit & 3) as i32;
+    let xa = if left { x0 } else { x0 + cx };
+    let xw = if left { cx } else { w - cx };
+    let (ya, yb) = (ry(row), ry(row + 1));
+    canvas.fill_rect(xa, ya, xw as u32, (yb - ya) as u32, fg);
+  }
+}
+
 /// Box drawing U+2500-257F. Lines are drawn as arms from the cell centre to its
 /// edges at a weight per side (light/heavy/double); dashes, rounded arcs, and
 /// diagonals are handled specially. Returns `false` for an unhandled codepoint.
@@ -1326,8 +1507,10 @@ fn draw_box_line(
   fg: Rgb,
 ) -> bool {
   let (w, h) = (m.width as i32, m.height as i32);
-  let thin = (h / 8).max(1);
-  let heavy = (thin * 2).max(2);
+  // Light lines use the font's stroke weight; heavy lines are ~2x, clamped so
+  // they stay distinct from light even at small sizes.
+  let thin = (m.stroke as i32).clamp(1, (h / 3).max(1));
+  let heavy = (thin * 2).max(thin + 1);
   let (midx, midy) = (x0 + w / 2, top + h / 2);
   let (right, bottom) = (x0 + w, top + h);
 
@@ -1839,6 +2022,7 @@ fn draw_decorations(
 #[cfg(test)]
 mod tests {
   use super::{
+    AlphaBlending,
     Canvas,
     CellMetrics,
     Rgb,
@@ -1858,11 +2042,13 @@ mod tests {
       pixels: &mut buf,
       width:  n,
       height: n,
+      blend:  AlphaBlending::Native,
     };
     let m = CellMetrics {
       width:  size as u32,
       height: size as u32,
       ascent: (size * 3 / 4) as u32,
+      stroke: (size / 8).max(1) as u32,
     };
     assert!(draw_box(&mut canvas, c, 0, 0, m, Rgb(255, 255, 255)));
     move |x: i32, y: i32| buf[((y * size + x) * 4) as usize] != 0
@@ -1933,6 +2119,52 @@ mod tests {
   }
 
   #[test]
+  fn octant_table_and_geometry() {
+    // The table is the full octant block, endpoints as transcribed from Kitty.
+    assert_eq!(super::OCTANTS.len(), 230);
+    assert_eq!(super::OCTANTS[0], 0x02);
+    assert_eq!(*super::OCTANTS.last().unwrap(), 0xFE);
+    // U+1CD00 → 0x02 = left column, row 1 only (rows are quarter-cells).
+    let ink = render_glyph('\u{1CD00}', 16);
+    assert!(ink(2, 5), "left column row 1 should be filled"); // row1 = [4,8)
+    assert!(!ink(2, 1), "row 0 should be empty");
+    assert!(!ink(10, 5), "right column should be empty");
+  }
+
+  #[test]
+  fn blend_endpoints_hold_in_all_modes() {
+    for mode in [
+      AlphaBlending::Native,
+      AlphaBlending::Linear,
+      AlphaBlending::LinearCorrected,
+    ] {
+      // Zero coverage leaves the (black) background untouched.
+      let mut buf = vec![0u8; 4];
+      let mut c = Canvas {
+        pixels: &mut buf,
+        width:  1,
+        height: 1,
+        blend:  mode,
+      };
+      c.blend(0, 0, Rgb(255, 255, 255), 0);
+      assert_eq!(buf[2], 0, "{mode:?}: zero coverage keeps the background");
+      // Full coverage paints the foreground.
+      let mut buf = vec![0u8; 4];
+      let mut c = Canvas {
+        pixels: &mut buf,
+        width:  1,
+        height: 1,
+        blend:  mode,
+      };
+      c.blend(0, 0, Rgb(255, 255, 255), 255);
+      assert!(
+        buf[2] >= 254,
+        "{mode:?}: full coverage paints the foreground"
+      );
+    }
+  }
+
+  #[test]
   fn diagonal_is_antialiased() {
     // A hard staircase would ink pixels fully or not at all; antialiasing
     // leaves edge pixels at partial coverage. Render U+2571 (╱) and confirm at
@@ -1943,11 +2175,13 @@ mod tests {
       pixels: &mut buf,
       width:  n,
       height: n,
+      blend:  AlphaBlending::Native,
     };
     let m = CellMetrics {
       width:  n as u32,
       height: n as u32,
       ascent: 18,
+      stroke: 2,
     };
     assert!(draw_box(
       &mut canvas,

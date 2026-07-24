@@ -253,6 +253,7 @@ pub fn run(
   .context("load font")?;
   let mut renderer = Renderer::new(fonts);
   renderer.set_padding(config.main.pad_x, config.main.pad_y);
+  renderer.set_alpha_blending(config.colors.alpha_blending);
 
   let bindings = crate::bindings::Bindings::from_config(
     &config.key_bindings,
@@ -1367,6 +1368,7 @@ impl App {
       }
       grid.set_cursor_blink(new.cursor.blink);
     }
+    self.renderer.set_alpha_blending(new.colors.alpha_blending);
     self.config = new;
     self.windows[idx].frames.clear();
     self.resize_grid(idx);
