@@ -30,6 +30,7 @@ match-background = "#ffd700"
 match-current-background = "#ff8c00"
 alpha = 1.0 # 0.0 transparent .. 1.0 opaque
 bold-as-bright = true
+alpha-blending = "linear-corrected" # native, linear, or linear-corrected
 regular = [
   "#282828",
   "#cc241d",
