@@ -13,6 +13,7 @@ use beer_protocols::{
 };
 
 use crate::{
+  config::Subpixel,
   font::{CellMetrics, Fonts, Glyph, GlyphData, Style},
   grid::{Cell, Color, CursorShape, Flags, Grid, Underline},
   theme::{Plane, Rgb, Theme},
@@ -77,6 +78,27 @@ impl Canvas<'_> {
     self.pixels[i] = mix(fg.2, self.pixels[i]);
     self.pixels[i + 1] = mix(fg.1, self.pixels[i + 1]);
     self.pixels[i + 2] = mix(fg.0, self.pixels[i + 2]);
+    self.pixels[i + 3] = 0xFF;
+  }
+
+  /// Alpha-blend `fg` over the destination with independent per-subpixel
+  /// coverage (LCD text). `cov` is in FreeType's physical order (leftmost,
+  /// middle, rightmost subpixel); `bgr` swaps the outer channels for panels
+  /// whose subpixels run blue-green-red rather than red-green-blue.
+  fn blend_lcd(&mut self, x: i32, y: i32, fg: Rgb, cov: [u8; 3], bgr: bool) {
+    let Some(i) = self.index(x, y) else { return };
+    let (ar, ag, ab) = if bgr {
+      (u32::from(cov[2]), u32::from(cov[1]), u32::from(cov[0]))
+    } else {
+      (u32::from(cov[0]), u32::from(cov[1]), u32::from(cov[2]))
+    };
+    let mix = |src: u8, dst: u8, a: u32| {
+      ((u32::from(src) * a + u32::from(dst) * (255 - a)) / 255) as u8
+    };
+    // The shm buffer is BGRA: index 0 is blue, 2 is red.
+    self.pixels[i] = mix(fg.2, self.pixels[i], ab);
+    self.pixels[i + 1] = mix(fg.1, self.pixels[i + 1], ag);
+    self.pixels[i + 2] = mix(fg.0, self.pixels[i + 2], ar);
     self.pixels[i + 3] = 0xFF;
   }
 
@@ -163,8 +185,9 @@ impl Renderer {
     &mut self,
     family: &str,
     size_px: u32,
+    subpixel: Subpixel,
   ) -> Result<(), crate::font::FontError> {
-    self.fonts = Fonts::new(family, size_px)?;
+    self.fonts = Fonts::new(family, size_px, subpixel)?;
     Ok(())
   }
 
@@ -204,6 +227,9 @@ impl Renderer {
   ) {
     let (theme, focused, blink_on) =
       (frame.theme, frame.focused, frame.blink_on);
+    // Subpixel text needs an opaque destination; a translucent window falls
+    // back to grayscale (see `sub_mode`).
+    let opaque_bg = theme.alpha == 0xFF;
     let (width, height) = dims;
     let mut canvas = Canvas {
       pixels,
@@ -303,6 +329,7 @@ impl Renderer {
         _ => None,
       };
       if let Some(shaped) = shaped {
+        let sub = self.sub_mode(opaque_bg);
         for placed in &shaped.glyphs {
           if let Ok(glyph) =
             self.fonts.glyph_indexed(shaped.face_idx, placed.gid, style)
@@ -315,6 +342,7 @@ impl Renderer {
               row_top,
               placed.y,
               fg,
+              sub,
             );
           }
         }
@@ -323,15 +351,36 @@ impl Renderer {
         // way tools like btop expect, rather than however the fallback
         // font happens to size its braille glyphs.
         draw_braille(&mut canvas, cell.c, origin_x, row_top, m, fg);
+      } else if is_box_draw(cell.c)
+        && draw_box(&mut canvas, cell.c, origin_x, row_top, m, fg)
+      {
+        // Box drawing, block elements, and sextants are drawn geometrically so
+        // they fill the cell exactly and tile seamlessly - fonts leave seams.
       } else {
         if cell.c != ' ' {
-          self.draw_glyph(&mut canvas, cell.c, style, origin_x, row_top, fg);
+          self.draw_glyph(
+            &mut canvas,
+            cell.c,
+            style,
+            origin_x,
+            row_top,
+            fg,
+            opaque_bg,
+          );
         }
         // No shaper available for this cluster: stack the marks over the
         // base using each mark glyph's own bearings.
         if let Some(marks) = &cell.combining {
           for mark in marks.chars() {
-            self.draw_glyph(&mut canvas, mark, style, origin_x, row_top, fg);
+            self.draw_glyph(
+              &mut canvas,
+              mark,
+              style,
+              origin_x,
+              row_top,
+              fg,
+              opaque_bg,
+            );
           }
         }
       }
@@ -401,7 +450,7 @@ impl Renderer {
         break;
       }
       if c != ' ' {
-        self.draw_glyph(&mut canvas, c, style, x, row_top, theme.fg);
+        self.draw_glyph(&mut canvas, c, style, x, row_top, theme.fg, true);
       }
       x += m.width as i32;
     }
@@ -438,7 +487,7 @@ impl Renderer {
       }
       canvas.fill_rect(x, row_top, m.width, m.height, theme.current_match_bg);
       if c != ' ' {
-        self.draw_glyph(&mut canvas, c, style, x, row_top, theme.bg);
+        self.draw_glyph(&mut canvas, c, style, x, row_top, theme.bg, true);
       }
       x += m.width as i32;
     }
@@ -476,7 +525,7 @@ impl Renderer {
       }
       canvas.fill_rect(x, row_top, m.width, m.height, theme.selection_bg);
       if c != ' ' {
-        self.draw_glyph(&mut canvas, c, style, x, row_top, theme.fg);
+        self.draw_glyph(&mut canvas, c, style, x, row_top, theme.fg, true);
       }
       // Underline the run a row above the cell bottom.
       canvas.hline(x, row_top + m.height as i32 - 2, m.width, theme.fg);
@@ -524,7 +573,7 @@ impl Renderer {
         let cell = grid.cell(cx, cy);
         if cell.c != ' ' && !cell.flags.contains(Flags::WIDE_CONT) {
           let (_, bg) = cell_colors(cell, theme);
-          self.draw_glyph(canvas, cell.c, cell_style(cell), x0, top, bg);
+          self.draw_glyph(canvas, cell.c, cell_style(cell), x0, top, bg, true);
         }
       },
       CursorShape::Underline => {
@@ -534,6 +583,20 @@ impl Renderer {
     }
   }
 
+  /// How LCD glyphs should be composited: `Some(bgr)` renders subpixel in the
+  /// panel's order, `None` renders grayscale. Subpixel coverage only composites
+  /// correctly over an opaque destination, so translucent backgrounds
+  /// (`opaque == false`) fall back to grayscale rather than fringe over an
+  /// unknown desktop behind the window.
+  fn sub_mode(&self, opaque: bool) -> Option<bool> {
+    match self.fonts.subpixel() {
+      Subpixel::Rgb if opaque => Some(false),
+      Subpixel::Bgr if opaque => Some(true),
+      _ => None,
+    }
+  }
+
+  #[allow(clippy::too_many_arguments)]
   fn draw_glyph(
     &mut self,
     canvas: &mut Canvas,
@@ -542,8 +605,10 @@ impl Renderer {
     origin_x: i32,
     cell_top: i32,
     fg: Rgb,
+    opaque: bool,
   ) {
     let m = self.fonts.metrics();
+    let sub = self.sub_mode(opaque);
     let glyph = match self.fonts.glyph(c, style) {
       Ok(glyph) => glyph,
       Err(err) => {
@@ -551,7 +616,7 @@ impl Renderer {
         return;
       },
     };
-    blit_glyph(canvas, glyph, m, origin_x, cell_top, 0, fg);
+    blit_glyph(canvas, glyph, m, origin_x, cell_top, 0, fg, sub);
   }
 
   /// Draw the slice of a text-sizing (`OSC 66`) block that falls in one row.
@@ -646,6 +711,23 @@ fn blit_glyph_clipped(
         }
         for gx in 0..gw {
           let a = mask[(gy * gw + gx) as usize];
+          if a != 0 {
+            canvas.blend(pen_x + glyph.left + gx, py, fg, a);
+          }
+        }
+      }
+    },
+    // Scaled (OSC 66) glyphs are rasterized grayscale, so LCD coverage does not
+    // arise here; collapse the middle subpixel to a coverage value defensively.
+    GlyphData::Lcd(sub) => {
+      let stride = gw * 3;
+      for gy in 0..gh {
+        let py = baseline - glyph.top + gy;
+        if py < clip.0 || py >= clip.1 {
+          continue;
+        }
+        for gx in 0..gw {
+          let a = sub[(gy * stride + gx * 3 + 1) as usize];
           if a != 0 {
             canvas.blend(pen_x + glyph.left + gx, py, fg, a);
           }
@@ -842,6 +924,7 @@ fn blit_image_cell(
 /// Composite a rasterized glyph into the canvas. `origin_x`/`cell_top` are the
 /// cell's top-left; `rise` lifts the glyph above the baseline (HarfBuzz's
 /// vertical offset, 0 for the unshaped path).
+#[allow(clippy::too_many_arguments)]
 fn blit_glyph(
   canvas: &mut Canvas,
   glyph: &Glyph,
@@ -850,6 +933,7 @@ fn blit_glyph(
   cell_top: i32,
   rise: i32,
   fg: Rgb,
+  sub: Option<bool>,
 ) {
   let (gw, gh) = (glyph.width as i32, glyph.height as i32);
   match &glyph.data {
@@ -865,6 +949,33 @@ fn blit_glyph(
               fg,
               a,
             );
+          }
+        }
+      }
+    },
+    // LCD subpixel coverage: three bytes per pixel. Over an opaque background
+    // it blends per channel; over a translucent one it averages to a single
+    // grayscale coverage, which is all a single-alpha buffer can represent.
+    GlyphData::Lcd(cov_bytes) => {
+      let baseline = cell_top + m.ascent as i32 - rise;
+      let stride = gw * 3;
+      for gy in 0..gh {
+        for gx in 0..gw {
+          let o = (gy * stride + gx * 3) as usize;
+          let cov = [cov_bytes[o], cov_bytes[o + 1], cov_bytes[o + 2]];
+          if cov[0] | cov[1] | cov[2] == 0 {
+            continue;
+          }
+          let (px, py) =
+            (origin_x + glyph.left + gx, baseline - glyph.top + gy);
+          match sub {
+            Some(bgr) => canvas.blend_lcd(px, py, fg, cov, bgr),
+            None => {
+              let a =
+                ((u32::from(cov[0]) + u32::from(cov[1]) + u32::from(cov[2]))
+                  / 3) as u8;
+              canvas.blend(px, py, fg, a);
+            },
           }
         }
       }
@@ -1021,6 +1132,658 @@ fn draw_braille(
   }
 }
 
+/// Whether `c` is drawn geometrically by [`draw_box`]: box drawing
+/// (U+2500-257F), block elements (U+2580-259F), or the legacy-computing
+/// sextants (U+1FB00-1FB3B).
+fn is_box_draw(c: char) -> bool {
+  matches!(c as u32, 0x2500..=0x259F | 0x1FB00..=0x1FB3B)
+}
+
+/// Draw a box-drawing, block-element, or sextant glyph directly into the cell.
+/// These characters tile edge-to-edge in TUIs, so drawing them from the cell
+/// geometry (rather than a font bitmap that may fall short of the cell) keeps
+/// borders, bars, and block mosaics seamless. Returns `false` for a codepoint
+/// in the box range that is not handled, so the caller falls back to the font.
+fn draw_box(
+  canvas: &mut Canvas,
+  c: char,
+  x0: i32,
+  top: i32,
+  m: CellMetrics,
+  fg: Rgb,
+) -> bool {
+  match c as u32 {
+    0x2580..=0x259F => {
+      draw_block_element(canvas, c as u32, x0, top, m, fg);
+      true
+    },
+    0x1FB00..=0x1FB3B => {
+      draw_sextant(canvas, c as u32, x0, top, m, fg);
+      true
+    },
+    0x2500..=0x257F => draw_box_line(canvas, c as u32, x0, top, m, fg),
+    _ => false,
+  }
+}
+
+/// Blend `fg` over a rectangle at fractional `alpha` (the 25/50/75% shades).
+fn blend_shade(
+  canvas: &mut Canvas,
+  x0: i32,
+  top: i32,
+  w: i32,
+  h: i32,
+  fg: Rgb,
+  alpha: u8,
+) {
+  for y in top..top + h {
+    for x in x0..x0 + w {
+      canvas.blend(x, y, fg, alpha);
+    }
+  }
+}
+
+/// Block elements U+2580-259F: half/eighth blocks, shades, and quadrants. All
+/// boundaries are floor-divided from the cell so adjacent cells share the exact
+/// same edge and tile without seams.
+fn draw_block_element(
+  canvas: &mut Canvas,
+  cp: u32,
+  x0: i32,
+  top: i32,
+  m: CellMetrics,
+  fg: Rgb,
+) {
+  let (w, h) = (m.width as i32, m.height as i32);
+  // Horizontal and vertical eighth boundaries.
+  let ex = |n: i32| (n * w) / 8;
+  let ey = |n: i32| (n * h) / 8;
+  match cp {
+    // Upper half.
+    0x2580 => canvas.fill_rect(x0, top, w as u32, ey(4) as u32, fg),
+    // Lower one-eighth (2581) through full block (2588).
+    0x2581..=0x2588 => {
+      let n = (cp - 0x2580) as i32;
+      let y = top + ey(8 - n);
+      canvas.fill_rect(x0, y, w as u32, (h - ey(8 - n)) as u32, fg);
+    },
+    // Left seven-eighths (2589) through left one-eighth (258F).
+    0x2589..=0x258F => {
+      let n = 8 - (cp - 0x2588) as i32;
+      canvas.fill_rect(x0, top, ex(n) as u32, h as u32, fg);
+    },
+    // Right half.
+    0x2590 => {
+      canvas.fill_rect(x0 + ex(4), top, (w - ex(4)) as u32, h as u32, fg)
+    },
+    0x2591 => blend_shade(canvas, x0, top, w, h, fg, 0x40),
+    0x2592 => blend_shade(canvas, x0, top, w, h, fg, 0x80),
+    0x2593 => blend_shade(canvas, x0, top, w, h, fg, 0xC0),
+    // Upper one-eighth.
+    0x2594 => canvas.fill_rect(x0, top, w as u32, ey(1) as u32, fg),
+    // Right one-eighth.
+    0x2595 => {
+      canvas.fill_rect(x0 + ex(7), top, (w - ex(7)) as u32, h as u32, fg)
+    },
+    0x2596..=0x259F => draw_quadrants(canvas, cp, x0, top, w, h, fg),
+    _ => {},
+  }
+}
+
+/// The quadrant block elements U+2596-259F, as a 2x2 grid of half-cells.
+fn draw_quadrants(
+  canvas: &mut Canvas,
+  cp: u32,
+  x0: i32,
+  top: i32,
+  w: i32,
+  h: i32,
+  fg: Rgb,
+) {
+  // Bit 0 = upper-left, 1 = upper-right, 2 = lower-left, 3 = lower-right.
+  let mask: u8 = match cp {
+    0x2596 => 0b0100,
+    0x2597 => 0b1000,
+    0x2598 => 0b0001,
+    0x2599 => 0b1101,
+    0x259A => 0b1001,
+    0x259B => 0b0111,
+    0x259C => 0b1011,
+    0x259D => 0b0010,
+    0x259E => 0b0110,
+    0x259F => 0b1110,
+    _ => 0,
+  };
+  let (hx, hy) = (w / 2, h / 2);
+  if mask & 0b0001 != 0 {
+    canvas.fill_rect(x0, top, hx as u32, hy as u32, fg);
+  }
+  if mask & 0b0010 != 0 {
+    canvas.fill_rect(x0 + hx, top, (w - hx) as u32, hy as u32, fg);
+  }
+  if mask & 0b0100 != 0 {
+    canvas.fill_rect(x0, top + hy, hx as u32, (h - hy) as u32, fg);
+  }
+  if mask & 0b1000 != 0 {
+    canvas.fill_rect(x0 + hx, top + hy, (w - hx) as u32, (h - hy) as u32, fg);
+  }
+}
+
+/// The bit pattern (positions 1-6, LSB = top-left) for sextant codepoint `cp`.
+/// The range U+1FB00-1FB3B enumerates the 60 sextant combinations, skipping
+/// blank, full, and the two that duplicate the left/right half blocks (bit
+/// patterns 21 and 42).
+fn sextant_pattern(cp: u32) -> u8 {
+  let idx = (cp - 0x1FB00) as u8;
+  let mut seen = 0u8;
+  let mut pat = 1u8;
+  while pat <= 62 {
+    if pat != 21 && pat != 42 {
+      if seen == idx {
+        return pat;
+      }
+      seen += 1;
+    }
+    pat += 1;
+  }
+  0
+}
+
+/// Legacy-computing sextants U+1FB00-1FB3B: a 2-column, 3-row block mosaic.
+fn draw_sextant(
+  canvas: &mut Canvas,
+  cp: u32,
+  x0: i32,
+  top: i32,
+  m: CellMetrics,
+  fg: Rgb,
+) {
+  let (w, h) = (m.width as i32, m.height as i32);
+  let pat = sextant_pattern(cp);
+  let cx = w / 2;
+  let ry = |r: i32| top + (r * h) / 3;
+  for bit in 0..6u8 {
+    if pat & (1 << bit) == 0 {
+      continue;
+    }
+    let (col, row) = ((bit % 2) as i32, (bit / 2) as i32);
+    let xa = x0 + col * cx;
+    let xw = if col == 0 { cx } else { w - cx };
+    let (ya, yb) = (ry(row), ry(row + 1));
+    canvas.fill_rect(xa, ya, xw as u32, (yb - ya) as u32, fg);
+  }
+}
+
+/// Box drawing U+2500-257F. Lines are drawn as arms from the cell centre to its
+/// edges at a weight per side (light/heavy/double); dashes, rounded arcs, and
+/// diagonals are handled specially. Returns `false` for an unhandled codepoint.
+fn draw_box_line(
+  canvas: &mut Canvas,
+  cp: u32,
+  x0: i32,
+  top: i32,
+  m: CellMetrics,
+  fg: Rgb,
+) -> bool {
+  let (w, h) = (m.width as i32, m.height as i32);
+  let thin = (h / 8).max(1);
+  let heavy = (thin * 2).max(2);
+  let (midx, midy) = (x0 + w / 2, top + h / 2);
+  let (right, bottom) = (x0 + w, top + h);
+
+  // Diagonals.
+  match cp {
+    0x2571 => {
+      draw_diagonal(canvas, x0, bottom, right, top, thin, fg);
+      return true;
+    },
+    0x2572 => {
+      draw_diagonal(canvas, x0, top, right, bottom, thin, fg);
+      return true;
+    },
+    0x2573 => {
+      draw_diagonal(canvas, x0, bottom, right, top, thin, fg);
+      draw_diagonal(canvas, x0, top, right, bottom, thin, fg);
+      return true;
+    },
+    _ => {},
+  }
+
+  // Dashed lines: a run of 2/3/4 dashes spanning the full width or height.
+  let dash: Option<(bool, i32, i32)> = match cp {
+    0x2504 => Some((true, thin, 3)),
+    0x2505 => Some((true, heavy, 3)),
+    0x2506 => Some((false, thin, 3)),
+    0x2507 => Some((false, heavy, 3)),
+    0x2508 => Some((true, thin, 4)),
+    0x2509 => Some((true, heavy, 4)),
+    0x250A => Some((false, thin, 4)),
+    0x250B => Some((false, heavy, 4)),
+    0x254C => Some((true, thin, 2)),
+    0x254D => Some((true, heavy, 2)),
+    0x254E => Some((false, thin, 2)),
+    0x254F => Some((false, heavy, 2)),
+    _ => None,
+  };
+  if let Some((horizontal, t, n)) = dash {
+    if horizontal {
+      draw_dashes(canvas, x0, w, midy, t, n, fg, true);
+    } else {
+      draw_dashes(canvas, top, h, midx, t, n, fg, false);
+    }
+    return true;
+  }
+
+  // Rounded arcs.
+  if (0x256D..=0x2570).contains(&cp) {
+    draw_arc(canvas, cp, x0, top, w, h, thin, fg);
+    return true;
+  }
+
+  // Straight arms. `[up, down, left, right]`, weight 0 none / 1 light / 2 heavy
+  // / 3 double.
+  let Some(arms) = box_arms(cp) else {
+    return false;
+  };
+  // Single (light/heavy) arms run centre-to-edge; the thickness is heavy for
+  // weight 2. Double arms (weight 3) are drawn together in `draw_doubles` so
+  // their rails close at junctions instead of leaving gapped corners.
+  let t = |w: u8| if w == 2 { heavy } else { thin };
+  if matches!(arms[0], 1 | 2) {
+    v_seg(canvas, top, midy, midx, t(arms[0]), fg);
+  }
+  if matches!(arms[1], 1 | 2) {
+    v_seg(canvas, midy, bottom, midx, t(arms[1]), fg);
+  }
+  if matches!(arms[2], 1 | 2) {
+    h_seg(canvas, x0, midx, midy, t(arms[2]), fg);
+  }
+  if matches!(arms[3], 1 | 2) {
+    h_seg(canvas, midx, right, midy, t(arms[3]), fg);
+  }
+  draw_doubles(
+    canvas,
+    arms,
+    (x0, top, right, bottom),
+    (midx, midy),
+    thin,
+    fg,
+  );
+  true
+}
+
+/// A horizontal bar of thickness `t` from `xa` to `xb`, centred on row `cy`.
+fn h_seg(canvas: &mut Canvas, xa: i32, xb: i32, cy: i32, t: i32, fg: Rgb) {
+  canvas.fill_rect(xa, cy - t / 2, (xb - xa).max(0) as u32, t as u32, fg);
+}
+
+/// A vertical bar of thickness `t` from `ya` to `yb`, centred on column `cx`.
+fn v_seg(canvas: &mut Canvas, ya: i32, yb: i32, cx: i32, t: i32, fg: Rgb) {
+  canvas.fill_rect(cx - t / 2, ya, t as u32, (yb - ya).max(0) as u32, fg);
+}
+
+/// Draw the double-line (weight 3) arms as pairs of rails straddling the cell
+/// centre. Each rail extends past the centre to the perpendicular outer rail
+/// when a perpendicular double exists, so corners and crosses close cleanly
+/// (`╔ ╬ ╠`) rather than leaving the gapped corners that independent per-arm
+/// lines produce. `arms` is `[up, down, left, right]`; `edges` is
+/// `(x0, top, right, bottom)`.
+fn draw_doubles(
+  canvas: &mut Canvas,
+  arms: [u8; 4],
+  edges: (i32, i32, i32, i32),
+  mid: (i32, i32),
+  thin: i32,
+  fg: Rgb,
+) {
+  let (x0, top, right, bottom) = edges;
+  let (midx, midy) = mid;
+  let d = thin + 1;
+  let h_dbl = arms[2] == 3 || arms[3] == 3;
+  let v_dbl = arms[0] == 3 || arms[1] == 3;
+  if h_dbl {
+    // Reach to the outer/inner vertical rail when a vertical double is present,
+    // else stop at the single centre line.
+    let xa = if arms[2] == 3 {
+      x0
+    } else if v_dbl {
+      midx - d
+    } else {
+      midx
+    };
+    let xb = if arms[3] == 3 {
+      right
+    } else if v_dbl {
+      midx + d
+    } else {
+      midx
+    };
+    h_seg(canvas, xa, xb, midy - d, thin, fg);
+    h_seg(canvas, xa, xb, midy + d, thin, fg);
+  }
+  if v_dbl {
+    let ya = if arms[0] == 3 {
+      top
+    } else if h_dbl {
+      midy - d
+    } else {
+      midy
+    };
+    let yb = if arms[1] == 3 {
+      bottom
+    } else if h_dbl {
+      midy + d
+    } else {
+      midy
+    };
+    v_seg(canvas, ya, yb, midx - d, thin, fg);
+    v_seg(canvas, ya, yb, midx + d, thin, fg);
+  }
+}
+
+/// Draw `n` dashes of thickness `t` evenly along a `span`-long axis starting at
+/// `start`, centred on the cross-axis coordinate `cross`.
+#[allow(clippy::too_many_arguments)]
+fn draw_dashes(
+  canvas: &mut Canvas,
+  start: i32,
+  span: i32,
+  cross: i32,
+  t: i32,
+  n: i32,
+  fg: Rgb,
+  horizontal: bool,
+) {
+  let slot = (span / n).max(1);
+  let dash = (slot * 2 / 3).max(1) as u32;
+  for i in 0..n {
+    let a = start + i * slot;
+    if horizontal {
+      canvas.fill_rect(a, cross - t / 2, dash, t as u32, fg);
+    } else {
+      canvas.fill_rect(cross - t / 2, a, t as u32, dash, fg);
+    }
+  }
+}
+
+/// Draw a rounded corner (U+256D-2570): two straight stubs from the cell edges
+/// meeting a quarter-circle at the centre.
+#[allow(clippy::too_many_arguments)]
+fn draw_arc(
+  canvas: &mut Canvas,
+  cp: u32,
+  x0: i32,
+  top: i32,
+  w: i32,
+  h: i32,
+  thin: i32,
+  fg: Rgb,
+) {
+  let (midx, midy) = (x0 + w / 2, top + h / 2);
+  let (right, bottom) = (x0 + w, top + h);
+  let r = (w / 2).min(h / 2).max(1);
+  // Each arc is a quarter-circle whose centre sits one radius diagonally inward
+  // from the corner; two straight stubs join it to the cell edges.
+  let hstub_r = |c: &mut Canvas| {
+    c.fill_rect(
+      midx + r,
+      midy - thin / 2,
+      (right - midx - r).max(0) as u32,
+      thin as u32,
+      fg,
+    )
+  };
+  let hstub_l = |c: &mut Canvas| {
+    c.fill_rect(
+      x0,
+      midy - thin / 2,
+      (midx - r - x0).max(0) as u32,
+      thin as u32,
+      fg,
+    )
+  };
+  let vstub_d = |c: &mut Canvas| {
+    c.fill_rect(
+      midx - thin / 2,
+      midy + r,
+      thin as u32,
+      (bottom - midy - r).max(0) as u32,
+      fg,
+    )
+  };
+  let vstub_u = |c: &mut Canvas| {
+    c.fill_rect(
+      midx - thin / 2,
+      top,
+      thin as u32,
+      (midy - r - top).max(0) as u32,
+      fg,
+    )
+  };
+  // The arc is the circle quadrant facing the cell centre: `(x_pos, y_pos)`
+  // pick which side of the arc centre that quadrant lies on.
+  match cp {
+    // Down + right: stubs run right and down; arc is the top-left quadrant.
+    0x256D => {
+      hstub_r(canvas);
+      vstub_d(canvas);
+      arc_quarter(canvas, midx + r, midy + r, r, false, false, thin, fg);
+    },
+    0x256E => {
+      hstub_l(canvas);
+      vstub_d(canvas);
+      arc_quarter(canvas, midx - r, midy + r, r, true, false, thin, fg);
+    },
+    0x256F => {
+      hstub_l(canvas);
+      vstub_u(canvas);
+      arc_quarter(canvas, midx - r, midy - r, r, true, true, thin, fg);
+    },
+    0x2570 => {
+      hstub_r(canvas);
+      vstub_u(canvas);
+      arc_quarter(canvas, midx + r, midy - r, r, false, true, thin, fg);
+    },
+    _ => {},
+  }
+}
+
+/// Plot an antialiased 90-degree arc of radius `r` and thickness `thin` about
+/// `(cx, cy)`, in the quadrant selected by `(x_pos, y_pos)` (whether that
+/// quadrant lies on the positive x/y side of the centre).
+#[allow(clippy::too_many_arguments)]
+fn arc_quarter(
+  canvas: &mut Canvas,
+  cx: i32,
+  cy: i32,
+  r: i32,
+  x_pos: bool,
+  y_pos: bool,
+  thin: i32,
+  fg: Rgb,
+) {
+  let half = thin as f32 / 2.0;
+  let (r_f, cxf, cyf) = (r as f32, cx as f32, cy as f32);
+  let (x_lo, x_hi) = if x_pos { (cx, cx + r) } else { (cx - r, cx) };
+  let (y_lo, y_hi) = if y_pos { (cy, cy + r) } else { (cy - r, cy) };
+  for py in y_lo..=y_hi {
+    for px in x_lo..=x_hi {
+      let dxp = px as f32 + 0.5 - cxf;
+      let dyp = py as f32 + 0.5 - cyf;
+      // Keep to the requested quadrant (a small slack avoids clipping the
+      // pixels where the arc meets the straight stubs on the axes).
+      if (x_pos && dxp < -0.5) || (!x_pos && dxp > 0.5) {
+        continue;
+      }
+      if (y_pos && dyp < -0.5) || (!y_pos && dyp > 0.5) {
+        continue;
+      }
+      // Coverage from the pixel's distance to the ring of radius `r`.
+      let ring = ((dxp * dxp + dyp * dyp).sqrt() - r_f).abs();
+      let cov = (half + 0.5 - ring).clamp(0.0, 1.0);
+      if cov > 0.0 {
+        canvas.blend(px, py, fg, (cov * 255.0).round() as u8);
+      }
+    }
+  }
+}
+
+/// Draw an antialiased line of thickness `thin` between two points (the
+/// box-drawing diagonals `╱ ╲ ╳`). Coverage is the pixel's distance from the
+/// segment, feathered over the last pixel, so the stroke is smooth rather than
+/// the hard staircase a stamped-square line produces.
+fn draw_diagonal(
+  canvas: &mut Canvas,
+  xa: i32,
+  ya: i32,
+  xb: i32,
+  yb: i32,
+  thin: i32,
+  fg: Rgb,
+) {
+  let (ax, ay) = (xa as f32, ya as f32);
+  let (dx, dy) = ((xb - xa) as f32, (yb - ya) as f32);
+  let len2 = dx * dx + dy * dy;
+  if len2 <= 0.0 {
+    return;
+  }
+  let half = thin as f32 / 2.0;
+  let (lo_x, hi_x) = (xa.min(xb), xa.max(xb));
+  let (lo_y, hi_y) = (ya.min(yb), ya.max(yb));
+  for py in lo_y..=hi_y {
+    for px in lo_x..=hi_x {
+      let (fx, fy) = (px as f32 + 0.5, py as f32 + 0.5);
+      // Distance from the pixel centre to the (clamped) segment.
+      let t = (((fx - ax) * dx + (fy - ay) * dy) / len2).clamp(0.0, 1.0);
+      let (cx, cy) = (ax + t * dx, ay + t * dy);
+      let dist = ((fx - cx).powi(2) + (fy - cy).powi(2)).sqrt();
+      let cov = (half + 0.5 - dist).clamp(0.0, 1.0);
+      if cov > 0.0 {
+        canvas.blend(px, py, fg, (cov * 255.0).round() as u8);
+      }
+    }
+  }
+}
+
+/// Arm weights `[up, down, left, right]` for a straight box-drawing codepoint:
+/// 0 none, 1 light, 2 heavy, 3 double. `None` for codepoints handled elsewhere
+/// (dashes, arcs, diagonals) or outside the solid-line set.
+fn box_arms(cp: u32) -> Option<[u8; 4]> {
+  let a = match cp {
+    0x2500 => [0, 0, 1, 1],
+    0x2501 => [0, 0, 2, 2],
+    0x2502 => [1, 1, 0, 0],
+    0x2503 => [2, 2, 0, 0],
+    0x250C => [0, 1, 0, 1],
+    0x250D => [0, 1, 0, 2],
+    0x250E => [0, 2, 0, 1],
+    0x250F => [0, 2, 0, 2],
+    0x2510 => [0, 1, 1, 0],
+    0x2511 => [0, 1, 2, 0],
+    0x2512 => [0, 2, 1, 0],
+    0x2513 => [0, 2, 2, 0],
+    0x2514 => [1, 0, 0, 1],
+    0x2515 => [1, 0, 0, 2],
+    0x2516 => [2, 0, 0, 1],
+    0x2517 => [2, 0, 0, 2],
+    0x2518 => [1, 0, 1, 0],
+    0x2519 => [1, 0, 2, 0],
+    0x251A => [2, 0, 1, 0],
+    0x251B => [2, 0, 2, 0],
+    0x251C => [1, 1, 0, 1],
+    0x251D => [1, 1, 0, 2],
+    0x251E => [2, 1, 0, 1],
+    0x251F => [1, 2, 0, 1],
+    0x2520 => [2, 2, 0, 1],
+    0x2521 => [2, 1, 0, 2],
+    0x2522 => [1, 2, 0, 2],
+    0x2523 => [2, 2, 0, 2],
+    0x2524 => [1, 1, 1, 0],
+    0x2525 => [1, 1, 2, 0],
+    0x2526 => [2, 1, 1, 0],
+    0x2527 => [1, 2, 1, 0],
+    0x2528 => [2, 2, 1, 0],
+    0x2529 => [2, 1, 2, 0],
+    0x252A => [1, 2, 2, 0],
+    0x252B => [2, 2, 2, 0],
+    0x252C => [0, 1, 1, 1],
+    0x252D => [0, 1, 2, 1],
+    0x252E => [0, 1, 1, 2],
+    0x252F => [0, 1, 2, 2],
+    0x2530 => [0, 2, 1, 1],
+    0x2531 => [0, 2, 2, 1],
+    0x2532 => [0, 2, 1, 2],
+    0x2533 => [0, 2, 2, 2],
+    0x2534 => [1, 0, 1, 1],
+    0x2535 => [1, 0, 2, 1],
+    0x2536 => [1, 0, 1, 2],
+    0x2537 => [1, 0, 2, 2],
+    0x2538 => [2, 0, 1, 1],
+    0x2539 => [2, 0, 2, 1],
+    0x253A => [2, 0, 1, 2],
+    0x253B => [2, 0, 2, 2],
+    0x253C => [1, 1, 1, 1],
+    0x253D => [1, 1, 2, 1],
+    0x253E => [1, 1, 1, 2],
+    0x253F => [1, 1, 2, 2],
+    0x2540 => [2, 1, 1, 1],
+    0x2541 => [1, 2, 1, 1],
+    0x2542 => [2, 2, 1, 1],
+    0x2543 => [2, 1, 2, 1],
+    0x2544 => [2, 1, 1, 2],
+    0x2545 => [1, 2, 2, 1],
+    0x2546 => [1, 2, 1, 2],
+    0x2547 => [2, 1, 2, 2],
+    0x2548 => [1, 2, 2, 2],
+    0x2549 => [2, 2, 2, 1],
+    0x254A => [2, 2, 1, 2],
+    0x254B => [2, 2, 2, 2],
+    0x2550 => [0, 0, 3, 3],
+    0x2551 => [3, 3, 0, 0],
+    0x2552 => [0, 1, 0, 3],
+    0x2553 => [0, 3, 0, 1],
+    0x2554 => [0, 3, 0, 3],
+    0x2555 => [0, 1, 3, 0],
+    0x2556 => [0, 3, 1, 0],
+    0x2557 => [0, 3, 3, 0],
+    0x2558 => [1, 0, 0, 3],
+    0x2559 => [3, 0, 0, 1],
+    0x255A => [3, 0, 0, 3],
+    0x255B => [1, 0, 3, 0],
+    0x255C => [3, 0, 1, 0],
+    0x255D => [3, 0, 3, 0],
+    0x255E => [1, 1, 0, 3],
+    0x255F => [3, 3, 0, 1],
+    0x2560 => [3, 3, 0, 3],
+    0x2561 => [1, 1, 3, 0],
+    0x2562 => [3, 3, 1, 0],
+    0x2563 => [3, 3, 3, 0],
+    0x2564 => [0, 1, 3, 3],
+    0x2565 => [0, 3, 1, 1],
+    0x2566 => [0, 3, 3, 3],
+    0x2567 => [1, 0, 3, 3],
+    0x2568 => [3, 0, 1, 1],
+    0x2569 => [3, 0, 3, 3],
+    0x256A => [1, 1, 3, 3],
+    0x256B => [3, 3, 1, 1],
+    0x256C => [3, 3, 3, 3],
+    0x2574 => [0, 0, 1, 0],
+    0x2575 => [1, 0, 0, 0],
+    0x2576 => [0, 0, 0, 1],
+    0x2577 => [0, 1, 0, 0],
+    0x2578 => [0, 0, 2, 0],
+    0x2579 => [2, 0, 0, 0],
+    0x257A => [0, 0, 0, 2],
+    0x257B => [0, 2, 0, 0],
+    0x257C => [0, 0, 1, 2],
+    0x257D => [1, 2, 0, 0],
+    0x257E => [0, 0, 2, 1],
+    0x257F => [2, 1, 0, 0],
+    _ => return None,
+  };
+  Some(a)
+}
+
 /// Draw underline, strikethrough, and overline for one cell.
 fn draw_decorations(
   canvas: &mut Canvas,
@@ -1075,7 +1838,35 @@ fn draw_decorations(
 
 #[cfg(test)]
 mod tests {
-  use super::braille_geometry;
+  use super::{
+    Canvas,
+    CellMetrics,
+    Rgb,
+    box_arms,
+    braille_geometry,
+    draw_box,
+    is_box_draw,
+    sextant_pattern,
+  };
+
+  /// Render one box glyph into a fresh `size`x`size` buffer and return a
+  /// predicate for whether a given pixel received ink.
+  fn render_glyph(c: char, size: i32) -> impl Fn(i32, i32) -> bool {
+    let n = size as usize;
+    let mut buf = vec![0u8; n * n * 4];
+    let mut canvas = Canvas {
+      pixels: &mut buf,
+      width:  n,
+      height: n,
+    };
+    let m = CellMetrics {
+      width:  size as u32,
+      height: size as u32,
+      ascent: (size * 3 / 4) as u32,
+    };
+    assert!(draw_box(&mut canvas, c, 0, 0, m, Rgb(255, 255, 255)));
+    move |x: i32, y: i32| buf[((y * size + x) * 4) as usize] != 0
+  }
 
   // Pinned to foot box-drawing.c draw_braille output (cross-checked numerically
   // identical across cell sizes 4..30 x 6..48); guards against drift.
@@ -1085,5 +1876,102 @@ mod tests {
     assert_eq!(braille_geometry(10, 20), (2, [1, 6], [1, 6, 11, 16]));
     assert_eq!(braille_geometry(12, 27), (3, [1, 8], [1, 8, 15, 22]));
     assert_eq!(braille_geometry(7, 15), (1, [1, 4], [2, 5, 8, 11]));
+  }
+
+  #[test]
+  fn box_draw_range_membership() {
+    assert!(is_box_draw('\u{2500}')); // light horizontal
+    assert!(is_box_draw('\u{2588}')); // full block
+    assert!(is_box_draw('\u{259F}')); // quadrant
+    assert!(is_box_draw('\u{1FB00}')); // first sextant
+    assert!(is_box_draw('\u{1FB3B}')); // last sextant
+    assert!(!is_box_draw('\u{1FB3C}')); // wedge, not handled
+    assert!(!is_box_draw('A'));
+  }
+
+  #[test]
+  fn box_arms_weights() {
+    // Light cross: every arm light. Heavy cross: every arm heavy.
+    assert_eq!(box_arms(0x253C), Some([1, 1, 1, 1]));
+    assert_eq!(box_arms(0x254B), Some([2, 2, 2, 2]));
+    // Double horizontal/vertical and the double cross.
+    assert_eq!(box_arms(0x2550), Some([0, 0, 3, 3]));
+    assert_eq!(box_arms(0x2551), Some([3, 3, 0, 0]));
+    assert_eq!(box_arms(0x256C), Some([3, 3, 3, 3]));
+    // A light down-and-right corner is down + right only.
+    assert_eq!(box_arms(0x250C), Some([0, 1, 0, 1]));
+    // Dashes/arcs/diagonals are handled elsewhere, not here.
+    assert_eq!(box_arms(0x2504), None);
+    assert_eq!(box_arms(0x256D), None);
+  }
+
+  #[test]
+  fn sextant_pattern_skips_half_blocks() {
+    // The enumeration runs 1..=62 skipping the left-half (21) and right-half
+    // (42) bit patterns, so the range endpoints map to 1 and 62.
+    assert_eq!(sextant_pattern(0x1FB00), 1);
+    assert_eq!(sextant_pattern(0x1FB3B), 62);
+    // No codepoint in the range produces a skipped pattern.
+    for cp in 0x1FB00..=0x1FB3B {
+      let p = sextant_pattern(cp);
+      assert!(p != 21 && p != 42 && p != 0 && p != 63);
+    }
+  }
+
+  #[test]
+  fn double_corner_closes_and_stays_hollow() {
+    // U+2554 ╔ (double down-and-right). thin = 16/8 = 2, d = 3, centre = 8.
+    let ink = render_glyph('\u{2554}', 16);
+    // The outer corner where the two outer rails meet is inked...
+    assert!(ink(5, 5), "double corner should close at the outer rails");
+    // ...while the centre of the corner box stays hollow.
+    assert!(!ink(8, 8), "the double corner's interior should be hollow");
+    // The arms reach their edges (right arm at the top rail, down arm's left
+    // rail near the bottom).
+    assert!(ink(15, 5), "top rail should reach the right edge");
+    assert!(ink(5, 15), "left rail should reach the bottom edge");
+  }
+
+  #[test]
+  fn diagonal_is_antialiased() {
+    // A hard staircase would ink pixels fully or not at all; antialiasing
+    // leaves edge pixels at partial coverage. Render U+2571 (╱) and confirm at
+    // least one pixel is partially covered (white fg → blue byte in 1..255).
+    let n = 24usize;
+    let mut buf = vec![0u8; n * n * 4];
+    let mut canvas = Canvas {
+      pixels: &mut buf,
+      width:  n,
+      height: n,
+    };
+    let m = CellMetrics {
+      width:  n as u32,
+      height: n as u32,
+      ascent: 18,
+    };
+    assert!(draw_box(
+      &mut canvas,
+      '\u{2571}',
+      0,
+      0,
+      m,
+      Rgb(255, 255, 255)
+    ));
+    let partial = buf.iter().step_by(4).any(|&b| b > 0 && b < 255);
+    assert!(
+      partial,
+      "diagonal should have antialiased (partial) coverage"
+    );
+  }
+
+  #[test]
+  fn single_cross_and_corner_geometry() {
+    // A light cross inks its centre; a top-left corner leaves the top-left
+    // pixel blank (arms only run down and right from the centre).
+    let cross = render_glyph('\u{253C}', 16); // ┼
+    assert!(cross(8, 8), "cross centre should be inked");
+    let corner = render_glyph('\u{250C}', 16); // ┌
+    assert!(corner(8, 8), "corner centre should be inked");
+    assert!(!corner(0, 0), "corner should not ink the opposite quadrant");
   }
 }

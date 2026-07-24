@@ -245,8 +245,12 @@ pub fn run(
   let idle_inhibit_manager =
     bind_global::<ZwpIdleInhibitManagerV1>(&globals, &qh);
 
-  let fonts = Fonts::new(&config.main.font, config.main.font_size)
-    .context("load font")?;
+  let fonts = Fonts::new(
+    &config.main.font,
+    config.main.font_size,
+    config.main.subpixel,
+  )
+  .context("load font")?;
   let mut renderer = Renderer::new(fonts);
   renderer.set_padding(config.main.pad_x, config.main.pad_y);
 
@@ -1554,7 +1558,11 @@ impl App {
       self.to_phys(idx, self.config.main.pad_y),
     );
     let px = self.to_phys(idx, self.font_size).max(1);
-    if let Err(err) = self.renderer.set_font(&self.config.main.font, px) {
+    if let Err(err) = self.renderer.set_font(
+      &self.config.main.font,
+      px,
+      self.config.main.subpixel,
+    ) {
       tracing::warn!(
         "rasterize font at scale {}: {err:#}",
         self.windows[idx].scale120

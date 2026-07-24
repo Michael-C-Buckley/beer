@@ -26,6 +26,12 @@ channel).
 *font-size* = _integer_
 	Font size in pixels. Default _16_.
 
+*subpixel* = _none_ | _rgb_ | _bgr_
+	Subpixel (LCD) antialiasing order. _none_ (the default) renders grayscale
+	coverage. _rgb_ and _bgr_ enable horizontal LCD rendering; pick the one
+	matching the display's physical subpixel layout, as the wrong choice
+	produces colour fringing. Colour glyphs (emoji) are unaffected.
+
 *term* = _string_
 	The _TERM_ value exported to the child shell. Default _beer_.
 

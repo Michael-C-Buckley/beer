@@ -12,6 +12,7 @@ use std::{collections::HashMap, fmt, num::NonZeroUsize, path::PathBuf};
 use fontconfig::{CharSet, Fontconfig, Pattern};
 use freetype::{
   Face,
+  LcdFilter,
   Library,
   Matrix,
   Vector,
@@ -21,6 +22,8 @@ use freetype::{
 use harfbuzz_rs_now as harfbuzz;
 use lru::LruCache;
 use thiserror::Error;
+
+use crate::config::Subpixel;
 
 /// Upper bound on cached glyphs; the working set of a terminal is far smaller,
 /// but this caps memory under adversarial all-of-Unicode output.
@@ -93,6 +96,10 @@ pub struct Glyph {
 pub enum GlyphData {
   /// One coverage byte per pixel.
   Mask(Vec<u8>),
+  /// LCD subpixel coverage: three bytes per pixel in FreeType's horizontal
+  /// order (physically leftmost, middle, rightmost subpixel). The renderer maps
+  /// these onto R/G/B according to the panel's configured [`Subpixel`] order.
+  Lcd(Vec<u8>),
   /// Pre-multiplied BGRA, four bytes per pixel.
   Color(Vec<u8>),
 }
@@ -132,6 +139,8 @@ pub struct Fonts {
   fontconfig:  Fontconfig,
   family:      String,
   size_px:     u32,
+  /// Subpixel order for LCD rendering; `None` keeps grayscale coverage.
+  subpixel:    Subpixel,
   metrics:     CellMetrics,
   /// All loaded faces; indices into this vector are stable.
   faces:       Vec<FaceEntry>,
@@ -160,10 +169,27 @@ impl fmt::Debug for Fonts {
 }
 
 impl Fonts {
-  /// Resolve `family` at `size_px` and compute the cell metrics.
-  pub fn new(family: &str, size_px: u32) -> Result<Self, FontError> {
+  /// Resolve `family` at `size_px` and compute the cell metrics. `subpixel`
+  /// selects LCD rendering; it is downgraded to grayscale if the FreeType build
+  /// lacks LCD-filter support.
+  pub fn new(
+    family: &str,
+    size_px: u32,
+    subpixel: Subpixel,
+  ) -> Result<Self, FontError> {
     let library = Library::init()?;
     let fontconfig = Fontconfig::new().ok_or(FontError::FontconfigInit)?;
+
+    // The LCD filter is a library-global FreeType setting; enable it once here
+    // so LCD-rendered glyphs are filtered to suppress colour fringing.
+    let subpixel = if subpixel != Subpixel::None
+      && library.set_lcd_filter(LcdFilter::LcdFilterDefault).is_err()
+    {
+      tracing::warn!("FreeType lacks LCD filter support; using grayscale");
+      Subpixel::None
+    } else {
+      subpixel
+    };
 
     let regular =
       resolve_face(&library, &fontconfig, family, Style::default(), size_px)?;
@@ -175,6 +201,7 @@ impl Fonts {
       fontconfig,
       family: family.to_owned(),
       size_px,
+      subpixel,
       metrics,
       faces: vec![regular],
       styled: [Some(0), None, None, None],
@@ -189,17 +216,23 @@ impl Fonts {
     self.metrics
   }
 
+  /// The active subpixel order; `None` when rendering grayscale coverage.
+  pub fn subpixel(&self) -> Subpixel {
+    self.subpixel
+  }
+
   /// Return the rasterized glyph for `c` in `style`, rasterizing and caching
   /// it on first use.
   pub fn glyph(&mut self, c: char, style: Style) -> Result<&Glyph, FontError> {
     let key = (c, style.index());
     if self.cache.get(&key).is_none() {
+      let lcd = self.subpixel != Subpixel::None;
       let idx = self.face_for(c, style)?;
       let face = &self.faces[idx].face;
       // Synthesize bold/italic only when the resolved face lacks the real
       // variant (most monospace families ship both).
       let (synth_bold, synth_italic) = synth_flags(face, style);
-      let glyph = rasterize(face, c, synth_bold, synth_italic)?;
+      let glyph = rasterize(face, c, synth_bold, synth_italic, lcd)?;
       self.cache.put(key, glyph);
     }
     Ok(self.cache.get(&key).expect("glyph was just inserted"))
@@ -216,9 +249,10 @@ impl Fonts {
   ) -> Result<&Glyph, FontError> {
     let key = (gid, face_idx, style.index());
     if self.gcache.get(&key).is_none() {
+      let lcd = self.subpixel != Subpixel::None;
       let face = &self.faces[face_idx].face;
       let (synth_bold, synth_italic) = synth_flags(face, style);
-      let glyph = rasterize_index(face, gid, synth_bold, synth_italic)?;
+      let glyph = rasterize_index(face, gid, synth_bold, synth_italic, lcd)?;
       self.gcache.put(key, glyph);
     }
     Ok(self.gcache.get(&key).expect("glyph was just inserted"))
@@ -488,9 +522,11 @@ fn rasterize(
   c: char,
   synth_bold: bool,
   synth_italic: bool,
+  lcd: bool,
 ) -> Result<Glyph, FontError> {
+  let flags = load_flags(lcd);
   rasterize_with(face, synth_bold, synth_italic, |face| {
-    face.load_char(c as usize, LoadFlag::RENDER | LoadFlag::COLOR)
+    face.load_char(c as usize, flags)
   })
 }
 
@@ -500,10 +536,23 @@ fn rasterize_index(
   gid: u32,
   synth_bold: bool,
   synth_italic: bool,
+  lcd: bool,
 ) -> Result<Glyph, FontError> {
+  let flags = load_flags(lcd);
   rasterize_with(face, synth_bold, synth_italic, |face| {
-    face.load_glyph(gid, LoadFlag::RENDER | LoadFlag::COLOR)
+    face.load_glyph(gid, flags)
   })
+}
+
+/// Load flags for a normal render: `TARGET_LCD` requests horizontal subpixel
+/// coverage; otherwise FreeType renders 8-bit grayscale. `COLOR` still yields a
+/// BGRA bitmap for colour glyphs regardless of the target.
+fn load_flags(lcd: bool) -> LoadFlag {
+  let mut flags = LoadFlag::RENDER | LoadFlag::COLOR;
+  if lcd {
+    flags |= LoadFlag::TARGET_LCD;
+  }
+  flags
 }
 
 /// Rasterize `c` with the outline scaled by `scale` (and sheared if italic is
@@ -579,23 +628,45 @@ fn rasterize_with(
 
   let slot = face.glyph();
   let bitmap = slot.bitmap();
-  let width = bitmap.width().max(0) as usize;
+  // For an LCD bitmap this is the subpixel column count (three per pixel); for
+  // every other mode it is the pixel width.
+  let cols = bitmap.width().max(0) as usize;
   let height = bitmap.rows().max(0) as usize;
   let pitch = bitmap.pitch();
   let src = bitmap.buffer();
 
-  let mut data = match bitmap.pixel_mode()? {
-    PixelMode::Gray => GlyphData::Mask(pack_rows(src, width, pitch, height)),
-    PixelMode::Bgra => {
-      GlyphData::Color(pack_rows(src, width * 4, pitch, height))
+  // `width` is the logical (whole-pixel) glyph width used by both the pixel
+  // buffer sizing and the placed `Glyph`.
+  let (mut data, width) = match bitmap.pixel_mode()? {
+    PixelMode::Gray => {
+      (GlyphData::Mask(pack_rows(src, cols, pitch, height)), cols)
     },
-    PixelMode::Mono => GlyphData::Mask(expand_mono(src, width, pitch, height)),
-    _ => GlyphData::Mask(vec![0; width * height]),
+    PixelMode::Lcd => {
+      let logical = cols / 3;
+      (
+        GlyphData::Lcd(pack_rows(src, logical * 3, pitch, height)),
+        logical,
+      )
+    },
+    PixelMode::Bgra => {
+      (
+        GlyphData::Color(pack_rows(src, cols * 4, pitch, height)),
+        cols,
+      )
+    },
+    PixelMode::Mono => {
+      (GlyphData::Mask(expand_mono(src, cols, pitch, height)), cols)
+    },
+    _ => (GlyphData::Mask(vec![0; cols * height]), cols),
   };
   // Fake bold by widening coverage one pixel to the right (colour glyphs are
   // left alone - there is no such thing as a bold emoji).
-  if synth_bold && let GlyphData::Mask(mask) = &mut data {
-    embolden(mask, width, height);
+  if synth_bold {
+    match &mut data {
+      GlyphData::Mask(mask) => embolden(mask, width, height),
+      GlyphData::Lcd(sub) => embolden_lcd(sub, width, height),
+      GlyphData::Color(_) => {},
+    }
   }
 
   Ok(Glyph {
@@ -632,6 +703,21 @@ fn embolden(mask: &mut [u8], width: usize, height: usize) {
     let row = &mut mask[y * width..y * width + width];
     for x in (1..width).rev() {
       row[x] = row[x].max(row[x - 1]);
+    }
+  }
+}
+
+/// Synthetic bold for LCD coverage: widen by one whole pixel, comparing each
+/// subpixel with the same channel of the pixel to its left so channels do not
+/// bleed into one another.
+fn embolden_lcd(sub: &mut [u8], width: usize, height: usize) {
+  let stride = width * 3;
+  for y in 0..height {
+    let row = &mut sub[y * stride..y * stride + stride];
+    for x in (1..width).rev() {
+      for c in 0..3 {
+        row[x * 3 + c] = row[x * 3 + c].max(row[(x - 1) * 3 + c]);
+      }
     }
   }
 }
@@ -680,7 +766,8 @@ mod tests {
   use super::*;
 
   fn fonts() -> Fonts {
-    Fonts::new("monospace", 16).expect("system has a monospace font")
+    Fonts::new("monospace", 16, Subpixel::None)
+      .expect("system has a monospace font")
   }
 
   #[test]
@@ -696,7 +783,7 @@ mod tests {
     let glyph = f.glyph('M', Style::default()).expect("rasterize M");
     assert!(glyph.width > 0 && glyph.height > 0);
     match &glyph.data {
-      GlyphData::Mask(px) => {
+      GlyphData::Mask(px) | GlyphData::Lcd(px) => {
         assert!(px.iter().any(|&p| p > 0), "M should have coverage")
       },
       GlyphData::Color(_) => {},
@@ -733,7 +820,7 @@ mod tests {
       .glyph_indexed(shaped.face_idx, shaped.glyphs[0].gid, Style::default())
       .expect("rasterize shaped glyph");
     match &g.data {
-      GlyphData::Mask(px) => {
+      GlyphData::Mask(px) | GlyphData::Lcd(px) => {
         assert!(px.iter().any(|&p| p > 0), "'a' should have ink")
       },
       GlyphData::Color(_) => {},

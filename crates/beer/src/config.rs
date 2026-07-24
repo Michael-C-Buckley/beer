@@ -140,6 +140,19 @@ pub struct Colors {
   pub bold_as_bright:           Option<bool>,
 }
 
+/// Subpixel (LCD) antialiasing order. `None` renders grayscale coverage, which
+/// is the safe default: the physical subpixel order is a property of the panel,
+/// so the wrong choice produces colour fringing. `Rgb`/`Bgr` select horizontal
+/// LCD rendering for displays with that subpixel layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Subpixel {
+  #[default]
+  None,
+  Rgb,
+  Bgr,
+}
+
 /// `[main]`: fonts, window geometry, padding, and the terminal name.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
@@ -148,6 +161,8 @@ pub struct Main {
   pub font:            String,
   /// Font size in pixels.
   pub font_size:       u32,
+  /// Subpixel (LCD) antialiasing order; `None` keeps grayscale coverage.
+  pub subpixel:        Subpixel,
   /// `TERM` value exported to the child shell.
   pub term:            String,
   /// Initial size in character cells.
@@ -172,6 +187,7 @@ impl Default for Main {
     Self {
       font:            "monospace".to_string(),
       font_size:       16,
+      subpixel:        Subpixel::None,
       term:            "beer".to_string(),
       initial_cols:    80,
       initial_rows:    24,
@@ -364,8 +380,8 @@ mod tests {
       .join(format!("beer-config-{}.toml", std::process::id()));
     std::fs::write(
       &path,
-      "[main]\nfont = \"JetBrains Mono\"\nfont-size = 20\n\n\
-       [colors]\nbackground = \"#171717\"\nalpha = 0.8\n",
+      "[main]\nfont = \"JetBrains Mono\"\nfont-size = \
+       20\n\n[colors]\nbackground = \"#171717\"\nalpha = 0.8\n",
     )
     .unwrap();
     let c = Config::load(std::slice::from_ref(&path));
