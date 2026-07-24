@@ -10,7 +10,8 @@ pub enum Charset {
 
 /// Map a designation byte to a [`Charset`]. `0` selects DEC special graphics;
 /// everything else falls back to ASCII.
-pub fn charset(byte: u8) -> Charset {
+#[must_use]
+pub const fn charset(byte: u8) -> Charset {
   match byte {
     b'0' => Charset::DecSpecial,
     _ => Charset::Ascii,
@@ -18,7 +19,8 @@ pub fn charset(byte: u8) -> Charset {
 }
 
 /// Translate a byte under the DEC special graphics set (VT100 line drawing).
-pub fn dec_special(c: char) -> char {
+#[must_use]
+pub const fn dec_special(c: char) -> char {
   match c {
     '`' => '◆',
     'a' => '▒',

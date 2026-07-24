@@ -1,7 +1,7 @@
 //! Pseudo-terminal: open a master/slave pair and run the user's shell on it.
 
 use std::{
-  ffi::OsStr,
+  ffi::{OsStr, OsString},
   io,
   os::{
     fd::{AsFd, OwnedFd},
@@ -24,11 +24,21 @@ pub struct Pty {
   child:  Child,
 }
 
+#[expect(
+  clippy::absolute_paths,
+  reason = "PTY setup names platform process and filesystem types explicitly"
+)]
 impl Pty {
   /// Open a PTY, size it to `cols`x`rows` (with `cell` giving the cell size in
   /// pixels, so the kernel reports a pixel geometry for graphics clients), and
   /// exec the user's login shell on the slave end with `TERM=term`. When `cwd`
   /// is set the child starts there, so a new window inherits its parent's cwd.
+  #[expect(
+    clippy::disallowed_methods,
+    unsafe_code,
+    reason = "launching the configured shell and configuring its controlling \
+              terminal are PTY boundaries"
+  )]
   pub fn spawn(
     cols: u16,
     rows: u16,
@@ -99,7 +109,7 @@ impl Pty {
   }
 
   /// The PTY master, for reading child output and writing input.
-  pub fn master(&self) -> &OwnedFd {
+  pub const fn master(&self) -> &OwnedFd {
     &self.master
   }
 
@@ -138,11 +148,11 @@ fn set_winsize(
 }
 
 /// Login-shell argv[0] is the shell's basename with a leading '-'.
-fn login_argv0(shell: &OsStr) -> std::ffi::OsString {
+fn login_argv0(shell: &OsStr) -> OsString {
   let name = Path::new(shell)
     .file_name()
     .unwrap_or_else(|| OsStr::new("sh"));
-  let mut argv0 = std::ffi::OsString::from("-");
+  let mut argv0 = OsString::from("-");
   argv0.push(name);
   argv0
 }

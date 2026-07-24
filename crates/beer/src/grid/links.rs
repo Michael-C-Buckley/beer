@@ -1,6 +1,6 @@
 use std::num::NonZeroU16;
 
-use super::*;
+use super::{Flags, Grid};
 
 /// A URL detected in the visible viewport, with the `(row, col)` of its first
 /// character in viewport coordinates.
@@ -77,26 +77,23 @@ impl Grid {
   /// is capped so a pathological stream cannot grow it without bound).
   fn intern_link(&mut self, uri: &str) -> NonZeroU16 {
     if let Some(i) = self.links.iter().position(|u| u.as_ref() == uri) {
-      return NonZeroU16::new(i as u16 + 1).expect("index + 1 is non-zero");
+      let id = u16::try_from(i + 1).unwrap_or(u16::MAX);
+      return NonZeroU16::new(id).unwrap_or(NonZeroU16::MIN);
     }
     // u16::MAX distinct links is far past any real document; reuse the last
     // slot once saturated rather than overflow the id space.
     if self.links.len() < usize::from(u16::MAX) - 1 {
       self.links.push(uri.into());
-    } else {
-      *self.links.last_mut().expect("table is non-empty when full") =
-        uri.into();
+    } else if let Some(last) = self.links.last_mut() {
+      *last = uri.into();
     }
-    NonZeroU16::new(self.links.len() as u16)
-      .expect("len after push is non-zero")
+    let id = u16::try_from(self.links.len()).unwrap_or(u16::MAX);
+    NonZeroU16::new(id).unwrap_or(NonZeroU16::MIN)
   }
 
   /// The URI for a hyperlink id, if it is still in the table.
   pub fn link_uri(&self, id: NonZeroU16) -> Option<&str> {
-    self
-      .links
-      .get(usize::from(id.get()) - 1)
-      .map(|s| s.as_ref())
+    self.links.get(usize::from(id.get()) - 1).map(AsRef::as_ref)
   }
 
   /// The hyperlink id of the cell at an absolute `(row, col)`, if any.

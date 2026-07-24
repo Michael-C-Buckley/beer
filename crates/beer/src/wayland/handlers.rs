@@ -41,7 +41,12 @@ use smithay_client_toolkit::{
       },
     },
   },
-  seat::{keyboard::KeyboardData, pointer::PointerData, touch::TouchData},
+  seat::{
+    SeatData,
+    keyboard::KeyboardData,
+    pointer::PointerData,
+    touch::TouchData,
+  },
   shell::xdg::window::WindowData,
 };
 use wayland_client::protocol::{
@@ -76,7 +81,12 @@ impl CompositorHandler for App {
       return;
     };
     if self.windows[idx].fractional_scale.is_none() {
-      self.set_scale(idx, (factor.max(1) as u32) * 120);
+      self.set_scale(
+        idx,
+        u32::try_from(factor.max(1))
+          .unwrap_or(u32::MAX)
+          .saturating_mul(120),
+      );
     }
   }
 
@@ -158,7 +168,10 @@ impl WindowHandler for App {
       self.windows[idx].height = h.get();
       if let Some(vp) = &self.windows[idx].viewport {
         let (ww, hh) = (self.windows[idx].width, self.windows[idx].height);
-        vp.set_destination(ww.max(1) as i32, hh.max(1) as i32);
+        vp.set_destination(
+          i32::try_from(ww.max(1)).unwrap_or(i32::MAX),
+          i32::try_from(hh.max(1)).unwrap_or(i32::MAX),
+        );
       }
     }
     self.windows[idx].focused = configure.is_activated();
@@ -214,7 +227,7 @@ impl SeatHandler for App {
         &seat,
         None,
         loop_handle,
-        Box::new(|app: &mut App, _kbd, event| app.handle_key(&event)),
+        Box::new(|app: &mut Self, _kbd, event| app.handle_key(&event)),
       );
       match keyboard {
         Ok(keyboard) => self.seats[i].keyboard = Some(keyboard),
@@ -428,13 +441,13 @@ pub(super) fn hint_labels(n: usize) -> Vec<String> {
         *slot = ALPHABET[idx % 26];
         idx /= 26;
       }
-      String::from_utf8(chars).expect("ascii labels are valid utf-8")
+      String::from_utf8(chars).unwrap_or_default()
     })
     .collect()
 }
 
 /// Map a Wayland button code to the terminal mouse base code, if reportable.
-fn button_code(button: u32) -> Option<u8> {
+const fn button_code(button: u32) -> Option<u8> {
   match button {
     BTN_LEFT => Some(0),
     BTN_MIDDLE => Some(1),
@@ -444,7 +457,7 @@ fn button_code(button: u32) -> Option<u8> {
 }
 
 /// Map a Wayland button code to a bindable [`MouseButton`].
-fn mouse_button(button: u32) -> Option<MouseButton> {
+const fn mouse_button(button: u32) -> Option<MouseButton> {
   match button {
     BTN_LEFT => Some(MouseButton::Left),
     BTN_MIDDLE => Some(MouseButton::Middle),
@@ -453,7 +466,15 @@ fn mouse_button(button: u32) -> Option<MouseButton> {
   }
 }
 
+#[expect(
+  clippy::cast_possible_truncation,
+  reason = "pointer event coordinates are bounded compositor values"
+)]
 impl PointerHandler for App {
+  #[expect(
+    clippy::match_wildcard_for_single_variants,
+    reason = "unhandled pointer event kinds intentionally share the no-op path"
+  )]
   fn pointer_frame(
     &mut self,
     _: &Connection,
@@ -584,6 +605,11 @@ impl PointerHandler for App {
 
 // Touch drives one-finger drag-to-scroll of the scrollback viewport. Taps and
 // multi-finger gestures are ignored; only the first touch point is tracked.
+#[expect(
+  clippy::cast_possible_truncation,
+  clippy::cast_precision_loss,
+  reason = "touch event coordinates are bounded compositor values"
+)]
 impl TouchHandler for App {
   fn down(
     &mut self,
@@ -643,7 +669,7 @@ impl TouchHandler for App {
     let Some(idx) = self.focused_index() else {
       return;
     };
-    let cell_h = self.renderer.metrics().height as f64;
+    let cell_h = f64::from(self.renderer.metrics().height);
     let win = &mut self.windows[idx];
     let Some(touch) = win.touch_scroll.as_mut().filter(|t| t.id == id) else {
       return;
@@ -654,7 +680,7 @@ impl TouchHandler for App {
     // viewport's "positive scrolls back" convention.
     let lines = (touch.acc / cell_h) as isize;
     if lines != 0 {
-      touch.acc -= lines as f64 * cell_h;
+      touch.acc = (lines as f64).mul_add(-cell_h, touch.acc);
       if let Some(session) = win.session.as_mut() {
         session.term.scroll_view(lines);
         win.needs_draw = true;
@@ -912,7 +938,7 @@ impl Dispatch<WpFractionalScaleV1, ()> for App {
     state: &mut Self,
     _: &WpFractionalScaleV1,
     event: wp_fractional_scale_v1::Event,
-    _: &(),
+    (): &(),
     _: &Connection,
     _: &QueueHandle<Self>,
   ) {
@@ -928,7 +954,7 @@ impl Dispatch<WpFractionalScaleManagerV1, ()> for App {
     _: &mut Self,
     _: &WpFractionalScaleManagerV1,
     _: <WpFractionalScaleManagerV1 as Proxy>::Event,
-    _: &(),
+    (): &(),
     _: &Connection,
     _: &QueueHandle<Self>,
   ) {
@@ -940,7 +966,7 @@ impl Dispatch<WpViewporter, ()> for App {
     _: &mut Self,
     _: &WpViewporter,
     _: <WpViewporter as Proxy>::Event,
-    _: &(),
+    (): &(),
     _: &Connection,
     _: &QueueHandle<Self>,
   ) {
@@ -952,7 +978,7 @@ impl Dispatch<WpViewport, ()> for App {
     _: &mut Self,
     _: &WpViewport,
     _: <WpViewport as Proxy>::Event,
-    _: &(),
+    (): &(),
     _: &Connection,
     _: &QueueHandle<Self>,
   ) {
@@ -966,7 +992,7 @@ impl Dispatch<ZwpIdleInhibitManagerV1, ()> for App {
     _: &mut Self,
     _: &ZwpIdleInhibitManagerV1,
     _: <ZwpIdleInhibitManagerV1 as Proxy>::Event,
-    _: &(),
+    (): &(),
     _: &Connection,
     _: &QueueHandle<Self>,
   ) {
@@ -978,7 +1004,7 @@ impl Dispatch<ZwpIdleInhibitorV1, ()> for App {
     _: &mut Self,
     _: &ZwpIdleInhibitorV1,
     _: zwp_idle_inhibitor_v1::Event,
-    _: &(),
+    (): &(),
     _: &Connection,
     _: &QueueHandle<Self>,
   ) {
@@ -990,7 +1016,7 @@ impl Dispatch<WpContentTypeManagerV1, ()> for App {
     _: &mut Self,
     _: &WpContentTypeManagerV1,
     _: <WpContentTypeManagerV1 as Proxy>::Event,
-    _: &(),
+    (): &(),
     _: &Connection,
     _: &QueueHandle<Self>,
   ) {
@@ -1002,7 +1028,7 @@ impl Dispatch<WpContentTypeV1, ()> for App {
     _: &mut Self,
     _: &WpContentTypeV1,
     _: wp_content_type_v1::Event,
-    _: &(),
+    (): &(),
     _: &Connection,
     _: &QueueHandle<Self>,
   ) {
@@ -1017,7 +1043,7 @@ impl ActivationHandler for App {
     if let (Some(activation), Some(idx)) =
       (self.activation.as_ref(), self.focused_index())
     {
-      activation.activate::<App>(self.windows[idx].window.wl_surface(), token);
+      activation.activate::<Self>(self.windows[idx].window.wl_surface(), token);
     }
   }
 }
@@ -1027,7 +1053,7 @@ impl Dispatch<ZwpTextInputManagerV3, ()> for App {
     _: &mut Self,
     _: &ZwpTextInputManagerV3,
     _: <ZwpTextInputManagerV3 as Proxy>::Event,
-    _: &(),
+    (): &(),
     _: &Connection,
     _: &QueueHandle<Self>,
   ) {
@@ -1037,11 +1063,16 @@ impl Dispatch<ZwpTextInputManagerV3, ()> for App {
 // text-input-v3 batches preedit/commit between `enter` and `done`; we apply the
 // accumulated transaction on `done` and re-enable on focus enter.
 impl Dispatch<ZwpTextInputV3, ()> for App {
+  #[expect(
+    clippy::match_same_arms,
+    reason = "unsupported text-input deletion events intentionally remain \
+              no-ops"
+  )]
   fn event(
     state: &mut Self,
     ti: &ZwpTextInputV3,
     event: zwp_text_input_v3::Event,
-    _: &(),
+    (): &(),
     _: &Connection,
     _: &QueueHandle<Self>,
   ) {
@@ -1123,7 +1154,7 @@ forward_dispatch! {
     ZxdgOutputV1 => OutputData,
     WlShm => GlobalData,
     // Our own `SeatData` struct shadows sctk's here, so name it in full.
-    WlSeat => ::smithay_client_toolkit::seat::SeatData,
+    WlSeat => SeatData,
     WlKeyboard => KeyboardData<App, ()>,
     WlPointer => PointerData<()>,
     WlTouch => TouchData<()>,

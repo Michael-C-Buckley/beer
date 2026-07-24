@@ -6,6 +6,7 @@
 use crate::style::{Color, Underline};
 
 /// Map an SGR 4 parameter (`4` or `4:x`) to an underline style.
+#[must_use]
 pub fn underline_from(param: &[u16]) -> Underline {
   match param.get(1).copied().unwrap_or(1) {
     0 => Underline::None,
@@ -21,6 +22,7 @@ pub fn underline_from(param: &[u16]) -> Underline {
 /// index of the introducer. Returns the colour and how many top-level
 /// parameters it consumed (1 for the colon-subparameter form, more for the
 /// legacy semicolon form).
+#[must_use]
 pub fn ext_color(items: &[&[u16]], i: usize) -> (Option<Color>, usize) {
   let head = items[i];
   if head.len() >= 2 {
@@ -32,7 +34,7 @@ pub fn ext_color(items: &[&[u16]], i: usize) -> (Option<Color>, usize) {
         .get(i + 2)
         .and_then(|s| s.first().copied())
         .unwrap_or(0);
-      (Some(Color::Indexed(idx as u8)), 3)
+      (Some(Color::Indexed(color_byte(idx))), 3)
     },
     Some(2) => {
       let get = |k: usize| {
@@ -42,7 +44,11 @@ pub fn ext_color(items: &[&[u16]], i: usize) -> (Option<Color>, usize) {
           .unwrap_or(0)
       };
       (
-        Some(Color::Rgb(get(2) as u8, get(3) as u8, get(4) as u8)),
+        Some(Color::Rgb(
+          color_byte(get(2)),
+          color_byte(get(3)),
+          color_byte(get(4)),
+        )),
         5,
       )
     },
@@ -55,7 +61,7 @@ pub fn ext_color(items: &[&[u16]], i: usize) -> (Option<Color>, usize) {
 /// ignored).
 fn color_from_subparams(sub: &[u16]) -> Option<Color> {
   match sub.first().copied() {
-    Some(5) => sub.get(1).map(|&i| Color::Indexed(i as u8)),
+    Some(5) => sub.get(1).map(|&i| Color::Indexed(color_byte(i))),
     Some(2) => {
       // Either `2:r:g:b` or `2:colorspace:r:g:b`.
       let rgb = if sub.len() >= 5 {
@@ -64,12 +70,18 @@ fn color_from_subparams(sub: &[u16]) -> Option<Color> {
         &sub[1..]
       };
       match rgb {
-        [r, g, b, ..] => Some(Color::Rgb(*r as u8, *g as u8, *b as u8)),
+        [r, g, b, ..] => {
+          Some(Color::Rgb(color_byte(*r), color_byte(*g), color_byte(*b)))
+        },
         _ => None,
       }
     },
     _ => None,
   }
+}
+
+fn color_byte(value: u16) -> u8 {
+  u8::try_from(value.min(u16::from(u8::MAX))).unwrap_or(u8::MAX)
 }
 
 #[cfg(test)]

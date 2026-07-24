@@ -12,7 +12,7 @@ mod theme;
 mod vt;
 mod wayland;
 
-use std::{path::PathBuf, process::ExitCode};
+use std::{env, io, path::PathBuf, process::ExitCode};
 
 use pound::Parse;
 
@@ -28,7 +28,7 @@ struct Cli {
   /// Always run a private window, never connect to a running server.
   #[pound(long)]
   no_daemon: bool,
-  /// Path to a config file (default: $XDG_CONFIG_HOME/beer/beer.toml).
+  /// Path to a config file (default: $`XDG_CONFIG_HOME/beer/beer.toml`).
   /// Repeatable; later files take priority over earlier ones.
   #[pound(long)]
   config:    Vec<PathBuf>,
@@ -40,7 +40,6 @@ fn main() -> ExitCode {
     Ok(code) => code,
     Err(err) => {
       tracing::error!("{err:#}");
-      eprintln!("beer: {err:#}");
       ExitCode::FAILURE
     },
   }
@@ -53,10 +52,7 @@ fn init_logging() {
     .or_else(|_| EnvFilter::try_from_default_env())
     .unwrap_or_else(|_| EnvFilter::new("warn"));
 
-  fmt()
-    .with_env_filter(filter)
-    .with_writer(std::io::stderr)
-    .init();
+  fmt().with_env_filter(filter).with_writer(io::stderr).init();
 }
 
 fn run(cli: Cli) -> anyhow::Result<ExitCode> {
@@ -64,10 +60,10 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
   // window's exit status. `--no-daemon` and `--server` opt out.
   if !cli.server && !cli.no_daemon {
     let req = ipc::OpenRequest {
-      cwd: std::env::current_dir()
+      cwd: env::current_dir()
         .ok()
         .map(|p| p.to_string_lossy().into_owned()),
-      env: std::env::vars().collect(),
+      env: env::vars().collect(),
     };
     match ipc::run_client(&req) {
       Ok(code) => return Ok(ExitCode::from(code)),
@@ -84,10 +80,11 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
 
 /// Merge `--config` paths with `$BEER_CONFIG` (the env paths rank lower).
 fn config_paths(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
-  if let Some(env) = std::env::var_os("BEER_CONFIG").filter(|s| !s.is_empty()) {
-    let extra: Vec<PathBuf> = std::env::split_paths(&env).collect();
+  if let Some(config_env) = env::var_os("BEER_CONFIG").filter(|s| !s.is_empty())
+  {
+    let extra: Vec<PathBuf> = env::split_paths(&config_env).collect();
     if extra.is_empty() {
-      paths.push(PathBuf::from(&env));
+      paths.push(PathBuf::from(&config_env));
     }
     let mut combined = extra;
     combined.append(&mut paths);

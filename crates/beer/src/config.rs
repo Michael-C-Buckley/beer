@@ -2,7 +2,12 @@
 //! deserialized into a typed [`Config`]. A missing file uses defaults; a
 //! malformed one warns and falls back to defaults rather than failing to start.
 
-use std::path::PathBuf;
+use std::{
+  collections::HashMap,
+  env,
+  fs,
+  path::{Path, PathBuf},
+};
 
 use serde::Deserialize;
 
@@ -22,12 +27,12 @@ pub struct Config {
   pub notify:            Notify,
   /// Chord → action, e.g. `"Ctrl+Shift+C" = "copy"`. Merged over the defaults;
   /// a value of `"none"` unbinds.
-  pub key_bindings:      std::collections::HashMap<String, String>,
+  pub key_bindings:      HashMap<String, String>,
   /// Chord → literal text to send (supports `\e \n \r \t \\ \xNN`).
-  pub text_bindings:     std::collections::HashMap<String, String>,
+  pub text_bindings:     HashMap<String, String>,
   /// Mouse chord (e.g. `"Middle"`, `"Shift+Right"`) → action. Merged over the
   /// defaults; `"none"` unbinds. Left-button select/drag stays built in.
-  pub mouse_bindings:    std::collections::HashMap<String, String>,
+  pub mouse_bindings:    HashMap<String, String>,
 }
 
 /// `[cursor]`: the default cursor presentation (DECSCUSR may override at
@@ -254,7 +259,7 @@ impl Config {
     // mean only the unknown-key check is lost, not the actual config load).
     let mut merged = toml::Value::Table(toml::Table::new());
     for path in &resolved {
-      let text = match std::fs::read_to_string(path) {
+      let text = match fs::read_to_string(path) {
         Ok(t) => t,
         Err(err) => {
           tracing::warn!("read config {}: {err}; skipping", path.display());
@@ -306,10 +311,9 @@ fn deep_merge(base: &mut toml::Value, overlay: &toml::Value) {
 /// Parse `text` through `serde_ignored` with `Config` as the target so a typo'd
 /// key (`font-sze`) is reported instead of silently dropped, while still
 /// loading so unknown keys remain tolerated for forward-compatibility.
-fn report_unknown_keys(text: &str, path: &std::path::Path) {
-  let de = match toml::Deserializer::parse(text) {
-    Ok(de) => de,
-    Err(_) => return,
+fn report_unknown_keys(text: &str, path: &Path) {
+  let Ok(de) = toml::Deserializer::parse(text) else {
+    return;
   };
   match serde_ignored::deserialize(de, |key| {
     tracing::warn!("config {}: unknown key `{key}` ignored", path.display());
@@ -329,12 +333,10 @@ fn report_unknown_keys(text: &str, path: &std::path::Path) {
 
 /// `$XDG_CONFIG_HOME/beer/beer.toml`, or `~/.config/beer/beer.toml`.
 fn default_path() -> Option<PathBuf> {
-  if let Some(dir) =
-    std::env::var_os("XDG_CONFIG_HOME").filter(|s| !s.is_empty())
-  {
+  if let Some(dir) = env::var_os("XDG_CONFIG_HOME").filter(|s| !s.is_empty()) {
     return Some(PathBuf::from(dir).join("beer/beer.toml"));
   }
-  let home = std::env::var_os("HOME")?;
+  let home = env::var_os("HOME")?;
   Some(PathBuf::from(home).join(".config/beer/beer.toml"))
 }
 
@@ -371,14 +373,14 @@ mod tests {
 
   #[test]
   fn unknown_keys_are_reported_but_still_load() {
-    let toml = r##"
+    let toml = r#"
             [main]
             font-sze = 14
             font = "JetBrains Mono"
 
             [made-up]
             x = 1
-        "##;
+        "#;
     let mut unknown = Vec::new();
     let de = toml::Deserializer::parse(toml).unwrap();
     let c: Config =
@@ -392,6 +394,11 @@ mod tests {
   }
 
   #[test]
+  #[expect(
+    clippy::absolute_paths,
+    reason = "the test intentionally exercises the host temporary-directory \
+              API"
+  )]
   fn load_reads_a_file_with_table_headers() {
     // `Config::load` must parse the whole document, not a single TOML value.
     // `str::parse::<toml::Value>()` reads only one value and rejects a leading
@@ -405,7 +412,7 @@ mod tests {
     )
     .unwrap();
     let c = Config::load(std::slice::from_ref(&path));
-    std::fs::remove_file(&path).ok();
+    let _ = std::fs::remove_file(&path);
     assert_eq!(c.main.font, "JetBrains Mono");
     assert_eq!(c.main.font_size, 20);
   }

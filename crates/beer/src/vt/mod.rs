@@ -4,7 +4,7 @@ mod perform;
 
 #[cfg(test)] mod conformance;
 
-use std::io::Write as _;
+use std::{io::Write as _, str};
 
 use beer_protocols::{
   caps::cap_value,
@@ -18,6 +18,7 @@ use vte::Params;
 use crate::{
   graphics::Graphics,
   grid::{
+    Cell,
     Color,
     CursorShape,
     Flags,
@@ -26,7 +27,7 @@ use crate::{
     MouseProtocol,
     Underline,
   },
-  theme::{Rgb, Theme},
+  theme::{Rgb, Theme, parse_color},
 };
 
 /// Which device-attributes query is being answered.
@@ -65,33 +66,31 @@ enum Dynamic {
 }
 
 /// DECRQM mode-state code: 1 = set, 2 = reset.
-fn set_reset(on: bool) -> u8 {
+const fn set_reset(on: bool) -> u8 {
   if on { 1 } else { 2 }
 }
 
 /// Parse an OSC colour spec into an [`Rgb`].
 fn parse_spec(spec: &[u8]) -> Option<Rgb> {
-  std::str::from_utf8(spec)
-    .ok()
-    .and_then(crate::theme::parse_color)
+  str::from_utf8(spec).ok().and_then(parse_color)
 }
 
 /// Parse a decimal palette index (0-255).
 fn parse_index(b: &[u8]) -> Option<u8> {
-  std::str::from_utf8(b).ok()?.parse().ok()
+  str::from_utf8(b).ok()?.parse().ok()
 }
 
-fn rgb_tuple(rgb: Rgb) -> (u8, u8, u8) {
+const fn rgb_tuple(rgb: Rgb) -> (u8, u8, u8) {
   (rgb.0, rgb.1, rgb.2)
 }
 
 /// Select `protocol` when a mouse mode is set, else turn reporting off.
-fn proto(on: bool, protocol: MouseProtocol) -> MouseProtocol {
+const fn proto(on: bool, protocol: MouseProtocol) -> MouseProtocol {
   if on { protocol } else { MouseProtocol::Off }
 }
 
 /// Select `encoding` when its mode is set, else fall back to the default form.
-fn enc(on: bool, encoding: MouseEncoding) -> MouseEncoding {
+const fn enc(on: bool, encoding: MouseEncoding) -> MouseEncoding {
   if on { encoding } else { MouseEncoding::X10 }
 }
 
@@ -147,6 +146,13 @@ enum ApcScan {
 /// Cap on a captured APC payload (one chunk is at most ~4 KiB of base64).
 const APC_MAX: usize = 1 << 20;
 
+#[expect(
+  clippy::absolute_paths,
+  clippy::cast_possible_truncation,
+  clippy::needless_pass_by_value,
+  reason = "the terminal state machine is the boundary between protocol \
+            values and bounded grid state"
+)]
 impl Term {
   pub fn new(cols: usize, rows: usize) -> Self {
     Self {
@@ -252,10 +258,10 @@ impl Term {
     let Some((&b'G', body)) = buf.split_first() else {
       return;
     };
-    let (control, payload) = match body.iter().position(|&b| b == b';') {
-      Some(p) => (&body[..p], &body[p + 1..]),
-      None => (body, &[][..]),
-    };
+    let (control, payload) = body
+      .iter()
+      .position(|&b| b == b';')
+      .map_or_else(|| (body, &[][..]), |p| (&body[..p], &body[p + 1..]));
     let cmd = beer_protocols::graphics::parse(control);
     let outcome = self.graphics.handle(cmd, payload, self.cell_px);
     if let Some(resp) = outcome.response {
@@ -279,7 +285,7 @@ impl Term {
       } => {
         self
           .grid
-          .place_image(image, placement, cols, rows, keep_cursor)
+          .place_image(image, placement, cols, rows, keep_cursor);
       },
       GridOp::Clear(spec) => {
         match spec {
@@ -288,7 +294,7 @@ impl Term {
           ClearSpec::Placement(id, p) => {
             self
               .grid
-              .clear_images(|r| r.image == id && r.placement == p)
+              .clear_images(|r| r.image == id && r.placement == p);
           },
           ClearSpec::AtCursor => {
             let targets = self.grid.images_at_cursor();
@@ -302,7 +308,7 @@ impl Term {
   }
 
   /// The graphics engine, for the renderer to read images and placements from.
-  pub fn graphics(&self) -> &Graphics {
+  pub const fn graphics(&self) -> &Graphics {
     &self.graphics
   }
 
@@ -352,44 +358,45 @@ impl Term {
     std::mem::take(&mut self.clipboard_ops)
   }
 
-  pub fn theme(&self) -> &Theme {
+  pub const fn theme(&self) -> &Theme {
     &self.theme
   }
 
   /// Replace the colour scheme (config load / reload).
-  pub fn set_theme(&mut self, theme: Theme) {
+  pub const fn set_theme(&mut self, theme: Theme) {
     self.theme = theme;
   }
 
   /// Answer an XTGETTCAP query: for each hex-encoded capability name, reply
   /// with `DCS 1 + r name=value ST` if known, else `DCS 0 + r name ST`.
+  #[expect(
+    clippy::branches_sharing_code,
+    reason = "the response protocol has two branches with a shared terminator"
+  )]
   fn answer_xtgettcap(&mut self, payload: &[u8]) {
     for name_hex in payload.split(|&b| b == b';') {
       let value = decode_hex(name_hex).and_then(|name| cap_value(&name));
-      match value {
-        Some(value) => {
-          self.response.extend_from_slice(b"\x1bP1+r");
-          self.response.extend_from_slice(name_hex);
-          self.response.push(b'=');
-          for byte in value.bytes() {
-            let _ = write!(self.response, "{byte:02x}");
-          }
-          self.response.extend_from_slice(b"\x1b\\");
-        },
-        None => {
-          self.response.extend_from_slice(b"\x1bP0+r");
-          self.response.extend_from_slice(name_hex);
-          self.response.extend_from_slice(b"\x1b\\");
-        },
+      if let Some(value) = value {
+        self.response.extend_from_slice(b"\x1bP1+r");
+        self.response.extend_from_slice(name_hex);
+        self.response.push(b'=');
+        for byte in value.bytes() {
+          let _ = write!(self.response, "{byte:02x}");
+        }
+        self.response.extend_from_slice(b"\x1b\\");
+      } else {
+        self.response.extend_from_slice(b"\x1bP0+r");
+        self.response.extend_from_slice(name_hex);
+        self.response.extend_from_slice(b"\x1b\\");
       }
     }
   }
 
-  pub fn grid(&self) -> &Grid {
+  pub const fn grid(&self) -> &Grid {
     &self.grid
   }
 
-  pub fn grid_mut(&mut self) -> &mut Grid {
+  pub const fn grid_mut(&mut self) -> &mut Grid {
     &mut self.grid
   }
 
@@ -401,7 +408,7 @@ impl Term {
     self.grid.scroll_view(delta);
   }
 
-  pub fn scroll_to_bottom(&mut self) {
+  pub const fn scroll_to_bottom(&mut self) {
     self.grid.scroll_to_bottom();
   }
 
@@ -419,12 +426,12 @@ impl Term {
     std::mem::take(&mut self.response)
   }
 
-  fn active_charset(&self) -> Charset {
+  const fn active_charset(&self) -> Charset {
     if self.shift_out { self.g1 } else { self.g0 }
   }
 
   fn set_mode(&mut self, params: &Params, private: bool, on: bool) {
-    for p in params.iter() {
+    for p in params {
       let Some(&code) = p.first() else { continue };
       match (private, code) {
         (true, 6) => self.grid.set_origin(on),
@@ -450,27 +457,27 @@ impl Term {
         (true, 1) => self.grid.set_app_cursor(on),
         (true, 25) => self.grid.set_cursor_visible(on),
         (true, 9) => {
-          self.grid.set_mouse_protocol(proto(on, MouseProtocol::X10))
+          self.grid.set_mouse_protocol(proto(on, MouseProtocol::X10));
         },
         (true, 1000) => {
           self
             .grid
-            .set_mouse_protocol(proto(on, MouseProtocol::Normal))
+            .set_mouse_protocol(proto(on, MouseProtocol::Normal));
         },
         (true, 1002) => {
           self
             .grid
-            .set_mouse_protocol(proto(on, MouseProtocol::Button))
+            .set_mouse_protocol(proto(on, MouseProtocol::Button));
         },
         (true, 1003) => {
-          self.grid.set_mouse_protocol(proto(on, MouseProtocol::Any))
+          self.grid.set_mouse_protocol(proto(on, MouseProtocol::Any));
         },
         (true, 1004) => self.grid.set_focus_events(on),
         (true, 1005) => {
-          self.grid.set_mouse_encoding(enc(on, MouseEncoding::Utf8))
+          self.grid.set_mouse_encoding(enc(on, MouseEncoding::Utf8));
         },
         (true, 1006) => {
-          self.grid.set_mouse_encoding(enc(on, MouseEncoding::Sgr))
+          self.grid.set_mouse_encoding(enc(on, MouseEncoding::Sgr));
         },
         (true, 2004) => self.grid.set_bracketed_paste(on),
         (true, 2026) => self.grid.set_sync(on),
@@ -492,7 +499,7 @@ impl Term {
       let pen = self.grid.pen_mut();
       let mut step = 1;
       match code {
-        0 => *pen = Default::default(),
+        0 => *pen = Cell::default(),
         1 => pen.flags.insert(Flags::BOLD),
         2 => pen.flags.insert(Flags::DIM),
         3 => pen.flags.insert(Flags::ITALIC),
@@ -542,7 +549,7 @@ impl Term {
       DaLevel::Primary => self.response.extend_from_slice(b"\x1b[?62;22c"),
       DaLevel::Secondary => self.response.extend_from_slice(b"\x1b[>0;276;0c"),
       DaLevel::Tertiary => {
-        self.response.extend_from_slice(b"\x1bP!|00000000\x1b\\")
+        self.response.extend_from_slice(b"\x1bP!|00000000\x1b\\");
       },
     }
   }
@@ -702,14 +709,21 @@ fn raw(params: &Params, idx: usize) -> u16 {
 }
 
 /// Decode an OSC string field to UTF-8 (lossy), or `None` if absent.
+#[expect(
+  clippy::single_option_map,
+  reason = "this named adapter documents the OSC field conversion at its call \
+            sites"
+)]
 fn osc_text(field: Option<&&[u8]>) -> Option<String> {
   field.map(|b| String::from_utf8_lossy(b).into_owned())
 }
 
 #[cfg(test)]
 mod tests {
+  use beer_protocols::codec::base64_encode;
+
   use super::*;
-  use crate::grid::{MouseEncoding, MouseProtocol};
+  use crate::grid::{Flags, MouseEncoding, MouseProtocol};
 
   fn feed(term: &mut Term, bytes: &[u8]) {
     let mut parser = vte::Parser::new();
@@ -744,7 +758,7 @@ mod tests {
     // transmitted and displayed at the cursor.
     let mut t = Term::new(20, 4);
     let px = vec![0xFFu8; 2 * 2 * 4];
-    let b64 = beer_protocols::codec::base64_encode(&px);
+    let b64 = base64_encode(&px);
     let seq = format!("\x1b_Ga=T,f=32,s=2,v=2,i=1;{b64}\x1b\\");
     feed(&mut t, seq.as_bytes());
     // With an 8x16 cell the 2x2 image occupies one cell, stamped at (0,0).
@@ -766,7 +780,7 @@ mod tests {
 
     // A 16x48 RGBA image: 2 cells wide, 3 cells tall at 8x16 cell size.
     let px = vec![0xFFu8; 16 * 48 * 4];
-    let b64 = beer_protocols::codec::base64_encode(&px);
+    let b64 = base64_encode(&px);
     let seq = format!("\x1b_Ga=T,f=32,s=16,v=48,i=2;{b64}\x1b\\");
     feed(&mut t, seq.as_bytes());
 
@@ -804,7 +818,7 @@ mod tests {
     // Transmit + a virtual placement (U=1): no cells are stamped, but the
     // placement is registered for placeholder cells to reference.
     let mut t = Term::new(20, 4);
-    let px = beer_protocols::codec::base64_encode(&[0xFF; 4]);
+    let px = base64_encode(&[0xFF; 4]);
     let seq = format!("\x1b_Ga=T,U=1,i=7,c=1,r=1,f=32,s=1,v=1;{px}\x1b\\");
     feed(&mut t, seq.as_bytes());
     assert!(
@@ -822,7 +836,7 @@ mod tests {
     // Text, then a graphics query APC, then more text: the text is intact and
     // the APC did not leak bytes into the grid.
     let mut t = Term::new(20, 2);
-    let px = beer_protocols::codec::base64_encode(&[0u8; 4]);
+    let px = base64_encode(&[0u8; 4]);
     let seq = format!("ab\x1b_Ga=q,f=32,s=1,v=1,i=2;{px}\x1b\\cd");
     feed(&mut t, seq.as_bytes());
     assert_eq!(t.grid().row_text(0), "abcd");
@@ -837,7 +851,7 @@ mod tests {
     assert_eq!(g.cell(0, 0).c, 'X');
     let s = g.cell(0, 0).sized.as_ref().expect("leading cell is scaled");
     assert_eq!((s.cols, s.rows), (2, 2));
-    assert!(g.cell(1, 1).flags.contains(crate::grid::Flags::SIZED_CONT));
+    assert!(g.cell(1, 1).flags.contains(Flags::SIZED_CONT));
     assert_eq!(g.cursor(), (2, 0));
   }
 

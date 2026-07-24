@@ -1,1 +1,20 @@
-msrv = "1.95"
+# The Clippy lints in Cargo.toml are rather aggressive. Escape hatches
+# and case-by-case allowances are defined here.
+# See:
+#  <https://doc.rust-lang.org/nightly/clippy/lint_configuration.html>
+
+msrv = "1.95.0" # must match Cargo.toml
+
+# Process spawning is banned by default.
+disallowed-methods = [ { path = "std::process::Command::new", reason = "Don't" } ]
+
+cognitive-complexity-threshold = 25
+excessive-nesting-threshold    = 7
+too-many-arguments-threshold   = 7
+too-many-lines-threshold       = 150
+
+allow-expect-in-tests           = true
+allow-indexing-slicing-in-tests = true
+allow-panic-in-tests            = true
+allow-unwrap-in-tests           = true
+allow-unwrap-types              = [  ]

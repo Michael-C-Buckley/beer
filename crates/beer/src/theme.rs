@@ -59,6 +59,13 @@ impl Default for Theme {
   }
 }
 
+#[expect(
+  clippy::absolute_paths,
+  clippy::cast_possible_truncation,
+  clippy::cast_sign_loss,
+  reason = "theme parsing and palette construction use bounded colour \
+            protocol values"
+)]
 impl Theme {
   /// Build a theme from the `[colors]` config table, falling back to the
   /// built-in defaults for any unset entry.
@@ -99,7 +106,7 @@ impl Theme {
 
   /// Resolve a cell colour to RGB on the given plane, applying bold-as-bright
   /// to the low 8 palette indices.
-  pub fn resolve(
+  pub const fn resolve(
     &self,
     color: crate::grid::Color,
     plane: Plane,
@@ -125,25 +132,25 @@ impl Theme {
     }
   }
 
-  pub fn set_palette(&mut self, index: u8, rgb: Rgb) {
+  pub const fn set_palette(&mut self, index: u8, rgb: Rgb) {
     self.palette[index as usize] = rgb;
   }
 
   /// Reset palette entry `index` to its configured value.
-  pub fn reset_palette_index(&mut self, index: u8) {
+  pub const fn reset_palette_index(&mut self, index: u8) {
     self.palette[index as usize] = self.default_palette[index as usize];
   }
 
   /// Reset the whole palette to its configured values.
-  pub fn reset_palette(&mut self) {
+  pub const fn reset_palette(&mut self) {
     self.palette = self.default_palette;
   }
 
-  pub fn reset_fg(&mut self) {
+  pub const fn reset_fg(&mut self) {
     self.fg = self.default_fg;
   }
 
-  pub fn reset_bg(&mut self) {
+  pub const fn reset_bg(&mut self) {
     self.bg = self.default_bg;
   }
 
@@ -173,6 +180,12 @@ fn apply_palette(palette: &mut [Rgb; 256], base: usize, specs: &[String]) {
 }
 
 /// The xterm 256-colour palette: 16 base, a 6×6×6 cube, then 24 greys.
+#[expect(
+  clippy::absolute_paths,
+  clippy::cast_possible_truncation,
+  reason = "the xterm palette indices and channel values are explicitly \
+            bounded"
+)]
 fn default_palette() -> [Rgb; 256] {
   const BASE: [Rgb; 16] = [
     Rgb(0x00, 0x00, 0x00),
@@ -210,6 +223,10 @@ fn default_palette() -> [Rgb; 256] {
 
 /// Parse an X11 colour spec: `rgb:rr/gg/bb` (1-4 hex digits per channel) or
 /// `#rrggbb`.
+#[expect(
+  clippy::cast_possible_truncation,
+  reason = "parsed colour channels are normalized into the u8 range"
+)]
 pub fn parse_color(spec: &str) -> Option<Rgb> {
   if let Some(rest) = spec.strip_prefix("rgb:") {
     let mut it = rest.split('/');

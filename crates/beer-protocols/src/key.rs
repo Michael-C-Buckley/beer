@@ -7,6 +7,7 @@ use smithay_client_toolkit::seat::keyboard::{KeyEvent, Keysym, Modifiers};
 /// Encode a key press into bytes for the PTY in the legacy xterm/VT form, or
 /// `None` if it produces no input. `app_cursor` selects the SS3 cursor-key form
 /// (DECCKM).
+#[must_use]
 pub fn encode(
   event: &KeyEvent,
   mods: Modifiers,
@@ -78,7 +79,7 @@ enum Func {
 
 /// Map a keysym to its kitty functional encoding, or `None` for a text key
 /// (whose code is its Unicode codepoint).
-fn functional(keysym: Keysym) -> Option<Func> {
+const fn functional(keysym: Keysym) -> Option<Func> {
   Some(match keysym {
     Keysym::Escape => Func::Number(27),
     Keysym::Return | Keysym::KP_Enter => Func::Number(13),
@@ -112,7 +113,7 @@ fn functional(keysym: Keysym) -> Option<Func> {
 
 /// The kitty key code for a lone modifier key, reported only in report-all
 /// mode.
-fn modifier_key(keysym: Keysym) -> Option<u32> {
+const fn modifier_key(keysym: Keysym) -> Option<u32> {
   Some(match keysym {
     Keysym::Caps_Lock => 57358,
     Keysym::Num_Lock => 57360,
@@ -152,14 +153,14 @@ fn base_codepoint(keysym: Keysym) -> Option<u32> {
 /// section is emitted when modifiers/event/text require it; the event sub-field
 /// only when the event is not a plain press.
 fn csi(
-  field: String,
+  field: &str,
   mod_param: u32,
   event: KeyKind,
   text: Option<&str>,
   term: u8,
 ) -> Vec<u8> {
   let mut s = String::from("\x1b[");
-  s.push_str(&field);
+  s.push_str(field);
   let needs_mods = mod_param != 1 || event != KeyKind::Press || text.is_some();
   if needs_mods {
     s.push(';');
@@ -183,6 +184,7 @@ fn csi(
 /// `flags`. Returns `None` when the event produces nothing (e.g. a text key
 /// release without report-all mode). `app_cursor` only affects unmodified
 /// cursor keys, matching legacy behaviour.
+#[must_use]
 pub fn kitty_encode(
   event: &KeyEvent,
   mods: Modifiers,
@@ -215,72 +217,69 @@ pub fn kitty_encode(
     if !report_all {
       return None;
     }
-    return Some(csi(code.to_string(), mod_param, kind, None, b'u'));
+    return Some(csi(&code.to_string(), mod_param, kind, None, b'u'));
   }
 
-  match functional(event.keysym) {
-    Some(func) => {
-      // Enter/Tab/Backspace keep legacy bytes when unmodified and not in
-      // report-all mode, so a shell stays usable.
-      let legacy_special = matches!(
-        event.keysym,
-        Keysym::Return | Keysym::KP_Enter | Keysym::Tab | Keysym::BackSpace
-      );
-      if legacy_special && !report_all && bits == 0 {
-        if kind != KeyKind::Press {
-          return None;
-        }
-        return Some(match event.keysym {
-          Keysym::BackSpace => b"\x7f".to_vec(),
-          Keysym::Tab => b"\t".to_vec(),
-          _ => b"\r".to_vec(),
-        });
-      }
-      Some(match func {
-        Func::Number(n) => csi(n.to_string(), mod_param, kind, None, b'u'),
-        Func::Tilde(n) => csi(n.to_string(), mod_param, kind, None, b'~'),
-        Func::Letter(l) => {
-          if mod_param == 1 && kind == KeyKind::Press {
-            // Unmodified: legacy CSI/SS3 form, honouring app-cursor.
-            vec![0x1B, if app_cursor { b'O' } else { b'[' }, l]
-          } else {
-            csi("1".to_string(), mod_param, kind, None, l)
-          }
-        },
-      })
-    },
-    None => {
-      let cp = base_codepoint(event.keysym)?;
-      if report_all {
-        if cp == 0 {
-          return None;
-        }
-        let text = if report_text {
-          event
-            .utf8
-            .as_deref()
-            .filter(|t| !t.is_empty() && t.chars().all(|c| !c.is_control()))
-        } else {
-          None
-        };
-        let field = alt_field(cp, event.keysym, mods, report_alt);
-        return Some(csi(field, mod_param, kind, text, b'u'));
-      }
-      // Without report-all, text keys only report presses.
+  if let Some(func) = functional(event.keysym) {
+    // Enter/Tab/Backspace keep legacy bytes when unmodified and not in
+    // report-all mode, so a shell stays usable.
+    let legacy_special = matches!(
+      event.keysym,
+      Keysym::Return | Keysym::KP_Enter | Keysym::Tab | Keysym::BackSpace
+    );
+    if legacy_special && !report_all && bits == 0 {
       if kind != KeyKind::Press {
         return None;
       }
-      // Plain or shift-only keys send their text; ctrl/alt/super → CSI u.
-      if bits & !1 == 0 {
-        let text = event.utf8.as_ref()?;
-        if text.is_empty() {
-          return None;
+      return Some(match event.keysym {
+        Keysym::BackSpace => b"\x7f".to_vec(),
+        Keysym::Tab => b"\t".to_vec(),
+        _ => b"\r".to_vec(),
+      });
+    }
+    Some(match func {
+      Func::Number(n) => csi(&n.to_string(), mod_param, kind, None, b'u'),
+      Func::Tilde(n) => csi(&n.to_string(), mod_param, kind, None, b'~'),
+      Func::Letter(l) => {
+        if mod_param == 1 && kind == KeyKind::Press {
+          // Unmodified: legacy CSI/SS3 form, honouring app-cursor.
+          vec![0x1B, if app_cursor { b'O' } else { b'[' }, l]
+        } else {
+          csi("1", mod_param, kind, None, l)
         }
-        return Some(text.as_bytes().to_vec());
+      },
+    })
+  } else {
+    let cp = base_codepoint(event.keysym)?;
+    if report_all {
+      if cp == 0 {
+        return None;
       }
+      let text = if report_text {
+        event
+          .utf8
+          .as_deref()
+          .filter(|t| !t.is_empty() && t.chars().all(|c| !c.is_control()))
+      } else {
+        None
+      };
       let field = alt_field(cp, event.keysym, mods, report_alt);
-      Some(csi(field, mod_param, KeyKind::Press, None, b'u'))
-    },
+      return Some(csi(&field, mod_param, kind, text, b'u'));
+    }
+    // Without report-all, text keys only report presses.
+    if kind != KeyKind::Press {
+      return None;
+    }
+    // Plain or shift-only keys send their text; ctrl/alt/super → CSI u.
+    if bits & !1 == 0 {
+      let text = event.utf8.as_ref()?;
+      if text.is_empty() {
+        return None;
+      }
+      return Some(text.as_bytes().to_vec());
+    }
+    let field = alt_field(cp, event.keysym, mods, report_alt);
+    Some(csi(&field, mod_param, KeyKind::Press, None, b'u'))
   }
 }
 

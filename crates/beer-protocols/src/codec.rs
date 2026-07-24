@@ -6,6 +6,7 @@ const B64: &[u8; 64] =
   b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 /// Standard base64 encode (used for OSC 52 query replies).
+#[must_use]
 pub fn base64_encode(data: &[u8]) -> String {
   let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
   for chunk in data.chunks(3) {
@@ -15,10 +16,10 @@ pub fn base64_encode(data: &[u8]) -> String {
       *chunk.get(2).unwrap_or(&0),
     ];
     let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
-    out.push(B64[(n >> 18 & 63) as usize] as char);
-    out.push(B64[(n >> 12 & 63) as usize] as char);
+    out.push(B64[((n >> 18) & 63) as usize] as char);
+    out.push(B64[((n >> 12) & 63) as usize] as char);
     out.push(if chunk.len() > 1 {
-      B64[(n >> 6 & 63) as usize] as char
+      B64[((n >> 6) & 63) as usize] as char
     } else {
       '='
     });
@@ -33,6 +34,7 @@ pub fn base64_encode(data: &[u8]) -> String {
 
 /// Standard base64 decode, ignoring padding and whitespace; `None` on a bad
 /// character.
+#[must_use]
 pub fn base64_decode(data: &[u8]) -> Option<Vec<u8>> {
   let val = |c: u8| -> Option<u32> {
     match c {
@@ -58,13 +60,13 @@ pub fn base64_decode(data: &[u8]) -> Option<Vec<u8>> {
     for &c in chunk {
       n = (n << 6) | val(c)?;
     }
-    n <<= 6 * (4 - chunk.len() as u32);
-    out.push((n >> 16) as u8);
+    n <<= 6 * (4 - u32::try_from(chunk.len()).ok()?);
+    out.push(u8::try_from((n >> 16) & u32::from(u8::MAX)).ok()?);
     if chunk.len() >= 3 {
-      out.push((n >> 8) as u8);
+      out.push(u8::try_from((n >> 8) & u32::from(u8::MAX)).ok()?);
     }
     if chunk.len() >= 4 {
-      out.push(n as u8);
+      out.push(u8::try_from(n & u32::from(u8::MAX)).ok()?);
     }
   }
   Some(out)
@@ -72,6 +74,7 @@ pub fn base64_decode(data: &[u8]) -> Option<Vec<u8>> {
 
 /// Decode an even-length lowercase/uppercase hex string into bytes (XTGETTCAP
 /// names arrive hex-encoded).
+#[must_use]
 pub fn decode_hex(s: &[u8]) -> Option<Vec<u8>> {
   if s.is_empty() || !s.len().is_multiple_of(2) {
     return None;
@@ -84,11 +87,12 @@ pub fn decode_hex(s: &[u8]) -> Option<Vec<u8>> {
 
 /// Turn a hexadecimal character into its numerical value.
 fn hex_nibble(b: u8) -> Option<u8> {
-  (b as char).to_digit(16).map(|d| d as u8)
+  (b as char).to_digit(16).and_then(|d| u8::try_from(d).ok())
 }
 
 /// Percent-decode `%XX` byte escapes in a URI path, passing other bytes
 /// through.
+#[must_use]
 pub fn percent_decode(s: &[u8]) -> Vec<u8> {
   let mut out = Vec::with_capacity(s.len());
   let mut i = 0;
@@ -97,7 +101,7 @@ pub fn percent_decode(s: &[u8]) -> Vec<u8> {
       let hi = hex_nibble(s[i + 1]);
       let lo = hex_nibble(s[i + 2]);
       if let (Some(hi), Some(lo)) = (hi, lo) {
-        out.push(hi << 4 | lo);
+        out.push((hi << 4) | lo);
         i += 3;
         continue;
       }
@@ -111,6 +115,7 @@ pub fn percent_decode(s: &[u8]) -> Vec<u8> {
 /// Extract the local path from an OSC 7 `file://host/path` URI, percent-decoding
 /// `%XX` escapes. The host part is ignored (we only spawn locally). Returns
 /// `None` if it is not a usable absolute path.
+#[must_use]
 pub fn file_uri_path(uri: &[u8]) -> Option<String> {
   let rest = uri.strip_prefix(b"file://").unwrap_or(uri);
   // Skip the authority (host) up to the first '/', which begins the path.

@@ -1,9 +1,9 @@
-use super::*;
+use super::{Flags, Grid, Point, is_word};
 
 impl Grid {
   /// Slide an active selection up by `n` rows after scrollback eviction,
   /// dropping it if either endpoint scrolled off the top.
-  pub(super) fn shift_selection(&mut self, n: usize) {
+  pub(super) const fn shift_selection(&mut self, n: usize) {
     if let Some((a, b)) = self.selection {
       if a.row < n || b.row < n {
         self.selection = None;
@@ -22,26 +22,26 @@ impl Grid {
     }
   }
 
-  pub fn clear_selection(&mut self) {
+  pub const fn clear_selection(&mut self) {
     self.selection = None;
   }
 
   /// Begin a linear selection at an absolute point (drag anchor).
-  pub fn start_selection(&mut self, row: usize, col: usize) {
+  pub const fn start_selection(&mut self, row: usize, col: usize) {
     let p = Point { row, col };
     self.selection = Some((p, p));
     self.selection_block = false;
   }
 
   /// Begin a rectangular (block) selection at an absolute point.
-  pub fn start_block_selection(&mut self, row: usize, col: usize) {
+  pub const fn start_block_selection(&mut self, row: usize, col: usize) {
     let p = Point { row, col };
     self.selection = Some((p, p));
     self.selection_block = true;
   }
 
   /// Move the selection head (drag), keeping the anchor fixed.
-  pub fn extend_selection(&mut self, row: usize, col: usize) {
+  pub const fn extend_selection(&mut self, row: usize, col: usize) {
     if let Some((_, head)) = self.selection.as_mut() {
       *head = Point { row, col };
     }

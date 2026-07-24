@@ -5,7 +5,7 @@
 //! then glyphs - so a wide glyph that overflows its cell is not clipped by the
 //! neighbouring cell's background fill.
 
-use std::{num::NonZeroU16, sync::LazyLock};
+use std::{mem, num::NonZeroU16, sync::LazyLock};
 
 use beer_protocols::{
   graphics::{PLACEHOLDER, diacritic_value},
@@ -14,12 +14,18 @@ use beer_protocols::{
 
 use crate::{
   config::{AlphaBlending, Subpixel},
-  font::{CellMetrics, Fonts, Glyph, GlyphData, Style},
+  font::{CellMetrics, FontError, Fonts, Glyph, GlyphData, Style},
+  graphics::{Graphics, Image, Placement},
   grid::{Cell, Color, CursorShape, Flags, Grid, Underline},
   theme::{Plane, Rgb, Theme},
 };
 
 /// sRGB (8-bit) → linear-light [0,1] lookup, for gamma-correct compositing.
+#[expect(
+  clippy::cast_precision_loss,
+  reason = "the fixed 8-bit sRGB lookup intentionally maps a bounded index to \
+            f32"
+)]
 static SRGB_TO_LINEAR: LazyLock<[f32; 256]> = LazyLock::new(|| {
   let mut t = [0f32; 256];
   for (i, v) in t.iter_mut().enumerate() {
@@ -40,21 +46,26 @@ fn srgb_to_linear_f(c: f32) -> f32 {
 /// sRGB transfer encode of a linear [0,1] channel back to a normalized float.
 fn linear_to_srgb_f(c: f32) -> f32 {
   let c = c.clamp(0.0, 1.0);
-  if c <= 0.0031308 {
+  if c <= 0.003_130_8 {
     c * 12.92
   } else {
-    1.055 * c.powf(1.0 / 2.4) - 0.055
+    1.055f32.mul_add(c.powf(1.0 / 2.4), -0.055)
   }
 }
 
 /// Encode a linear channel to an 8-bit sRGB value.
+#[expect(
+  clippy::cast_possible_truncation,
+  clippy::cast_sign_loss,
+  reason = "the channel is clamped to the complete u8 range before encoding"
+)]
 fn linear_to_srgb(c: f32) -> u8 {
   (linear_to_srgb_f(c) * 255.0).round().clamp(0.0, 255.0) as u8
 }
 
 /// Rec. 709 relative luminance of a linear RGB triple.
 fn luminance(rgb: [f32; 3]) -> f32 {
-  0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]
+  0.0722f32.mul_add(rgb[2], 0.7152f32.mul_add(rgb[1], 0.2126 * rgb[0]))
 }
 
 /// A mutable view over a BGRA pixel buffer.
@@ -68,8 +79,15 @@ struct Canvas<'a> {
   blend:  AlphaBlending,
 }
 
+#[expect(
+  clippy::cast_possible_truncation,
+  clippy::cast_possible_wrap,
+  clippy::cast_sign_loss,
+  reason = "canvas coordinates are checked or clamped before indexing the \
+            pixel buffer"
+)]
 impl Canvas<'_> {
-  fn index(&self, x: i32, y: i32) -> Option<usize> {
+  const fn index(&self, x: i32, y: i32) -> Option<usize> {
     if x < 0 || y < 0 || x as usize >= self.width || y as usize >= self.height {
       return None;
     }
@@ -113,57 +131,66 @@ impl Canvas<'_> {
   /// Alpha-blend `fg` over the existing pixel with coverage `a`, in the
   /// configured [`AlphaBlending`] space. The buffer is BGRA: index 0 is blue,
   /// index 2 is red.
-  fn blend(&mut self, x: i32, y: i32, fg: Rgb, a: u8) {
-    let Some(i) = self.index(x, y) else { return };
+  fn blend(&mut self, pixel_x: i32, pixel_y: i32, fg: Rgb, coverage: u8) {
+    let Some(pixel_index) = self.index(pixel_x, pixel_y) else {
+      return;
+    };
     match self.blend {
       AlphaBlending::Native => {
-        let (a, inv) = (u32::from(a), u32::from(255 - a));
+        let (coverage, inverse) =
+          (u32::from(coverage), u32::from(255 - coverage));
         let mix = |src: u8, dst: u8| {
-          ((u32::from(src) * a + u32::from(dst) * inv) / 255) as u8
+          ((u32::from(src) * coverage + u32::from(dst) * inverse) / 255) as u8
         };
-        self.pixels[i] = mix(fg.2, self.pixels[i]);
-        self.pixels[i + 1] = mix(fg.1, self.pixels[i + 1]);
-        self.pixels[i + 2] = mix(fg.0, self.pixels[i + 2]);
+        self.pixels[pixel_index] = mix(fg.2, self.pixels[pixel_index]);
+        self.pixels[pixel_index + 1] = mix(fg.1, self.pixels[pixel_index + 1]);
+        self.pixels[pixel_index + 2] = mix(fg.0, self.pixels[pixel_index + 2]);
       },
       AlphaBlending::Linear | AlphaBlending::LinearCorrected => {
         let lut = &*SRGB_TO_LINEAR;
         // Foreground and destination in linear light.
-        let f = [lut[fg.0 as usize], lut[fg.1 as usize], lut[fg.2 as usize]];
-        let d = [
-          lut[self.pixels[i + 2] as usize],
-          lut[self.pixels[i + 1] as usize],
-          lut[self.pixels[i] as usize],
+        let foreground =
+          [lut[fg.0 as usize], lut[fg.1 as usize], lut[fg.2 as usize]];
+        let destination = [
+          lut[self.pixels[pixel_index + 2] as usize],
+          lut[self.pixels[pixel_index + 1] as usize],
+          lut[self.pixels[pixel_index] as usize],
         ];
-        let cov = f32::from(a) / 255.0;
+        let cov = f32::from(coverage) / 255.0;
         // Linear-corrected remaps the coverage so the blended luminance matches
         // what gamma-space (Native) blending would give, preserving perceived
         // stroke weight while keeping colour edges clean.
         let alpha = if self.blend == AlphaBlending::LinearCorrected {
-          let fl = luminance(f);
-          let bl = luminance(d);
-          if (fl - bl).abs() < 1e-6 {
+          let foreground_luminance = luminance(foreground);
+          let background_luminance = luminance(destination);
+          if (foreground_luminance - background_luminance).abs() < 1e-6 {
             cov
           } else {
-            let target = srgb_to_linear_f(
-              linear_to_srgb_f(fl) * cov + linear_to_srgb_f(bl) * (1.0 - cov),
-            );
-            ((target - bl) / (fl - bl)).clamp(0.0, 1.0)
+            let target =
+              srgb_to_linear_f(linear_to_srgb_f(background_luminance).mul_add(
+                1.0 - cov,
+                linear_to_srgb_f(foreground_luminance) * cov,
+              ));
+            ((target - background_luminance)
+              / (foreground_luminance - background_luminance))
+              .clamp(0.0, 1.0)
           }
         } else {
           cov
         };
-        let out =
-          |fc: f32, dc: f32| linear_to_srgb(fc * alpha + dc * (1.0 - alpha));
-        self.pixels[i] = out(f[2], d[2]);
-        self.pixels[i + 1] = out(f[1], d[1]);
-        self.pixels[i + 2] = out(f[0], d[0]);
+        let out = |fc: f32, dc: f32| {
+          linear_to_srgb(dc.mul_add(1.0 - alpha, fc * alpha))
+        };
+        self.pixels[pixel_index] = out(foreground[2], destination[2]);
+        self.pixels[pixel_index + 1] = out(foreground[1], destination[1]);
+        self.pixels[pixel_index + 2] = out(foreground[0], destination[0]);
       },
     }
-    self.pixels[i + 3] = 0xFF;
+    self.pixels[pixel_index + 3] = 0xFF;
   }
 
   /// Alpha-blend `fg` over the destination with independent per-subpixel
-  /// coverage (LCD text). `cov` is in FreeType's physical order (leftmost,
+  /// coverage (LCD text). `cov` is in `FreeType`'s physical order (leftmost,
   /// middle, rightmost subpixel); `bgr` swaps the outer channels for panels
   /// whose subpixels run blue-green-red rather than red-green-blue.
   fn blend_lcd(&mut self, x: i32, y: i32, fg: Rgb, cov: [u8; 3], bgr: bool) {
@@ -238,7 +265,7 @@ pub struct Frame<'a> {
   /// Hyperlink currently under the pointer; its cells get a hover underline.
   pub hovered_link: Option<NonZeroU16>,
   /// The graphics engine, source of image pixels and placement geometry.
-  pub images:       &'a crate::graphics::Graphics,
+  pub images:       &'a Graphics,
 }
 
 #[derive(Debug)]
@@ -251,6 +278,14 @@ pub struct Renderer {
   blend: AlphaBlending,
 }
 
+#[expect(
+  clippy::cast_possible_truncation,
+  clippy::cast_possible_wrap,
+  clippy::cast_sign_loss,
+  clippy::cast_precision_loss,
+  reason = "renderer dimensions and cell geometry are bounded by the \
+            compositor surface"
+)]
 impl Renderer {
   pub fn new(fonts: Fonts) -> Self {
     Self {
@@ -260,22 +295,22 @@ impl Renderer {
     }
   }
 
-  pub fn metrics(&self) -> CellMetrics {
+  pub const fn metrics(&self) -> CellMetrics {
     self.fonts.metrics()
   }
 
-  pub fn set_padding(&mut self, pad_x: u32, pad_y: u32) {
+  pub const fn set_padding(&mut self, pad_x: u32, pad_y: u32) {
     self.pad = (pad_x as i32, pad_y as i32);
   }
 
-  pub fn set_alpha_blending(&mut self, blend: AlphaBlending) {
+  pub const fn set_alpha_blending(&mut self, blend: AlphaBlending) {
     self.blend = blend;
   }
 
   /// The compositing mode to use this frame: the configured mode when the
   /// background is opaque, else `Native` (linear blending needs an opaque
   /// destination to read).
-  fn blend_for(&self, theme: &Theme) -> AlphaBlending {
+  const fn blend_for(&self, theme: &Theme) -> AlphaBlending {
     if theme.alpha == 0xFF {
       self.blend
     } else {
@@ -289,7 +324,7 @@ impl Renderer {
     family: &str,
     size_px: u32,
     subpixel: Subpixel,
-  ) -> Result<(), crate::font::FontError> {
+  ) -> Result<(), FontError> {
     self.fonts = Fonts::new(family, size_px, subpixel)?;
     Ok(())
   }
@@ -696,7 +731,7 @@ impl Renderer {
   /// correctly over an opaque destination, so translucent backgrounds
   /// (`opaque == false`) fall back to grayscale rather than fringe over an
   /// unknown desktop behind the window.
-  fn sub_mode(&self, opaque: bool) -> Option<bool> {
+  const fn sub_mode(&self, opaque: bool) -> Option<bool> {
     match self.fonts.subpixel() {
       Subpixel::Rgb if opaque => Some(false),
       Subpixel::Bgr if opaque => Some(true),
@@ -704,7 +739,10 @@ impl Renderer {
     }
   }
 
-  #[allow(clippy::too_many_arguments)]
+  #[expect(
+    clippy::too_many_arguments,
+    reason = "renderer hot path keeps pixel parameters explicit"
+  )]
   fn draw_glyph(
     &mut self,
     canvas: &mut Canvas,
@@ -749,7 +787,7 @@ impl Renderer {
       return;
     };
     let scale = s.size.font_scale();
-    let (cols, rows) = (s.cols as i32, s.rows as i32);
+    let (cols, rows) = (i32::from(s.cols), i32::from(s.rows));
     let block_top = row_top - dy as i32 * m.height as i32;
     let (block_w, block_h) = (cols * m.width as i32, rows * m.height as i32);
     let clip = (row_top, row_top + m.height as i32);
@@ -758,10 +796,10 @@ impl Renderer {
     let render_h = (m.height as f32 * scale).round().max(1.0) as i32;
 
     // The run: a packed string (w>0) or the leading grapheme (w==0).
-    let run: Vec<char> = match s.run.as_deref() {
-      Some(text) => text.chars().collect(),
-      None => vec![lead.c],
-    };
+    let run: Vec<char> = s
+      .run
+      .as_deref()
+      .map_or_else(|| vec![lead.c], |text| text.chars().collect());
     let render_w = advance * run.len() as i32;
 
     // A fractional scale renders into an area smaller than the block, placed
@@ -800,6 +838,14 @@ impl Renderer {
 /// y1)` so a tall text-sizing glyph paints only the part belonging to the
 /// current row. Mask glyphs are tinted with `fg`; colour glyphs are scaled to
 /// `target_h` (the outline transform does not scale embedded bitmaps).
+#[expect(
+  clippy::cast_possible_truncation,
+  clippy::cast_possible_wrap,
+  clippy::cast_sign_loss,
+  clippy::cast_precision_loss,
+  reason = "glyph placement converts bounded font metrics into pixel \
+            coordinates"
+)]
 fn blit_glyph_clipped(
   canvas: &mut Canvas,
   glyph: &Glyph,
@@ -867,15 +913,24 @@ fn blit_glyph_clipped(
 /// Composite the graphics-image cells of one row whose placement z-index passes
 /// `z_filter` (one call below the text, one above). Each cell carries its
 /// `(dx, dy)` in the placement; the engine supplies the pixels and geometry.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+  clippy::too_many_arguments,
+  reason = "renderer hot path keeps pixel parameters explicit"
+)]
+#[expect(
+  clippy::cast_possible_truncation,
+  clippy::cast_possible_wrap,
+  reason = "image placement converts bounded cell geometry into pixel \
+            coordinates"
+)]
 fn draw_image_cells(
   canvas: &mut Canvas,
-  images: &crate::graphics::Graphics,
+  images: &Graphics,
   cells: &[Cell],
   cols: usize,
   pad_x: i32,
   row_top: i32,
-  m: CellMetrics,
+  metrics: CellMetrics,
   z_filter: impl Fn(i32) -> bool,
 ) {
   for (x, cell) in cells.iter().take(cols).enumerate() {
@@ -889,16 +944,16 @@ fn draw_image_cells(
     let Some(img) = images.image(p.image) else {
       continue;
     };
-    let origin_x = pad_x + x as i32 * m.width as i32;
+    let origin_x = pad_x + x as i32 * metrics.width as i32;
     blit_image_cell(
       canvas,
       img,
       p,
-      r.dx as i32,
-      r.dy as i32,
+      i32::from(r.dx),
+      i32::from(r.dy),
       origin_x,
       row_top,
-      m,
+      metrics,
     );
   }
 }
@@ -907,9 +962,14 @@ fn draw_image_cells(
 /// `U+10EEEE`, its image id in the foreground colour, and its row/column as
 /// combining diacritics; a missing row/column/id-byte is inherited from the
 /// placeholder to the left, the way the protocol specifies.
+#[expect(
+  clippy::cast_possible_truncation,
+  clippy::cast_possible_wrap,
+  reason = "placeholder geometry is bounded by the terminal cell and surface"
+)]
 fn draw_placeholders(
   canvas: &mut Canvas,
-  images: &crate::graphics::Graphics,
+  images: &Graphics,
   cells: &[Cell],
   cols: usize,
   pad_x: i32,
@@ -973,7 +1033,7 @@ fn placeholder_id(fg: Color) -> Option<u32> {
   match fg {
     Color::Indexed(n) => Some(u32::from(n)),
     Color::Rgb(r, g, b) => {
-      Some(u32::from(r) << 16 | u32::from(g) << 8 | u32::from(b))
+      Some((u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b))
     },
     Color::Default => None,
   }
@@ -983,11 +1043,19 @@ fn placeholder_id(fg: Color) -> Option<u32> {
 /// rectangle is scaled to its full cell-pixel area; this cell shows the
 /// sub-rectangle for its `(dx, dy)`, sampled nearest-neighbour and
 /// alpha-blended.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+  clippy::too_many_arguments,
+  reason = "renderer hot path keeps pixel parameters explicit"
+)]
+#[expect(
+  clippy::cast_possible_wrap,
+  clippy::cast_sign_loss,
+  reason = "image sampling coordinates are bounded by the image placement"
+)]
 fn blit_image_cell(
   canvas: &mut Canvas,
-  img: &crate::graphics::Image,
-  p: &crate::graphics::Placement,
+  img: &Image,
+  p: &Placement,
   dx: i32,
   dy: i32,
   origin_x: i32,
@@ -997,8 +1065,8 @@ fn blit_image_cell(
   let (cell_w, cell_h) = (m.width as i32, m.height as i32);
   // The source rectangle is scaled to the cell area less the first-cell pixel
   // offset, so a non-zero X/Y shifts the image inward from the top-left cell.
-  let span_w = (p.cols as i32 * cell_w - p.off_x as i32).max(1);
-  let span_h = (p.rows as i32 * cell_h - p.off_y as i32).max(1);
+  let span_w = (i32::from(p.cols) * cell_w - p.off_x as i32).max(1);
+  let span_h = (i32::from(p.rows) * cell_h - p.off_y as i32).max(1);
   let src_w = if p.src_w == 0 { img.width } else { p.src_w } as i32;
   let src_h = if p.src_h == 0 { img.height } else { p.src_h } as i32;
   let (iw, ih) = (img.width as i32, img.height as i32);
@@ -1030,9 +1098,19 @@ fn blit_image_cell(
 }
 
 /// Composite a rasterized glyph into the canvas. `origin_x`/`cell_top` are the
-/// cell's top-left; `rise` lifts the glyph above the baseline (HarfBuzz's
+/// cell's top-left; `rise` lifts the glyph above the baseline (`HarfBuzz`'s
 /// vertical offset, 0 for the unshaped path).
-#[allow(clippy::too_many_arguments)]
+#[expect(
+  clippy::too_many_arguments,
+  reason = "renderer hot path keeps pixel parameters explicit"
+)]
+#[expect(
+  clippy::cast_possible_truncation,
+  clippy::cast_possible_wrap,
+  clippy::cast_sign_loss,
+  clippy::cast_precision_loss,
+  reason = "glyph sampling uses bounded font metrics and canvas coordinates"
+)]
 fn blit_glyph(
   canvas: &mut Canvas,
   glyph: &Glyph,
@@ -1076,14 +1154,13 @@ fn blit_glyph(
           }
           let (px, py) =
             (origin_x + glyph.left + gx, baseline - glyph.top + gy);
-          match sub {
-            Some(bgr) => canvas.blend_lcd(px, py, fg, cov, bgr),
-            None => {
-              let a =
-                ((u32::from(cov[0]) + u32::from(cov[1]) + u32::from(cov[2]))
-                  / 3) as u8;
-              canvas.blend(px, py, fg, a);
-            },
+          if let Some(bgr) = sub {
+            canvas.blend_lcd(px, py, fg, cov, bgr);
+          } else {
+            let a =
+              ((u32::from(cov[0]) + u32::from(cov[1]) + u32::from(cov[2])) / 3)
+                as u8;
+            canvas.blend(px, py, fg, a);
           }
         }
       }
@@ -1108,6 +1185,12 @@ fn blit_glyph(
 
 /// Bilinearly sample a premultiplied BGRA image at fractional `(fx, fy)`.
 /// Premultiplied colour interpolates linearly, so this is correct to blend.
+#[expect(
+  clippy::cast_possible_truncation,
+  clippy::cast_sign_loss,
+  reason = "bilinear sampling clamps coordinates and channels to bounded \
+            ranges"
+)]
 fn sample_bilinear(bgra: &[u8], w: i32, h: i32, fx: f32, fy: f32) -> [u8; 4] {
   let x0f = fx.floor();
   let y0f = fy.floor();
@@ -1127,7 +1210,7 @@ fn sample_bilinear(bgra: &[u8], w: i32, h: i32, fx: f32, fy: f32) -> [u8; 4] {
   out
 }
 
-fn cell_style(cell: &Cell) -> Style {
+const fn cell_style(cell: &Cell) -> Style {
   Style {
     bold:   cell.flags.contains(Flags::BOLD),
     italic: cell.flags.contains(Flags::ITALIC),
@@ -1141,7 +1224,7 @@ fn cell_colors(cell: &Cell, theme: &Theme) -> (Rgb, Rgb) {
   let mut fg = theme.resolve(cell.fg, Plane::Fg, bold);
   let mut bg = theme.resolve(cell.bg, Plane::Bg, false);
   if cell.flags.contains(Flags::REVERSE) {
-    std::mem::swap(&mut fg, &mut bg);
+    mem::swap(&mut fg, &mut bg);
   }
   if cell.flags.contains(Flags::DIM) {
     fg = blend_rgb(fg, bg);
@@ -1153,6 +1236,10 @@ fn cell_colors(cell: &Cell, theme: &Theme) -> (Rgb, Rgb) {
 }
 
 /// Mix `c` two-thirds of the way from `toward`, used for the dim attribute.
+#[expect(
+  clippy::cast_possible_truncation,
+  reason = "the channel arithmetic is bounded to the u8 range"
+)]
 fn blend_rgb(c: Rgb, toward: Rgb) -> Rgb {
   let mix = |a: u8, b: u8| ((u32::from(a) * 2 + u32::from(b)) / 3) as u8;
   Rgb(mix(c.0, toward.0), mix(c.1, toward.1), mix(c.2, toward.2))
@@ -1168,6 +1255,7 @@ fn is_braille(c: char) -> bool {
 /// foot's `box-drawing.c` `draw_braille` - base size and spacing from the cell,
 /// then leftover pixels distributed (dot → margin → spacing → margin → dot) so
 /// dots land on exact pixels with no rounding drift.
+#[expect(clippy::cast_sign_loss, reason = "cell geometry is non-negative")]
 fn braille_geometry(width: i32, height: i32) -> (u32, [i32; 2], [i32; 4]) {
   let mut w = (width / 4).min(height / 8);
   let mut x_spacing = width / 4;
@@ -1233,6 +1321,11 @@ fn braille_geometry(width: i32, height: i32) -> (u32, [i32; 2], [i32; 4]) {
 /// The low eight bits of the codepoint select dots: bits 0-2 are the left
 /// column rows 0-2, bits 3-5 the right column rows 0-2, bits 6-7 the bottom
 /// row.
+#[expect(
+  clippy::cast_possible_wrap,
+  clippy::cast_possible_truncation,
+  reason = "braille geometry is bounded by the terminal cell"
+)]
 fn draw_braille(
   canvas: &mut Canvas,
   c: char,
@@ -1241,8 +1334,6 @@ fn draw_braille(
   m: CellMetrics,
   fg: Rgb,
 ) {
-  let (w, xs, ys) = braille_geometry(m.width as i32, m.height as i32);
-  let sym = ((c as u32) - 0x2800) as u8;
   // (bit mask, column index, row index).
   const DOTS: [(u8, usize, usize); 8] = [
     (0x01, 0, 0),
@@ -1254,6 +1345,8 @@ fn draw_braille(
     (0x40, 0, 3),
     (0x80, 1, 3),
   ];
+  let (w, xs, ys) = braille_geometry(m.width as i32, m.height as i32);
+  let sym = ((c as u32) - 0x2800) as u8;
   for (mask, col, row) in DOTS {
     if sym & mask != 0 {
       canvas.fill_rect(x0 + xs[col], top + ys[row], w, w, fg);
@@ -1264,7 +1357,7 @@ fn draw_braille(
 /// Whether `c` is drawn geometrically by [`draw_box`]: box drawing
 /// (U+2500-257F), block elements (U+2580-259F), or the legacy-computing
 /// sextants (U+1FB00-1FB3B) and octants (U+1CD00-1CDE5).
-fn is_box_draw(c: char) -> bool {
+const fn is_box_draw(c: char) -> bool {
   matches!(c as u32, 0x2500..=0x259F | 0x1FB00..=0x1FB3B | 0x1CD00..=0x1CDE5)
 }
 
@@ -1319,6 +1412,11 @@ fn blend_shade(
 /// Block elements U+2580-259F: half/eighth blocks, shades, and quadrants. All
 /// boundaries are floor-divided from the cell so adjacent cells share the exact
 /// same edge and tile without seams.
+#[expect(
+  clippy::cast_possible_wrap,
+  clippy::cast_sign_loss,
+  reason = "block element geometry is bounded by the terminal cell"
+)]
 fn draw_block_element(
   canvas: &mut Canvas,
   cp: u32,
@@ -1327,43 +1425,65 @@ fn draw_block_element(
   m: CellMetrics,
   fg: Rgb,
 ) {
-  let (w, h) = (m.width as i32, m.height as i32);
+  let (width, height) = (m.width as i32, m.height as i32);
   // Horizontal and vertical eighth boundaries.
-  let ex = |n: i32| (n * w) / 8;
-  let ey = |n: i32| (n * h) / 8;
+  let edge_x = |n: i32| (n * width) / 8;
+  let edge_y = |n: i32| (n * height) / 8;
   match cp {
     // Upper half.
-    0x2580 => canvas.fill_rect(x0, top, w as u32, ey(4) as u32, fg),
+    0x2580 => canvas.fill_rect(x0, top, width as u32, edge_y(4) as u32, fg),
     // Lower one-eighth (2581) through full block (2588).
     0x2581..=0x2588 => {
-      let n = (cp - 0x2580) as i32;
-      let y = top + ey(8 - n);
-      canvas.fill_rect(x0, y, w as u32, (h - ey(8 - n)) as u32, fg);
+      let segment = (cp - 0x2580) as i32;
+      let y = top + edge_y(8 - segment);
+      canvas.fill_rect(
+        x0,
+        y,
+        width as u32,
+        (height - edge_y(8 - segment)) as u32,
+        fg,
+      );
     },
     // Left seven-eighths (2589) through left one-eighth (258F).
     0x2589..=0x258F => {
-      let n = 8 - (cp - 0x2588) as i32;
-      canvas.fill_rect(x0, top, ex(n) as u32, h as u32, fg);
+      let segment = 8 - (cp - 0x2588) as i32;
+      canvas.fill_rect(x0, top, edge_x(segment) as u32, height as u32, fg);
     },
     // Right half.
     0x2590 => {
-      canvas.fill_rect(x0 + ex(4), top, (w - ex(4)) as u32, h as u32, fg)
+      canvas.fill_rect(
+        x0 + edge_x(4),
+        top,
+        (width - edge_x(4)) as u32,
+        height as u32,
+        fg,
+      );
     },
-    0x2591 => blend_shade(canvas, x0, top, w, h, fg, 0x40),
-    0x2592 => blend_shade(canvas, x0, top, w, h, fg, 0x80),
-    0x2593 => blend_shade(canvas, x0, top, w, h, fg, 0xC0),
+    0x2591 => blend_shade(canvas, x0, top, width, height, fg, 0x40),
+    0x2592 => blend_shade(canvas, x0, top, width, height, fg, 0x80),
+    0x2593 => blend_shade(canvas, x0, top, width, height, fg, 0xC0),
     // Upper one-eighth.
-    0x2594 => canvas.fill_rect(x0, top, w as u32, ey(1) as u32, fg),
+    0x2594 => canvas.fill_rect(x0, top, width as u32, edge_y(1) as u32, fg),
     // Right one-eighth.
     0x2595 => {
-      canvas.fill_rect(x0 + ex(7), top, (w - ex(7)) as u32, h as u32, fg)
+      canvas.fill_rect(
+        x0 + edge_x(7),
+        top,
+        (width - edge_x(7)) as u32,
+        height as u32,
+        fg,
+      );
     },
-    0x2596..=0x259F => draw_quadrants(canvas, cp, x0, top, w, h, fg),
+    0x2596..=0x259F => draw_quadrants(canvas, cp, x0, top, width, height, fg),
     _ => {},
   }
 }
 
 /// The quadrant block elements U+2596-259F, as a 2x2 grid of half-cells.
+#[expect(
+  clippy::cast_sign_loss,
+  reason = "quadrant geometry is bounded by the terminal cell"
+)]
 fn draw_quadrants(
   canvas: &mut Canvas,
   cp: u32,
@@ -1406,7 +1526,11 @@ fn draw_quadrants(
 /// The range U+1FB00-1FB3B enumerates the 60 sextant combinations, skipping
 /// blank, full, and the two that duplicate the left/right half blocks (bit
 /// patterns 21 and 42).
-fn sextant_pattern(cp: u32) -> u8 {
+#[expect(
+  clippy::cast_possible_truncation,
+  reason = "the sextant codepoint range is explicitly bounded"
+)]
+const fn sextant_pattern(cp: u32) -> u8 {
   let idx = (cp - 0x1FB00) as u8;
   let mut seen = 0u8;
   let mut pat = 1u8;
@@ -1423,6 +1547,11 @@ fn sextant_pattern(cp: u32) -> u8 {
 }
 
 /// Legacy-computing sextants U+1FB00-1FB3B: a 2-column, 3-row block mosaic.
+#[expect(
+  clippy::cast_possible_wrap,
+  clippy::cast_sign_loss,
+  reason = "sextant geometry is bounded by the terminal cell"
+)]
 fn draw_sextant(
   canvas: &mut Canvas,
   cp: u32,
@@ -1439,7 +1568,7 @@ fn draw_sextant(
     if pat & (1 << bit) == 0 {
       continue;
     }
-    let (col, row) = ((bit % 2) as i32, (bit / 2) as i32);
+    let (col, row) = (i32::from(bit % 2), i32::from(bit / 2));
     let xa = x0 + col * cx;
     let xw = if col == 0 { cx } else { w - cx };
     let (ya, yb) = (ry(row), ry(row + 1));
@@ -1470,6 +1599,11 @@ const OCTANTS: [u8; 230] = [
 ];
 
 /// Legacy-computing octants U+1CD00-1CDE5: a 2-column, 4-row block mosaic.
+#[expect(
+  clippy::cast_possible_wrap,
+  clippy::cast_sign_loss,
+  reason = "octant geometry is bounded by the terminal cell"
+)]
 fn draw_octant(
   canvas: &mut Canvas,
   cp: u32,
@@ -1487,7 +1621,7 @@ fn draw_octant(
       continue;
     }
     let left = bit < 4;
-    let row = (bit & 3) as i32;
+    let row = i32::from(bit & 3);
     let xa = if left { x0 } else { x0 + cx };
     let xw = if left { cx } else { w - cx };
     let (ya, yb) = (ry(row), ry(row + 1));
@@ -1498,6 +1632,10 @@ fn draw_octant(
 /// Box drawing U+2500-257F. Lines are drawn as arms from the cell centre to its
 /// edges at a weight per side (light/heavy/double); dashes, rounded arcs, and
 /// diagonals are handled specially. Returns `false` for an unhandled codepoint.
+#[expect(
+  clippy::cast_possible_wrap,
+  reason = "box-line geometry is bounded by the terminal cell"
+)]
 fn draw_box_line(
   canvas: &mut Canvas,
   cp: u32,
@@ -1596,11 +1734,21 @@ fn draw_box_line(
 }
 
 /// A horizontal bar of thickness `t` from `xa` to `xb`, centred on row `cy`.
+#[expect(
+  clippy::cast_sign_loss,
+  reason = "line lengths and thickness are clamped non-negative before \
+            conversion"
+)]
 fn h_seg(canvas: &mut Canvas, xa: i32, xb: i32, cy: i32, t: i32, fg: Rgb) {
   canvas.fill_rect(xa, cy - t / 2, (xb - xa).max(0) as u32, t as u32, fg);
 }
 
 /// A vertical bar of thickness `t` from `ya` to `yb`, centred on column `cx`.
+#[expect(
+  clippy::cast_sign_loss,
+  reason = "line lengths and thickness are clamped non-negative before \
+            conversion"
+)]
 fn v_seg(canvas: &mut Canvas, ya: i32, yb: i32, cx: i32, t: i32, fg: Rgb) {
   canvas.fill_rect(cx - t / 2, ya, t as u32, (yb - ya).max(0) as u32, fg);
 }
@@ -1666,7 +1814,14 @@ fn draw_doubles(
 
 /// Draw `n` dashes of thickness `t` evenly along a `span`-long axis starting at
 /// `start`, centred on the cross-axis coordinate `cross`.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+  clippy::too_many_arguments,
+  reason = "renderer hot path keeps pixel parameters explicit"
+)]
+#[expect(
+  clippy::cast_sign_loss,
+  reason = "dash geometry is bounded by the terminal cell"
+)]
 fn draw_dashes(
   canvas: &mut Canvas,
   start: i32,
@@ -1691,7 +1846,14 @@ fn draw_dashes(
 
 /// Draw a rounded corner (U+256D-2570): two straight stubs from the cell edges
 /// meeting a quarter-circle at the centre.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+  clippy::too_many_arguments,
+  reason = "renderer hot path keeps pixel parameters explicit"
+)]
+#[expect(
+  clippy::cast_sign_loss,
+  reason = "arc geometry is bounded by the terminal cell"
+)]
 fn draw_arc(
   canvas: &mut Canvas,
   cp: u32,
@@ -1714,7 +1876,7 @@ fn draw_arc(
       (right - midx - r).max(0) as u32,
       thin as u32,
       fg,
-    )
+    );
   };
   let hstub_l = |c: &mut Canvas| {
     c.fill_rect(
@@ -1723,7 +1885,7 @@ fn draw_arc(
       (midx - r - x0).max(0) as u32,
       thin as u32,
       fg,
-    )
+    );
   };
   let vstub_d = |c: &mut Canvas| {
     c.fill_rect(
@@ -1732,7 +1894,7 @@ fn draw_arc(
       thin as u32,
       (bottom - midy - r).max(0) as u32,
       fg,
-    )
+    );
   };
   let vstub_u = |c: &mut Canvas| {
     c.fill_rect(
@@ -1741,7 +1903,7 @@ fn draw_arc(
       thin as u32,
       (midy - r - top).max(0) as u32,
       fg,
-    )
+    );
   };
   // The arc is the circle quadrant facing the cell centre: `(x_pos, y_pos)`
   // pick which side of the arc centre that quadrant lies on.
@@ -1774,7 +1936,16 @@ fn draw_arc(
 /// Plot an antialiased 90-degree arc of radius `r` and thickness `thin` about
 /// `(cx, cy)`, in the quadrant selected by `(x_pos, y_pos)` (whether that
 /// quadrant lies on the positive x/y side of the centre).
-#[allow(clippy::too_many_arguments)]
+#[expect(
+  clippy::too_many_arguments,
+  reason = "renderer hot path keeps pixel parameters explicit"
+)]
+#[expect(
+  clippy::cast_possible_truncation,
+  clippy::cast_sign_loss,
+  clippy::cast_precision_loss,
+  reason = "arc sampling stays within bounded cell coordinates"
+)]
 fn arc_quarter(
   canvas: &mut Canvas,
   cx: i32,
@@ -1802,7 +1973,7 @@ fn arc_quarter(
         continue;
       }
       // Coverage from the pixel's distance to the ring of radius `r`.
-      let ring = ((dxp * dxp + dyp * dyp).sqrt() - r_f).abs();
+      let ring = (dxp.hypot(dyp) - r_f).abs();
       let cov = (half + 0.5 - ring).clamp(0.0, 1.0);
       if cov > 0.0 {
         canvas.blend(px, py, fg, (cov * 255.0).round() as u8);
@@ -1815,6 +1986,12 @@ fn arc_quarter(
 /// box-drawing diagonals `╱ ╲ ╳`). Coverage is the pixel's distance from the
 /// segment, feathered over the last pixel, so the stroke is smooth rather than
 /// the hard staircase a stamped-square line produces.
+#[expect(
+  clippy::cast_possible_truncation,
+  clippy::cast_sign_loss,
+  clippy::cast_precision_loss,
+  reason = "diagonal geometry is bounded by the terminal cell"
+)]
 fn draw_diagonal(
   canvas: &mut Canvas,
   xa: i32,
@@ -1826,7 +2003,7 @@ fn draw_diagonal(
 ) {
   let (ax, ay) = (xa as f32, ya as f32);
   let (dx, dy) = ((xb - xa) as f32, (yb - ya) as f32);
-  let len2 = dx * dx + dy * dy;
+  let len2 = dy.mul_add(dy, dx * dx);
   if len2 <= 0.0 {
     return;
   }
@@ -1837,9 +2014,9 @@ fn draw_diagonal(
     for px in lo_x..=hi_x {
       let (fx, fy) = (px as f32 + 0.5, py as f32 + 0.5);
       // Distance from the pixel centre to the (clamped) segment.
-      let t = (((fx - ax) * dx + (fy - ay) * dy) / len2).clamp(0.0, 1.0);
+      let t = ((fy - ay).mul_add(dy, (fx - ax) * dx) / len2).clamp(0.0, 1.0);
       let (cx, cy) = (ax + t * dx, ay + t * dy);
-      let dist = ((fx - cx).powi(2) + (fy - cy).powi(2)).sqrt();
+      let dist = (fx - cx).hypot(fy - cy);
       let cov = (half + 0.5 - dist).clamp(0.0, 1.0);
       if cov > 0.0 {
         canvas.blend(px, py, fg, (cov * 255.0).round() as u8);
@@ -1851,7 +2028,7 @@ fn draw_diagonal(
 /// Arm weights `[up, down, left, right]` for a straight box-drawing codepoint:
 /// 0 none, 1 light, 2 heavy, 3 double. `None` for codepoints handled elsewhere
 /// (dashes, arcs, diagonals) or outside the solid-line set.
-fn box_arms(cp: u32) -> Option<[u8; 4]> {
+const fn box_arms(cp: u32) -> Option<[u8; 4]> {
   let a = match cp {
     0x2500 => [0, 0, 1, 1],
     0x2501 => [0, 0, 2, 2],
@@ -1968,6 +2145,10 @@ fn box_arms(cp: u32) -> Option<[u8; 4]> {
 }
 
 /// Draw underline, strikethrough, and overline for one cell.
+#[expect(
+  clippy::cast_possible_wrap,
+  reason = "decoration geometry is bounded by the terminal cell"
+)]
 fn draw_decorations(
   canvas: &mut Canvas,
   cell: &Cell,
@@ -1982,7 +2163,7 @@ fn draw_decorations(
   let uy = (baseline + 1).min(top + m.height as i32 - 1);
   // A `Default` underline colour follows the cell's foreground.
   let uc = match cell.underline_color {
-    crate::grid::Color::Default => fg,
+    Color::Default => fg,
     other => theme.resolve(other, Plane::Fg, false),
   };
   match cell.underline {
@@ -1994,7 +2175,7 @@ fn draw_decorations(
     },
     Underline::Curly => {
       for dx in 0..w as i32 {
-        let wobble = if (dx / 2) % 2 == 0 { 0 } else { 1 };
+        let wobble = i32::from((dx / 2) % 2 != 0);
         canvas.put(x0 + dx, uy - wobble, uc);
       }
     },
@@ -2035,6 +2216,11 @@ mod tests {
 
   /// Render one box glyph into a fresh `size`x`size` buffer and return a
   /// predicate for whether a given pixel received ink.
+  #[expect(
+    clippy::cast_sign_loss,
+    reason = "render tests call this helper only with positive cell sizes and \
+              coordinates"
+  )]
   fn render_glyph(c: char, size: i32) -> impl Fn(i32, i32) -> bool {
     let n = size as usize;
     let mut buf = vec![0u8; n * n * 4];
@@ -2178,8 +2364,8 @@ mod tests {
       blend:  AlphaBlending::Native,
     };
     let m = CellMetrics {
-      width:  n as u32,
-      height: n as u32,
+      width:  u32::try_from(n).unwrap_or(u32::MAX),
+      height: u32::try_from(n).unwrap_or(u32::MAX),
       ascent: 18,
       stroke: 2,
     };

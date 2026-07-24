@@ -76,13 +76,15 @@ impl Default for TextSize {
 impl TextSize {
   /// Whether this run is ordinary text needing no scaled layout: scale 1, no
   /// explicit width, and no fractional scale.
-  pub fn is_plain(&self) -> bool {
+  #[must_use]
+  pub const fn is_plain(&self) -> bool {
     self.scale == 1 && self.width == 0 && !self.has_fraction()
   }
 
   /// Whether a fractional scale `n/d` (with `n < d`) is in effect. Only then
   /// does the font shrink within the block and does alignment matter.
-  pub fn has_fraction(&self) -> bool {
+  #[must_use]
+  pub const fn has_fraction(&self) -> bool {
     self.numerator > 0
       && self.denominator > 0
       && self.numerator < self.denominator
@@ -90,21 +92,25 @@ impl TextSize {
 
   /// The factor to multiply the base font size by when rendering this run:
   /// the integer scale `s`, reduced by the fraction `n/d` when one is set.
+  #[must_use]
   pub fn font_scale(&self) -> f32 {
     if self.has_fraction() {
-      self.scale as f32 * self.numerator as f32 / self.denominator as f32
+      f32::from(self.scale) * f32::from(self.numerator)
+        / f32::from(self.denominator)
     } else {
-      self.scale as f32
+      f32::from(self.scale)
     }
   }
 
   /// The height of the cell block, in cells: `s`.
-  pub fn cell_height(&self) -> usize {
+  #[must_use]
+  pub const fn cell_height(&self) -> usize {
     self.scale as usize
   }
 
   /// Parse from a `&str` of metadata; convenience over [`parse`] when the
   /// caller already holds a string rather than bytes.
+  #[must_use]
   pub fn parse_str(meta: &str) -> Self {
     parse(meta.as_bytes())
   }
@@ -115,6 +121,7 @@ impl TextSize {
 /// Unknown keys and malformed pairs are ignored; out-of-range integers are
 /// clamped to the protocol's documented bounds. An empty field yields the
 /// default (ordinary text).
+#[must_use]
 pub fn parse(meta: &[u8]) -> TextSize {
   let mut ts = TextSize::default();
 
@@ -160,7 +167,7 @@ fn parse_u32(bytes: &[u8]) -> Option<u32> {
   let mut acc: u32 = 0;
   for &b in bytes {
     let d = b.checked_sub(b'0').filter(|&d| d < 10)?;
-    acc = acc.saturating_mul(10).saturating_add(d as u32);
+    acc = acc.saturating_mul(10).saturating_add(u32::from(d));
   }
   Some(acc)
 }
@@ -174,14 +181,14 @@ mod tests {
     let ts = parse(b"");
     assert_eq!(ts, TextSize::default());
     assert!(ts.is_plain());
-    assert_eq!(ts.font_scale(), 1.0);
+    assert!((ts.font_scale() - 1.0).abs() < f32::EPSILON);
   }
 
   #[test]
   fn scale_doubles_font_and_height() {
     let ts = parse(b"s=2");
     assert_eq!(ts.scale, 2);
-    assert_eq!(ts.font_scale(), 2.0);
+    assert!((ts.font_scale() - 2.0).abs() < f32::EPSILON);
     assert_eq!(ts.cell_height(), 2);
     assert!(!ts.is_plain());
   }
@@ -197,7 +204,7 @@ mod tests {
     // `n=1:d=2` with default scale: half-size font, top of the cell.
     let ts = parse(b"n=1:d=2");
     assert!(ts.has_fraction());
-    assert_eq!(ts.font_scale(), 0.5);
+    assert!((ts.font_scale() - 0.5).abs() < f32::EPSILON);
     assert_eq!(ts.valign, VAlign::Top);
   }
 
@@ -205,14 +212,14 @@ mod tests {
   fn subscript_is_bottom_aligned() {
     let ts = parse(b"n=1:d=2:v=1");
     assert_eq!(ts.valign, VAlign::Bottom);
-    assert_eq!(ts.font_scale(), 0.5);
+    assert!((ts.font_scale() - 0.5).abs() < f32::EPSILON);
   }
 
   #[test]
   fn centred_normal_size_in_double_block() {
     // `s=2:n=1:d=2:v=2`: full-size font (2 * 1/2) centred in a 2-high block.
     let ts = parse(b"s=2:n=1:d=2:v=2");
-    assert_eq!(ts.font_scale(), 1.0);
+    assert!((ts.font_scale() - 1.0).abs() < f32::EPSILON);
     assert_eq!(ts.valign, VAlign::Middle);
     assert_eq!(ts.cell_height(), 2);
   }
@@ -222,7 +229,7 @@ mod tests {
     // n >= d means no reduction and no alignment.
     let ts = parse(b"s=3:n=2:d=2");
     assert!(!ts.has_fraction());
-    assert_eq!(ts.font_scale(), 3.0);
+    assert!((ts.font_scale() - 3.0).abs() < f32::EPSILON);
   }
 
   #[test]

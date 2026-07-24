@@ -1,13 +1,13 @@
 //! Font discovery, rasterization, and glyph caching.
 //!
 //! fontconfig resolves family names and performs per-codepoint fallback;
-//! FreeType rasterizes each glyph to an 8-bit coverage mask or, for colour
+//! `FreeType` rasterizes each glyph to an 8-bit coverage mask or, for colour
 //! fonts, a pre-multiplied BGRA bitmap. Layout is fixed-cell, so a glyph's own
 //! advance is never consulted - only the [`CellMetrics`] taken from the primary
 //! face. C interop goes through the `freetype`/`fontconfig` safe wrappers; the
 //! sole `unsafe` is reading a face's fixed-strike array (see `nearest_strike`).
 
-use std::{collections::HashMap, fmt, num::NonZeroUsize, path::PathBuf};
+use std::{collections::HashMap, fmt, fs, num::NonZeroUsize, path::PathBuf};
 
 use fontconfig::{CharSet, Fontconfig, Pattern};
 use freetype::{
@@ -44,6 +44,8 @@ pub enum FontError {
   NoFamily(String),
   #[error("font {0:?} reports no size metrics")]
   NoMetrics(String),
+  #[error("glyph cache insertion failed")]
+  CacheInvariant,
 }
 
 /// Bold/italic selection, used both to pick a face and to key the glyph cache.
@@ -59,7 +61,7 @@ impl Style {
     usize::from(self.bold) | (usize::from(self.italic) << 1)
   }
 
-  fn fontconfig_style(self) -> &'static str {
+  const fn fontconfig_style(self) -> &'static str {
     match (self.bold, self.italic) {
       (false, false) => "Regular",
       (true, false) => "Bold",
@@ -99,7 +101,7 @@ pub struct Glyph {
 pub enum GlyphData {
   /// One coverage byte per pixel.
   Mask(Vec<u8>),
-  /// LCD subpixel coverage: three bytes per pixel in FreeType's horizontal
+  /// LCD subpixel coverage: three bytes per pixel in `FreeType`'s horizontal
   /// order (physically leftmost, middle, rightmost subpixel). The renderer maps
   /// these onto R/G/B according to the panel's configured [`Subpixel`] order.
   Lcd(Vec<u8>),
@@ -108,8 +110,8 @@ pub enum GlyphData {
 }
 
 /// One shaped glyph in a cluster: a glyph index into a specific face plus the
-/// pixel offset, relative to the cell origin and baseline, that HarfBuzz placed
-/// it at. `x` grows rightward, `y` upward (away from the baseline).
+/// pixel offset, relative to the cell origin and baseline, that `HarfBuzz`
+/// placed it at. `x` grows rightward, `y` upward (away from the baseline).
 #[derive(Clone, Copy, Debug)]
 pub struct Placed {
   pub gid: u32,
@@ -125,13 +127,13 @@ pub struct ShapedCluster {
   pub glyphs:   Vec<Placed>,
 }
 
-/// A loaded face plus where it came from, so HarfBuzz can be handed the same
-/// font bytes that FreeType rasterizes from.
+/// A loaded face plus where it came from, so `HarfBuzz` can be handed the same
+/// font bytes that `FreeType` rasterizes from.
 struct FaceEntry {
   face:  Face,
   path:  PathBuf,
   index: u32,
-  /// HarfBuzz font for this face, built on first shape against it.
+  /// `HarfBuzz` font for this face, built on first shape against it.
   hb:    Option<harfbuzz::Owned<harfbuzz::Font<'static>>>,
 }
 
@@ -167,14 +169,14 @@ impl fmt::Debug for Fonts {
       .field("metrics", &self.metrics)
       .field("faces", &self.faces.len())
       .field("cached", &self.cache.len())
-      .finish()
+      .finish_non_exhaustive()
   }
 }
 
 impl Fonts {
   /// Resolve `family` at `size_px` and compute the cell metrics. `subpixel`
-  /// selects LCD rendering; it is downgraded to grayscale if the FreeType build
-  /// lacks LCD-filter support.
+  /// selects LCD rendering; it is downgraded to grayscale if the `FreeType`
+  /// build lacks LCD-filter support.
   pub fn new(
     family: &str,
     size_px: u32,
@@ -198,7 +200,7 @@ impl Fonts {
       resolve_face(&library, &fontconfig, family, Style::default(), size_px)?;
     let metrics = cell_metrics(&regular.face, family)?;
 
-    let cap = |n| NonZeroUsize::new(n).expect("cache cap is nonzero");
+    let cap = |n| NonZeroUsize::new(n).ok_or(FontError::CacheInvariant);
     Ok(Self {
       library,
       fontconfig,
@@ -209,18 +211,18 @@ impl Fonts {
       faces: vec![regular],
       styled: [Some(0), None, None, None],
       fallbacks: HashMap::new(),
-      cache: LruCache::new(cap(GLYPH_CACHE_CAP)),
-      gcache: LruCache::new(cap(GLYPH_CACHE_CAP)),
-      shape_cache: LruCache::new(cap(SHAPE_CACHE_CAP)),
+      cache: LruCache::new(cap(GLYPH_CACHE_CAP)?),
+      gcache: LruCache::new(cap(GLYPH_CACHE_CAP)?),
+      shape_cache: LruCache::new(cap(SHAPE_CACHE_CAP)?),
     })
   }
 
-  pub fn metrics(&self) -> CellMetrics {
+  pub const fn metrics(&self) -> CellMetrics {
     self.metrics
   }
 
   /// The active subpixel order; `None` when rendering grayscale coverage.
-  pub fn subpixel(&self) -> Subpixel {
+  pub const fn subpixel(&self) -> Subpixel {
     self.subpixel
   }
 
@@ -238,12 +240,12 @@ impl Fonts {
       let glyph = rasterize(face, c, synth_bold, synth_italic, lcd)?;
       self.cache.put(key, glyph);
     }
-    Ok(self.cache.get(&key).expect("glyph was just inserted"))
+    self.cache.get(&key).ok_or(FontError::CacheInvariant)
   }
 
   /// Return the rasterized glyph for glyph index `gid` in `face_idx`,
   /// rasterizing and caching on first use. Used by the shaped path, where
-  /// HarfBuzz has already chosen the face and glyph.
+  /// `HarfBuzz` has already chosen the face and glyph.
   pub fn glyph_indexed(
     &mut self,
     face_idx: usize,
@@ -258,7 +260,7 @@ impl Fonts {
       let glyph = rasterize_index(face, gid, synth_bold, synth_italic, lcd)?;
       self.gcache.put(key, glyph);
     }
-    Ok(self.gcache.get(&key).expect("glyph was just inserted"))
+    self.gcache.get(&key).ok_or(FontError::CacheInvariant)
   }
 
   /// Rasterize `c` in `style` at `scale` times the base size, uncached.
@@ -282,7 +284,7 @@ impl Fonts {
   }
 
   /// Shape `base` plus its combining `marks` into positioned glyphs using
-  /// HarfBuzz, so marks land where the font's GPOS table wants them rather
+  /// `HarfBuzz`, so marks land where the font's GPOS table wants them rather
   /// than stacked at the origin. Returns `None` when shaping is unavailable or
   /// the cluster has glyphs the face does not cover (`.notdef`), so the caller
   /// can fall back to drawing the marks stacked. Results are cached.
@@ -335,8 +337,8 @@ impl Fonts {
     Some(ShapedCluster { face_idx, glyphs })
   }
 
-  /// Lazily build the HarfBuzz font for `face_idx` from the same file bytes
-  /// FreeType loaded. The bytes are leaked to `'static`: a face lives for the
+  /// Lazily build the `HarfBuzz` font for `face_idx` from the same file bytes
+  /// `FreeType` loaded. The bytes are leaked to `'static`: a face lives for the
   /// process, and only the handful actually used to shape clusters allocate.
   fn hb_font(
     &mut self,
@@ -344,11 +346,11 @@ impl Fonts {
   ) -> Option<&harfbuzz::Owned<harfbuzz::Font<'static>>> {
     if self.faces[face_idx].hb.is_none() {
       let entry = &self.faces[face_idx];
-      let bytes = std::fs::read(&entry.path).ok()?;
+      let bytes = fs::read(&entry.path).ok()?;
       let leaked: &'static [u8] = Box::leak(bytes.into_boxed_slice());
       let face = harfbuzz::Face::from_bytes(leaked, entry.index);
       let mut font = harfbuzz::Font::new(face);
-      let scale = self.size_px as i32 * 64;
+      let scale = i32::try_from(self.size_px).unwrap_or(i32::MAX) * 64;
       font.set_scale(scale, scale);
       font.set_ppem(self.size_px, self.size_px);
       self.faces[face_idx].hb = Some(font);
@@ -384,8 +386,7 @@ impl Fonts {
     if let Some(idx) = self.styled[style.index()] {
       return Ok(idx);
     }
-    let regular =
-      self.styled[0].expect("regular face is loaded at construction");
+    let regular = self.styled[0].ok_or(FontError::CacheInvariant)?;
     let idx = match resolve_face(
       &self.library,
       &self.fontconfig,
@@ -417,14 +418,16 @@ impl Fonts {
       return Ok(Some(idx));
     }
     let index = matched.face_index().unwrap_or(0);
-    let face = self.library.new_face(&path, index as isize)?;
+    let face = self
+      .library
+      .new_face(&path, isize::try_from(index).unwrap_or(isize::MAX))?;
     if size_face(&face, self.size_px).is_err() {
       return Ok(None);
     }
     self.faces.push(FaceEntry {
       face,
       path: path.clone(),
-      index: index as u32,
+      index: u32::try_from(index).unwrap_or(u32::MAX),
       hb: None,
     });
     let idx = self.faces.len() - 1;
@@ -434,7 +437,9 @@ impl Fonts {
 }
 
 fn face_has_glyph(face: &Face, c: char) -> bool {
-  face.get_char_index(c as usize).is_some_and(|g| g != 0)
+  face
+    .get_char_index(usize::try_from(u32::from(c)).unwrap_or(usize::MAX))
+    .is_some_and(|g| g != 0)
 }
 
 /// Whether bold/italic must be synthesized: only when the requested style is
@@ -457,12 +462,13 @@ fn resolve_face(
     .find(family, Some(style.fontconfig_style()))
     .map_err(|_| FontError::NoFamily(family.to_owned()))?;
   let index = font.index.unwrap_or(0);
-  let face = library.new_face(&font.path, index as isize)?;
+  let face = library
+    .new_face(&font.path, isize::try_from(index).unwrap_or(isize::MAX))?;
   size_face(&face, size_px)?;
   Ok(FaceEntry {
     face,
     path: font.path,
-    index: index as u32,
+    index: u32::try_from(index).unwrap_or(u32::MAX),
     hb: None,
   })
 }
@@ -482,6 +488,11 @@ fn size_face(face: &Face, size_px: u32) -> Result<(), FontError> {
 }
 
 /// Index of the fixed strike whose pixel height is closest to `target`.
+#[expect(
+  unsafe_code,
+  reason = "FreeType exposes fixed strikes only through its validated raw \
+            face record"
+)]
 fn nearest_strike(face: &Face, target: u32) -> i32 {
   let rec = face.raw();
   let target = i32::try_from(target).unwrap_or(i32::MAX);
@@ -490,8 +501,12 @@ fn nearest_strike(face: &Face, target: u32) -> i32 {
   for i in 0..rec.num_fixed_sizes {
     // SAFETY: `available_sizes` points to `num_fixed_sizes` valid
     // `FT_Bitmap_Size` entries for the face's lifetime; `i` is in range.
-    let height =
-      i32::from(unsafe { (*rec.available_sizes.offset(i as isize)).height });
+    let height = i32::from(unsafe {
+      (*rec
+        .available_sizes
+        .offset(isize::try_from(i).unwrap_or(isize::MAX)))
+      .height
+    });
     let delta = (height - target).abs();
     if delta < best_delta {
       best = i;
@@ -506,19 +521,24 @@ fn cell_metrics(face: &Face, family: &str) -> Result<CellMetrics, FontError> {
     .size_metrics()
     .ok_or_else(|| FontError::NoMetrics(family.to_owned()))?;
   // FreeType reports these in 26.6 fixed point.
-  let ascent = (metrics.ascender >> 6).max(1) as u32;
-  let height = (metrics.height >> 6).max(1) as u32;
+  let ascent =
+    u32::try_from((metrics.ascender >> 6).max(1)).unwrap_or(u32::MAX);
+  let height = u32::try_from((metrics.height >> 6).max(1)).unwrap_or(u32::MAX);
 
   // For a monospace face every advance is equal; measure one ASCII glyph.
-  face.load_char('M' as usize, LoadFlag::DEFAULT)?;
-  let width = (face.glyph().advance().x >> 6).max(1) as u32;
+  face.load_char(
+    usize::try_from(u32::from('M')).unwrap_or(usize::MAX),
+    LoadFlag::DEFAULT,
+  )?;
+  let width =
+    u32::try_from((face.glyph().advance().x >> 6).max(1)).unwrap_or(u32::MAX);
 
   // Scale the face's underline thickness (font units) to pixels via the size's
   // y-scale: `FT_MulFix` gives 26.6 pixels, then `>> 6`. Bitmap/colour faces
   // may report zero, so fall back to a small fraction of the cell height.
   let raw = i64::from(face.underline_thickness());
   let scaled = (raw * metrics.y_scale + 0x8000) >> 16;
-  let underline_px = (scaled >> 6).max(0) as u32;
+  let underline_px = u32::try_from((scaled >> 6).max(0)).unwrap_or(u32::MAX);
   let stroke = if underline_px > 0 {
     underline_px
   } else {
@@ -542,7 +562,7 @@ fn rasterize(
 ) -> Result<Glyph, FontError> {
   let flags = load_flags(lcd);
   rasterize_with(face, synth_bold, synth_italic, |face| {
-    face.load_char(c as usize, flags)
+    face.load_char(usize::try_from(u32::from(c)).unwrap_or(usize::MAX), flags)
   })
 }
 
@@ -561,8 +581,8 @@ fn rasterize_index(
 }
 
 /// Load flags for a normal render: `TARGET_LCD` requests horizontal subpixel
-/// coverage; otherwise FreeType renders 8-bit grayscale. `COLOR` still yields a
-/// BGRA bitmap for colour glyphs regardless of the target.
+/// coverage; otherwise `FreeType` renders 8-bit grayscale. `COLOR` still yields
+/// a BGRA bitmap for colour glyphs regardless of the target.
 fn load_flags(lcd: bool) -> LoadFlag {
   let mut flags = LoadFlag::RENDER | LoadFlag::COLOR;
   if lcd {
@@ -574,6 +594,10 @@ fn load_flags(lcd: bool) -> LoadFlag {
 /// Rasterize `c` with the outline scaled by `scale` (and sheared if italic is
 /// synthesized). The transform is reset before returning so the face is left as
 /// it was found.
+#[expect(
+  clippy::cast_possible_truncation,
+  reason = "FreeType requires a bounded 16.16 fixed-point transform"
+)]
 fn rasterize_scaled(
   face: &Face,
   c: char,
@@ -595,14 +619,17 @@ fn rasterize_scaled(
     yy: (scale * 65536.0).round() as _,
   };
   face.set_transform(&mut matrix, &mut Vector { x: 0, y: 0 });
-  let result = face.load_char(c as usize, LoadFlag::RENDER | LoadFlag::COLOR);
+  let result = face.load_char(
+    usize::try_from(u32::from(c)).unwrap_or(usize::MAX),
+    LoadFlag::RENDER | LoadFlag::COLOR,
+  );
   face.set_transform(&mut identity_matrix(), &mut Vector { x: 0, y: 0 });
   result?;
 
   let slot = face.glyph();
   let bitmap = slot.bitmap();
-  let width = bitmap.width().max(0) as usize;
-  let height = bitmap.rows().max(0) as usize;
+  let width = usize::try_from(bitmap.width().max(0)).unwrap_or(usize::MAX);
+  let height = usize::try_from(bitmap.rows().max(0)).unwrap_or(usize::MAX);
   let pitch = bitmap.pitch();
   let src = bitmap.buffer();
   let mut data = match bitmap.pixel_mode()? {
@@ -619,8 +646,8 @@ fn rasterize_scaled(
   Ok(Glyph {
     left: slot.bitmap_left(),
     top: slot.bitmap_top(),
-    width: width as u32,
-    height: height as u32,
+    width: u32::try_from(width).unwrap_or(u32::MAX),
+    height: u32::try_from(height).unwrap_or(u32::MAX),
     data,
   })
 }
@@ -646,8 +673,8 @@ fn rasterize_with(
   let bitmap = slot.bitmap();
   // For an LCD bitmap this is the subpixel column count (three per pixel); for
   // every other mode it is the pixel width.
-  let cols = bitmap.width().max(0) as usize;
-  let height = bitmap.rows().max(0) as usize;
+  let cols = usize::try_from(bitmap.width().max(0)).unwrap_or(usize::MAX);
+  let height = usize::try_from(bitmap.rows().max(0)).unwrap_or(usize::MAX);
   let pitch = bitmap.pitch();
   let src = bitmap.buffer();
 
@@ -688,13 +715,13 @@ fn rasterize_with(
   Ok(Glyph {
     left: slot.bitmap_left(),
     top: slot.bitmap_top(),
-    width: width as u32,
-    height: height as u32,
+    width: u32::try_from(width).unwrap_or(u32::MAX),
+    height: u32::try_from(height).unwrap_or(u32::MAX),
     data,
   })
 }
 
-fn shear_matrix() -> Matrix {
+const fn shear_matrix() -> Matrix {
   // ~0.2 horizontal shear in 16.16 fixed point.
   Matrix {
     xx: 0x1_0000,
@@ -704,7 +731,7 @@ fn shear_matrix() -> Matrix {
   }
 }
 
-fn identity_matrix() -> Matrix {
+const fn identity_matrix() -> Matrix {
   Matrix {
     xx: 0x1_0000,
     xy: 0,
@@ -738,7 +765,7 @@ fn embolden_lcd(sub: &mut [u8], width: usize, height: usize) {
   }
 }
 
-/// Copy `height` rows of `row_bytes` each out of FreeType's padded buffer,
+/// Copy `height` rows of `row_bytes` each out of `FreeType`'s padded buffer,
 /// honouring pitch sign (positive = top-down).
 fn pack_rows(
   src: &[u8],
@@ -746,7 +773,7 @@ fn pack_rows(
   pitch: i32,
   height: usize,
 ) -> Vec<u8> {
-  let stride = pitch.unsigned_abs() as usize;
+  let stride = usize::try_from(pitch.unsigned_abs()).unwrap_or(usize::MAX);
   let take = row_bytes.min(stride);
   let mut out = vec![0u8; row_bytes * height];
   for row in 0..height {
@@ -762,7 +789,7 @@ fn pack_rows(
 
 /// Expand a 1-bit-per-pixel mono bitmap to one coverage byte per pixel.
 fn expand_mono(src: &[u8], width: usize, pitch: i32, height: usize) -> Vec<u8> {
-  let stride = pitch.unsigned_abs() as usize;
+  let stride = usize::try_from(pitch.unsigned_abs()).unwrap_or(usize::MAX);
   let mut out = vec![0u8; width * height];
   for row in 0..height {
     let src_row = if pitch >= 0 { row } else { height - 1 - row };
@@ -800,7 +827,7 @@ mod tests {
     assert!(glyph.width > 0 && glyph.height > 0);
     match &glyph.data {
       GlyphData::Mask(px) | GlyphData::Lcd(px) => {
-        assert!(px.iter().any(|&p| p > 0), "M should have coverage")
+        assert!(px.iter().any(|&p| p > 0), "M should have coverage");
       },
       GlyphData::Color(_) => {},
     }
@@ -837,7 +864,7 @@ mod tests {
       .expect("rasterize shaped glyph");
     match &g.data {
       GlyphData::Mask(px) | GlyphData::Lcd(px) => {
-        assert!(px.iter().any(|&p| p > 0), "'a' should have ink")
+        assert!(px.iter().any(|&p| p > 0), "'a' should have ink");
       },
       GlyphData::Color(_) => {},
     }

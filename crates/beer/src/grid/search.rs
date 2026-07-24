@@ -1,4 +1,4 @@
-use super::*;
+use super::Grid;
 
 /// One scrollback-search hit: a run of `len` cells at absolute `(row, col)`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -117,6 +117,12 @@ impl Grid {
 
   /// Scroll the viewport so the focused match is on screen, centering it only
   /// when it would otherwise be off the visible range.
+  #[expect(
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    reason = "scroll coordinates are bounded by the allocated grid and are \
+              converted for signed clamping"
+  )]
   fn jump_to_current(&mut self) {
     let Some(abs) = self
       .search

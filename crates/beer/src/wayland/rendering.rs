@@ -1,4 +1,15 @@
-use super::*;
+use super::{
+  App,
+  Buffer,
+  Cell,
+  CursorShape,
+  FrameCallbackData,
+  Grid,
+  MAX_BUFFERS,
+  WaylandSurface,
+  wl_shm,
+};
+use crate::grid::Flags;
 
 /// What determines one rendered row's pixels: its cells, the cursor on it, the
 /// selection span over it, and the blink phase. Two equal `RowSnap`s render
@@ -41,9 +52,7 @@ fn row_snap(
   let abs = grid.view_to_abs(y);
   let cells = grid.view_row(y).to_vec();
   let cursor = row_cursor(grid, y, focused, blink_on);
-  let has_blink = cells
-    .iter()
-    .any(|c| c.flags.contains(crate::grid::Flags::BLINK));
+  let has_blink = cells.iter().any(|c| c.flags.contains(Flags::BLINK));
   RowSnap {
     cells,
     cursor,
@@ -73,7 +82,7 @@ fn row_matches(
   let blink = if grid
     .view_row(y)
     .iter()
-    .any(|c| c.flags.contains(crate::grid::Flags::BLINK))
+    .any(|c| c.flags.contains(Flags::BLINK))
   {
     blink_on
   } else {
@@ -105,6 +114,11 @@ fn row_cursor(
     None
   }
 }
+#[expect(
+  clippy::cast_possible_wrap,
+  clippy::cast_possible_truncation,
+  reason = "Wayland surface dimensions are bounded compositor geometry"
+)]
 impl App {
   /// Render only the rows of window `idx` that changed since the chosen buffer
   /// last displayed them, damage just those rows, and commit with a
@@ -144,7 +158,7 @@ impl App {
     let grid = session.term.grid();
     // The visual bell inverts fg/bg for the duration of the flash.
     let flashed = win.flashing.then(|| session.term.theme().inverted());
-    let theme = flashed.as_ref().unwrap_or(session.term.theme());
+    let theme = flashed.as_ref().unwrap_or_else(|| session.term.theme());
     let rows = grid.rows();
 
     // The search prompt occupies the bottom row while search mode is active.

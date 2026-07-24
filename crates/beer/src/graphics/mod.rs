@@ -11,13 +11,17 @@
 
 use std::{
   collections::HashMap,
-  io::{BufReader, Cursor, Read, SeekFrom},
+  env,
+  fs::{self, File},
+  io::{self, BufReader, Cursor, Read, Seek, SeekFrom},
+  str,
 };
 
 use beer_protocols::{
   codec::base64_decode,
   graphics::{Action, Format, GraphicsCommand, Medium},
 };
+use flate2::read::ZlibDecoder;
 
 /// Cap on a single image's pixel buffer (decoded RGBA), guarding against a
 /// client claiming an enormous size. 64 MiB is far beyond any real preview.
@@ -94,7 +98,7 @@ impl Image {
   }
 
   /// Whether this image has more than one frame and is actively playing.
-  fn is_animating(&self) -> bool {
+  const fn is_animating(&self) -> bool {
     self.playing && self.frames.len() > 1
   }
 
@@ -276,7 +280,9 @@ impl Graphics {
     cell_px: (u32, u32),
   ) -> Outcome {
     let done = {
-      let pending = self.pending.as_mut().expect("pending checked by caller");
+      let Some(pending) = self.pending.as_mut() else {
+        return respond_error(&cont, "EINVAL: missing pending transmission");
+      };
       push_capped(&mut pending.b64, payload, MAX_TRANSMIT_BYTES);
       // The last chunk carries m=0; the opening command's geometry is used.
       !cont.more
@@ -284,8 +290,9 @@ impl Graphics {
     if !done {
       return Outcome::default();
     }
-    let Pending { cmd, b64 } =
-      self.pending.take().expect("pending checked by caller");
+    let Some(Pending { cmd, b64 }) = self.pending.take() else {
+      return respond_error(&cont, "EINVAL: missing pending transmission");
+    };
     self.finalize_b64(cmd, &b64, cell_px)
   }
 
@@ -305,7 +312,7 @@ impl Graphics {
     b64: &[u8],
     cell_px: (u32, u32),
   ) -> Outcome {
-    match self.load_pixels(&cmd, b64) {
+    match Self::load_pixels(&cmd, b64) {
       Ok(pixels) => {
         if cmd.action == Action::Query {
           // Verify only: report success, store nothing.
@@ -313,7 +320,7 @@ impl Graphics {
         }
         if cmd.action == Action::Frame {
           // Animation frame data for an existing image.
-          return self.add_frame(&cmd, pixels);
+          return self.add_frame(&cmd, &pixels);
         }
         let id = self.store(&cmd, pixels);
         if cmd.action == Action::TransmitAndDisplay {
@@ -329,11 +336,7 @@ impl Graphics {
   }
 
   /// Decode the transmitted payload into RGBA [`Pixels`].
-  fn load_pixels(
-    &self,
-    cmd: &GraphicsCommand,
-    b64: &[u8],
-  ) -> Result<Pixels, String> {
+  fn load_pixels(cmd: &GraphicsCommand, b64: &[u8]) -> Result<Pixels, String> {
     let raw = base64_decode(b64).ok_or("EINVAL: bad base64 payload")?;
     if raw.len() > MAX_SOURCE_BYTES {
       return Err("EINVAL: source data too large".into());
@@ -378,7 +381,7 @@ impl Graphics {
   /// onto a base canvas - a chosen base frame (`c`) or transparent black -
   /// inside the destination rectangle `(x, y)` sized to the data, then stored
   /// as a new frame or, with `r`, used to replace frame `r`.
-  fn add_frame(&mut self, cmd: &GraphicsCommand, pixels: Pixels) -> Outcome {
+  fn add_frame(&mut self, cmd: &GraphicsCommand, pixels: &Pixels) -> Outcome {
     let Some(id) = self.resolve_id(cmd) else {
       return respond_error(cmd, "ENOENT: no such image");
     };
@@ -395,7 +398,7 @@ impl Graphics {
       &mut canvas,
       img.width,
       img.height,
-      &pixels,
+      pixels,
       (cmd.x, cmd.y),
       cmd.cap_x == 1,
     );
@@ -502,11 +505,12 @@ impl Graphics {
 
   /// Display an already-stored image (`a=p`).
   fn put(&mut self, cmd: GraphicsCommand, cell_px: (u32, u32)) -> Outcome {
-    let id = self.resolve_id(&cmd);
-    if id.is_none() || !self.images.contains_key(&id.unwrap()) {
+    let Some(id) = self.resolve_id(&cmd) else {
+      return respond_error(&cmd, "ENOENT: no such image");
+    };
+    if !self.images.contains_key(&id) {
       return respond_error(&cmd, "ENOENT: no such image");
     }
-    let id = id.unwrap();
     let mut out = self.display(id, &cmd, cell_px);
     out.response = respond(&cmd, "OK").response;
     out
@@ -546,8 +550,8 @@ impl Graphics {
     let placement_id = cmd.placement;
     self.placements.insert((id, placement_id), Placement {
       image: id,
-      cols: cols.min(u16::MAX as usize) as u16,
-      rows: rows.min(u16::MAX as usize) as u16,
+      cols: u16::try_from(cols.min(usize::from(u16::MAX))).unwrap_or(u16::MAX),
+      rows: u16::try_from(rows.min(usize::from(u16::MAX))).unwrap_or(u16::MAX),
       src_x: cmd.x,
       src_y: cmd.y,
       src_w,
@@ -586,7 +590,6 @@ impl Graphics {
   fn delete(&mut self, cmd: GraphicsCommand) -> Outcome {
     let free = cmd.delete_frees_data();
     let spec = match cmd.delete.to_ascii_lowercase() {
-      0 | b'a' => ClearSpec::All,
       b'i' => {
         let id = cmd.id;
         if cmd.placement != 0 {
@@ -686,7 +689,8 @@ fn aspect_cells(
   let numerator =
     u128::from(cells) * u128::from(cell_px) * u128::from(source_num);
   let denominator = u128::from(source_den) * u128::from(other_cell_px);
-  (numerator / denominator).max(1).min(u128::from(u32::MAX)) as u32
+  u32::try_from((numerator / denominator).max(1).min(u128::from(u32::MAX)))
+    .unwrap_or(u32::MAX)
 }
 
 /// Decode transmitted bytes into RGBA [`Pixels`] per the command's format.
@@ -698,8 +702,10 @@ fn decode(cmd: &GraphicsCommand, bytes: Vec<u8>) -> Result<Pixels, String> {
         image::ImageFormat::Png,
       );
       let mut limits = image::Limits::default();
-      limits.max_image_width = Some((MAX_IMAGE_BYTES / 4) as u32);
-      limits.max_image_height = Some((MAX_IMAGE_BYTES / 4) as u32);
+      limits.max_image_width =
+        Some(u32::try_from(MAX_IMAGE_BYTES / 4).unwrap_or(u32::MAX));
+      limits.max_image_height =
+        Some(u32::try_from(MAX_IMAGE_BYTES / 4).unwrap_or(u32::MAX));
       limits.max_alloc = Some(MAX_IMAGE_BYTES as u64);
       reader.limits(limits);
       let img = reader.decode().map_err(|e| format!("EINVAL: {e}"))?;
@@ -771,11 +777,11 @@ fn push_capped(buf: &mut Vec<u8>, data: &[u8], cap: usize) {
 /// The stored gap for a frame from its `z` value: zero keeps the default
 /// (played as 40ms), a negative value is gapless (stored as 1ms, advanced at
 /// once), a positive value is taken as milliseconds.
-fn frame_gap(z: i32) -> u32 {
+const fn frame_gap(z: i32) -> u32 {
   match z {
     0 => 0,
     n if n < 0 => 1,
-    n => n as u32,
+    n => n.cast_unsigned(),
   }
 }
 
@@ -810,7 +816,10 @@ fn compose_rect(
 /// Copy a `(w, h)` region of `src` (an `iw` by `ih` frame) at `soff` onto `dst`
 /// (also `iw` by `ih`) at `doff`, clipped to the image, blending unless
 /// `overwrite`.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+  clippy::too_many_arguments,
+  reason = "protocol operation mirrors kitty's parameter set"
+)]
 fn compose_frames(
   dst: &mut [u8],
   iw: u32,
@@ -848,14 +857,18 @@ fn blend_into(dst: &mut [u8], src: &[u8], overwrite: bool) {
   }
   let (a, inv) = (u32::from(src[3]), u32::from(255 - src[3]));
   for i in 0..3 {
-    dst[i] = ((u32::from(src[i]) * a + u32::from(dst[i]) * inv) / 255) as u8;
+    dst[i] =
+      u8::try_from((u32::from(src[i]) * a + u32::from(dst[i]) * inv) / 255)
+        .unwrap_or(u8::MAX);
   }
-  dst[3] = (a + u32::from(dst[3]) * inv / 255).min(255) as u8;
+  dst[3] =
+    u8::try_from((a + u32::from(dst[3]) * inv / 255).min(u32::from(u8::MAX)))
+      .unwrap_or(u8::MAX);
 }
 
 /// zlib-inflate `o=z` payloads.
 fn inflate(bytes: &[u8]) -> Result<Vec<u8>, String> {
-  let mut decoder = flate2::read::ZlibDecoder::new(bytes);
+  let mut decoder = ZlibDecoder::new(bytes);
   read_limited(&mut decoder, MAX_SOURCE_BYTES)
     .map_err(|e| format!("EINVAL: zlib: {e}"))
 }
@@ -865,20 +878,20 @@ fn inflate(bytes: &[u8]) -> Result<Vec<u8>, String> {
 /// length. A temp file is deleted after reading when it is clearly a graphics
 /// temp file in a known temp directory.
 fn read_source(cmd: &GraphicsCommand, name: &[u8]) -> Result<Vec<u8>, String> {
-  let name = std::str::from_utf8(name)
-    .map_err(|_| "EINVAL: non-UTF-8 path".to_string())?;
+  let name =
+    str::from_utf8(name).map_err(|_| "EINVAL: non-UTF-8 path".to_string())?;
   let data = match cmd.medium {
     Medium::SharedMemory => read_shm(name, cmd.read_offset, cmd.read_size)?,
     _ => read_file(name, cmd.read_offset, cmd.read_size)?,
   };
   if cmd.medium == Medium::TempFile && is_safe_temp(name) {
-    let _ = std::fs::remove_file(name);
+    let _ = fs::remove_file(name);
   }
   Ok(data)
 }
 
 fn read_file(path: &str, offset: u32, size: u32) -> Result<Vec<u8>, String> {
-  let mut f = std::fs::File::open(path).map_err(|e| format!("EBADF: {e}"))?;
+  let mut f = File::open(path).map_err(|e| format!("EBADF: {e}"))?;
   read_region(&mut f, offset, size)
 }
 
@@ -888,19 +901,19 @@ fn read_shm(name: &str, offset: u32, size: u32) -> Result<Vec<u8>, String> {
   use rustix::shm;
   let fd = shm::open(name, shm::OFlags::RDONLY, shm::Mode::empty())
     .map_err(|e| format!("EBADF: shm {e}"))?;
-  let mut f = std::fs::File::from(fd);
+  let mut f = File::from(fd);
   let data = read_region(&mut f, offset, size);
   let _ = shm::unlink(name);
   data
 }
 
-fn read_region<R: Read + std::io::Seek>(
+fn read_region<R: Read + Seek>(
   f: &mut R,
   offset: u32,
   size: u32,
 ) -> Result<Vec<u8>, String> {
   if offset != 0 {
-    f.seek(SeekFrom::Start(offset as u64))
+    f.seek(SeekFrom::Start(u64::from(offset)))
       .map_err(|e| format!("EIO: {e}"))?;
   }
   if size != 0 {
@@ -919,10 +932,7 @@ fn read_region<R: Read + std::io::Seek>(
 /// Read one source without letting a special file or decompressor grow an
 /// unbounded buffer. Read one byte beyond the cap to distinguish exact-limit
 /// input from an oversized stream.
-fn read_limited<R: Read>(
-  reader: &mut R,
-  limit: usize,
-) -> std::io::Result<Vec<u8>> {
+fn read_limited<R: Read>(reader: &mut R, limit: usize) -> io::Result<Vec<u8>> {
   let mut out = Vec::new();
   let mut chunk = [0u8; 8192];
   loop {
@@ -931,8 +941,8 @@ fn read_limited<R: Read>(
       return match reader.read(&mut extra)? {
         0 => Ok(out),
         _ => {
-          Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
+          Err(io::Error::new(
+            io::ErrorKind::InvalidData,
             "source data too large",
           ))
         },
@@ -954,7 +964,7 @@ fn is_safe_temp(path: &str) -> bool {
   if !path.contains("tty-graphics-protocol") {
     return false;
   }
-  let tmpdir = std::env::var("TMPDIR").unwrap_or_default();
+  let tmpdir = env::var("TMPDIR").unwrap_or_default();
   let roots = ["/tmp/", "/dev/shm/", "/var/tmp/"];
   roots.iter().any(|r| path.starts_with(r))
     || (!tmpdir.is_empty() && path.starts_with(&tmpdir))

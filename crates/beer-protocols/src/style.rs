@@ -73,7 +73,8 @@ pub enum PromptKind {
 }
 
 /// Map an OSC 133 mark letter (`A`/`B`/`C`/`D`) to a [`PromptKind`].
-pub fn prompt_kind(b: u8) -> Option<PromptKind> {
+#[must_use]
+pub const fn prompt_kind(b: u8) -> Option<PromptKind> {
   match b {
     b'A' => Some(PromptKind::PromptStart),
     b'B' => Some(PromptKind::CmdStart),

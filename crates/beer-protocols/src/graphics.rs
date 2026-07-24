@@ -85,7 +85,7 @@ pub struct GraphicsCommand {
   pub read_size:         u32,
   /// `O`: byte offset to start reading a file/shared-memory object from.
   pub read_offset:       u32,
-  /// `i`: image id (1..=u32::MAX; 0 means unset).
+  /// `i`: image id (`1..=u32::MAX`; 0 means unset).
   pub id:                u32,
   /// `I`: image number, an alternative client-side handle.
   pub number:            u32,
@@ -134,7 +134,8 @@ pub struct GraphicsCommand {
 
 impl GraphicsCommand {
   /// Whether a `d`-key delete frees the stored image data (uppercase variant).
-  pub fn delete_frees_data(&self) -> bool {
+  #[must_use]
+  pub const fn delete_frees_data(&self) -> bool {
     self.delete.is_ascii_uppercase()
   }
 }
@@ -179,14 +180,19 @@ const DIACRITICS: [u32; 297] = [
 
 /// The value a placeholder diacritic encodes (its position in the table), or
 /// `None` if `c` is not one of the protocol's row/column diacritics.
+#[must_use]
 pub fn diacritic_value(c: char) -> Option<u32> {
   let cp = c as u32;
-  DIACRITICS.iter().position(|&d| d == cp).map(|i| i as u32)
+  DIACRITICS
+    .iter()
+    .position(|&d| d == cp)
+    .and_then(|i| u32::try_from(i).ok())
 }
 
 /// Parse the control-data field of a graphics command (everything between
 /// `ESC _ G` and the `;` that precedes the payload). Unknown keys and malformed
 /// pairs are ignored; an empty field yields the default command.
+#[must_use]
 pub fn parse(control: &[u8]) -> GraphicsCommand {
   let mut cmd = GraphicsCommand::default();
   for pair in control.split(|&b| b == b',') {
@@ -265,7 +271,7 @@ fn set_u32(slot: &mut u32, value: &[u8]) {
 
 fn set_u8(slot: &mut u8, value: &[u8]) {
   if let Some(v) = parse_u32(value) {
-    *slot = v.min(u8::MAX as u32) as u8;
+    *slot = u8::try_from(v.min(u32::from(u8::MAX))).unwrap_or(u8::MAX);
   }
 }
 
@@ -283,7 +289,7 @@ fn parse_u32(bytes: &[u8]) -> Option<u32> {
   let mut acc: u32 = 0;
   for &b in bytes {
     let d = b.checked_sub(b'0').filter(|&d| d < 10)?;
-    acc = acc.saturating_mul(10).saturating_add(d as u32);
+    acc = acc.saturating_mul(10).saturating_add(u32::from(d));
   }
   Some(acc)
 }
@@ -296,9 +302,13 @@ fn parse_i32(bytes: &[u8]) -> Option<i32> {
   };
   let mag = parse_u32(digits)?;
   Some(if neg {
-    -(mag.min(i32::MAX as u32 + 1) as i64) as i32
+    i32::try_from(-i64::from(
+      mag.min(u32::try_from(i32::MAX).unwrap_or(u32::MAX) + 1),
+    ))
+    .unwrap_or(i32::MIN)
   } else {
-    mag.min(i32::MAX as u32) as i32
+    i32::try_from(mag.min(u32::try_from(i32::MAX).unwrap_or(u32::MAX)))
+      .unwrap_or(i32::MAX)
   })
 }
 

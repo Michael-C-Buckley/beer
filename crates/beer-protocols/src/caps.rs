@@ -3,6 +3,7 @@
 /// Look up a terminfo capability beer reports via XTGETTCAP, by its terminfo
 /// name. `None` means the capability is unknown (the reply is then a negative
 /// `DCS 0 + r`).
+#[must_use]
 pub fn cap_value(name: &[u8]) -> Option<&'static str> {
   match name {
     b"TN" => Some("beer"),

@@ -55,13 +55,10 @@ impl Action {
 }
 
 /// A parsed chord: a key plus the modifiers that must be held exactly.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, Debug)]
 struct Chord {
-  key:   Keysym,
-  ctrl:  bool,
-  shift: bool,
-  alt:   bool,
-  logo:  bool,
+  key:  Keysym,
+  mods: Modifiers,
 }
 
 impl Chord {
@@ -80,22 +77,26 @@ impl Chord {
       }
     }
     Some(Self {
-      key: key?,
-      ctrl,
-      shift,
-      alt,
-      logo,
+      key:  key?,
+      mods: Modifiers {
+        ctrl,
+        shift,
+        alt,
+        logo,
+        caps_lock: false,
+        num_lock: false,
+      },
     })
   }
 
   /// Whether `event`/`mods` match this chord. Letters compare
   /// case-insensitively (Shift is matched via the modifier, not the keysym
   /// case).
-  fn matches(&self, event: &KeyEvent, mods: Modifiers) -> bool {
-    if mods.ctrl != self.ctrl
-      || mods.shift != self.shift
-      || mods.alt != self.alt
-      || mods.logo != self.logo
+  fn matches(self, event: &KeyEvent, mods: Modifiers) -> bool {
+    if mods.ctrl != self.mods.ctrl
+      || mods.shift != self.mods.shift
+      || mods.alt != self.mods.alt
+      || mods.logo != self.mods.logo
     {
       return false;
     }
@@ -116,13 +117,10 @@ pub enum MouseButton {
 }
 
 /// A parsed mouse chord: a button plus the modifiers that must be held exactly.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, Debug)]
 struct MouseChord {
   button: MouseButton,
-  ctrl:   bool,
-  shift:  bool,
-  alt:    bool,
-  logo:   bool,
+  mods:   Modifiers,
 }
 
 impl MouseChord {
@@ -148,19 +146,23 @@ impl MouseChord {
     }
     Some(Self {
       button: button?,
-      ctrl,
-      shift,
-      alt,
-      logo,
+      mods:   Modifiers {
+        ctrl,
+        shift,
+        alt,
+        logo,
+        caps_lock: false,
+        num_lock: false,
+      },
     })
   }
 
-  fn matches(&self, button: MouseButton, mods: Modifiers) -> bool {
+  fn matches(self, button: MouseButton, mods: Modifiers) -> bool {
     self.button == button
-      && mods.ctrl == self.ctrl
-      && mods.shift == self.shift
-      && mods.alt == self.alt
-      && mods.logo == self.logo
+      && mods.ctrl == self.mods.ctrl
+      && mods.shift == self.mods.shift
+      && mods.alt == self.mods.alt
+      && mods.logo == self.mods.logo
   }
 }
 
@@ -183,7 +185,13 @@ impl Bindings {
     let mut keys: Vec<(Chord, Action)> = Vec::new();
     let mut add = |chord: &str, action: Action| {
       if let Some(c) = Chord::parse(chord) {
-        keys.retain(|(existing, _)| *existing != c);
+        keys.retain(|(existing, _)| {
+          existing.key != c.key
+            || existing.mods.ctrl != c.mods.ctrl
+            || existing.mods.shift != c.mods.shift
+            || existing.mods.alt != c.mods.alt
+            || existing.mods.logo != c.mods.logo
+        });
         keys.push((c, action));
       }
     };
@@ -194,7 +202,13 @@ impl Bindings {
     }
     for (chord, action) in key_bindings {
       if let Some(c) = Chord::parse(chord) {
-        keys.retain(|(existing, _)| *existing != c);
+        keys.retain(|(existing, _)| {
+          existing.key != c.key
+            || existing.mods.ctrl != c.mods.ctrl
+            || existing.mods.shift != c.mods.shift
+            || existing.mods.alt != c.mods.alt
+            || existing.mods.logo != c.mods.logo
+        });
         if let Some(a) = Action::parse(action) {
           keys.push((c, a));
         } else if action != "none" {
@@ -213,7 +227,13 @@ impl Bindings {
     let mut mouse: Vec<(MouseChord, Action)> = Vec::new();
     let mut add_mouse = |chord: &str, action: Option<Action>| {
       if let Some(c) = MouseChord::parse(chord) {
-        mouse.retain(|(existing, _)| *existing != c);
+        mouse.retain(|(existing, _)| {
+          existing.button != c.button
+            || existing.mods.ctrl != c.mods.ctrl
+            || existing.mods.shift != c.mods.shift
+            || existing.mods.alt != c.mods.alt
+            || existing.mods.logo != c.mods.logo
+        });
         if let Some(a) = action {
           mouse.push((c, a));
         }
@@ -340,7 +360,7 @@ fn keysym_from_token(token: &str) -> Option<Keysym> {
 /// Decode the escapes a text binding may contain: `\e \n \r \t \\` and `\xNN`.
 fn unescape(s: &str) -> Vec<u8> {
   let mut out = Vec::with_capacity(s.len());
-  let mut chars = s.chars().peekable();
+  let mut chars = s.chars();
   while let Some(c) = chars.next() {
     if c != '\\' {
       let mut buf = [0u8; 4];
@@ -352,7 +372,7 @@ fn unescape(s: &str) -> Vec<u8> {
       Some('n') => out.push(b'\n'),
       Some('r') => out.push(b'\r'),
       Some('t') => out.push(b'\t'),
-      Some('\\') => out.push(b'\\'),
+      Some('\\') | None => out.push(b'\\'),
       Some('x') => {
         let hex: String = (0..2).filter_map(|_| chars.next()).collect();
         if let Ok(byte) = u8::from_str_radix(&hex, 16) {
@@ -364,7 +384,6 @@ fn unescape(s: &str) -> Vec<u8> {
         let mut buf = [0u8; 4];
         out.extend_from_slice(other.encode_utf8(&mut buf).as_bytes());
       },
-      None => out.push(b'\\'),
     }
   }
   out

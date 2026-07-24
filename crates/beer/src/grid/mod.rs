@@ -54,15 +54,15 @@ impl Flags {
     Self(self.0 | other.0)
   }
 
-  pub fn contains(self, other: Self) -> bool {
+  pub const fn contains(self, other: Self) -> bool {
     self.0 & other.0 == other.0
   }
 
-  pub fn insert(&mut self, other: Self) {
+  pub const fn insert(&mut self, other: Self) {
     self.0 |= other.0;
   }
 
-  pub fn remove(&mut self, other: Self) {
+  pub const fn remove(&mut self, other: Self) {
     self.0 &= !other.0;
   }
 }
@@ -122,7 +122,7 @@ pub struct Cell {
   pub underline_color: Color,
   /// Zero-width combining marks attached to `c`, in arrival order. `None` for
   /// the common case; the renderer stacks each over the base glyph. This is
-  /// the grapheme cluster a future shaper (HarfBuzz) would consume.
+  /// the grapheme cluster a future shaper (`HarfBuzz`) would consume.
   pub combining:       Option<Box<str>>,
   /// OSC 8 hyperlink: a 1-based index into the grid's link table, or `None`.
   pub link:            Option<NonZeroU16>,
@@ -185,6 +185,10 @@ pub struct Point {
 }
 
 /// The active screen plus cursor, scroll region, and current pen.
+#[expect(
+  clippy::struct_excessive_bools,
+  reason = "these independent terminal modes are part of the emulated VT state"
+)]
 #[derive(Debug)]
 pub struct Grid {
   cols:            usize,
@@ -287,6 +291,11 @@ fn graphemes(text: &str) -> Vec<(char, String, usize)> {
   out
 }
 
+#[expect(
+  clippy::absolute_paths,
+  reason = "grid internals use fully-qualified standard-library ownership \
+            operations"
+)]
 impl Grid {
   pub fn new(cols: usize, rows: usize) -> Self {
     let cols = cols.max(1);
@@ -331,12 +340,12 @@ impl Grid {
   }
 
   /// The active kitty-keyboard flags (0 means legacy encoding).
-  pub fn kitty_flags(&self) -> u8 {
+  pub const fn kitty_flags(&self) -> u8 {
     self.kitty_current
   }
 
   /// Apply `CSI = flags ; mode u`: mode 1 replaces, 2 sets bits, 3 clears bits.
-  pub fn kitty_set(&mut self, flags: u8, mode: u8) {
+  pub const fn kitty_set(&mut self, flags: u8, mode: u8) {
     self.kitty_current = match mode {
       2 => self.kitty_current | flags,
       3 => self.kitty_current & !flags,
@@ -376,11 +385,11 @@ impl Grid {
     self.view_offset = self.view_offset.min(self.scrollback.len());
   }
 
-  pub fn cols(&self) -> usize {
+  pub const fn cols(&self) -> usize {
     self.cols
   }
 
-  pub fn rows(&self) -> usize {
+  pub const fn rows(&self) -> usize {
     self.rows
   }
 
@@ -525,13 +534,13 @@ impl Grid {
     self.clear_search();
   }
 
-  pub fn cursor(&self) -> (usize, usize) {
+  pub const fn cursor(&self) -> (usize, usize) {
     (self.cursor.x, self.cursor.y)
   }
 
   // --- pen / attributes ---
 
-  pub fn pen_mut(&mut self) -> &mut Cell {
+  pub const fn pen_mut(&mut self) -> &mut Cell {
     &mut self.pen
   }
 
@@ -539,7 +548,7 @@ impl Grid {
     self.pen = Cell::default();
   }
 
-  pub fn set_autowrap(&mut self, on: bool) {
+  pub const fn set_autowrap(&mut self, on: bool) {
     self.autowrap = on;
   }
 
@@ -548,63 +557,63 @@ impl Grid {
     self.move_to(0, 0);
   }
 
-  pub fn set_insert(&mut self, on: bool) {
+  pub const fn set_insert(&mut self, on: bool) {
     self.insert = on;
   }
 
-  pub fn autowrap(&self) -> bool {
+  pub const fn autowrap(&self) -> bool {
     self.autowrap
   }
 
-  pub fn origin(&self) -> bool {
+  pub const fn origin(&self) -> bool {
     self.origin
   }
 
-  pub fn insert(&self) -> bool {
+  pub const fn insert(&self) -> bool {
     self.insert
   }
 
-  pub fn alt_active(&self) -> bool {
+  pub const fn alt_active(&self) -> bool {
     self.alt_saved.is_some()
   }
 
-  pub fn set_cursor_shape(&mut self, shape: CursorShape) {
+  pub const fn set_cursor_shape(&mut self, shape: CursorShape) {
     self.cursor_shape = shape;
   }
 
-  pub fn cursor_shape(&self) -> CursorShape {
+  pub const fn cursor_shape(&self) -> CursorShape {
     self.cursor_shape
   }
 
-  pub fn set_cursor_blink(&mut self, blink: bool) {
+  pub const fn set_cursor_blink(&mut self, blink: bool) {
     self.cursor_blink = blink;
   }
 
-  pub fn cursor_blink(&self) -> bool {
+  pub const fn cursor_blink(&self) -> bool {
     self.cursor_blink
   }
 
-  pub fn set_cursor_visible(&mut self, visible: bool) {
+  pub const fn set_cursor_visible(&mut self, visible: bool) {
     self.cursor_visible = visible;
   }
 
-  pub fn cursor_visible(&self) -> bool {
+  pub const fn cursor_visible(&self) -> bool {
     self.cursor_visible
   }
 
-  pub fn set_cursor_color(&mut self, color: Option<(u8, u8, u8)>) {
+  pub const fn set_cursor_color(&mut self, color: Option<(u8, u8, u8)>) {
     self.cursor_color = color;
   }
 
-  pub fn cursor_color(&self) -> Option<(u8, u8, u8)> {
+  pub const fn cursor_color(&self) -> Option<(u8, u8, u8)> {
     self.cursor_color
   }
 
-  pub fn set_app_cursor(&mut self, on: bool) {
+  pub const fn set_app_cursor(&mut self, on: bool) {
     self.app_cursor = on;
   }
 
-  pub fn app_cursor(&self) -> bool {
+  pub const fn app_cursor(&self) -> bool {
     self.app_cursor
   }
 
@@ -714,7 +723,7 @@ impl Grid {
       }
     } else {
       let cols = (rows * size.width as usize).clamp(1, self.cols);
-      self.place_block(' ', String::new(), Some(text.into()), size, cols, rows);
+      self.place_block(' ', String::new(), Some(text), size, cols, rows);
     }
   }
 
@@ -725,7 +734,7 @@ impl Grid {
     &mut self,
     lead: char,
     marks: String,
-    run: Option<Box<str>>,
+    run: Option<&str>,
     size: TextSize,
     cols: usize,
     rows: usize,
@@ -761,11 +770,11 @@ impl Grid {
         }
         cell.sized = Some(Box::new(Sized {
           size,
-          cols: cols as u8,
-          rows: rows as u8,
-          dx: dx as u8,
-          dy: dy as u8,
-          run: if lead_cell { run.clone() } else { None },
+          cols: u8::try_from(cols).unwrap_or(u8::MAX),
+          rows: u8::try_from(rows).unwrap_or(u8::MAX),
+          dx: u8::try_from(dx).unwrap_or(u8::MAX),
+          dy: u8::try_from(dy).unwrap_or(u8::MAX),
+          run: if lead_cell { run.map(Into::into) } else { None },
         }));
         self.lines[cy].cells[cx] = cell;
       }
@@ -825,8 +834,8 @@ impl Grid {
         cell.image = Some(ImageRef {
           image,
           placement,
-          dx: dx as u16,
-          dy: dy as u16,
+          dx: u16::try_from(dx).unwrap_or(u16::MAX),
+          dy: u16::try_from(dy).unwrap_or(u16::MAX),
         });
       }
     }
@@ -963,7 +972,7 @@ impl Grid {
 
   // --- cursor movement ---
 
-  fn region(&self) -> (usize, usize) {
+  const fn region(&self) -> (usize, usize) {
     if self.origin {
       (self.top, self.bottom)
     } else {
@@ -1006,12 +1015,12 @@ impl Grid {
     self.wrap_pending = false;
   }
 
-  pub fn cursor_back(&mut self, n: usize) {
+  pub const fn cursor_back(&mut self, n: usize) {
     self.cursor.x = self.cursor.x.saturating_sub(n);
     self.wrap_pending = false;
   }
 
-  pub fn save_cursor(&mut self) {
+  pub const fn save_cursor(&mut self) {
     self.saved = self.cursor;
   }
 
@@ -1024,12 +1033,12 @@ impl Grid {
 
   // --- line discipline ---
 
-  pub fn carriage_return(&mut self) {
+  pub const fn carriage_return(&mut self) {
     self.cursor.x = 0;
     self.wrap_pending = false;
   }
 
-  pub fn backspace(&mut self) {
+  pub const fn backspace(&mut self) {
     self.cursor.x = self.cursor.x.saturating_sub(1);
     self.wrap_pending = false;
   }
@@ -1290,6 +1299,12 @@ impl Grid {
 
   /// Scroll the viewport by `delta` lines: positive = back into history,
   /// negative = toward the live screen. No-op on the alternate screen.
+  #[expect(
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    reason = "scrollback positions are bounded by the grid and adjusted in \
+              signed coordinates"
+  )]
   pub fn scroll_view(&mut self, delta: isize) {
     if self.alt_saved.is_some() {
       return;
@@ -1299,12 +1314,12 @@ impl Grid {
       (self.view_offset as isize + delta).clamp(0, max) as usize;
   }
 
-  pub fn scroll_to_bottom(&mut self) {
+  pub const fn scroll_to_bottom(&mut self) {
     self.view_offset = 0;
   }
 
   /// Whether the viewport is showing the live screen (not scrolled back).
-  pub fn view_at_bottom(&self) -> bool {
+  pub const fn view_at_bottom(&self) -> bool {
     self.view_offset == 0
   }
 
@@ -1405,6 +1420,12 @@ impl Grid {
   /// Scroll the viewport to the previous (`up`) or next prompt, placing that
   /// prompt line at the top of the window. No-op on the alternate screen or
   /// when there is no prompt in that direction.
+  #[expect(
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    reason = "prompt positions are bounded by the grid and adjusted in signed \
+              coordinates"
+  )]
   pub fn jump_prompt(&mut self, up: bool) {
     if self.alt_saved.is_some() {
       return;
@@ -1444,7 +1465,7 @@ impl Grid {
       lines.push(self.row_slice_text(r, 0, usize::MAX).trim_end().to_string());
     }
     // Drop trailing blank rows (e.g. the empty live screen below the output).
-    while lines.last().is_some_and(|l| l.is_empty()) {
+    while lines.last().is_some_and(std::string::String::is_empty) {
       lines.pop();
     }
     let mut out = lines.join("\n");
@@ -1452,43 +1473,43 @@ impl Grid {
     Some(out)
   }
 
-  pub fn set_bracketed_paste(&mut self, on: bool) {
+  pub const fn set_bracketed_paste(&mut self, on: bool) {
     self.bracketed_paste = on;
   }
 
-  pub fn bracketed_paste(&self) -> bool {
+  pub const fn bracketed_paste(&self) -> bool {
     self.bracketed_paste
   }
 
-  pub fn set_sync(&mut self, on: bool) {
+  pub const fn set_sync(&mut self, on: bool) {
     self.sync = on;
   }
 
-  pub fn sync_active(&self) -> bool {
+  pub const fn sync_active(&self) -> bool {
     self.sync
   }
 
-  pub fn set_mouse_protocol(&mut self, protocol: MouseProtocol) {
+  pub const fn set_mouse_protocol(&mut self, protocol: MouseProtocol) {
     self.mouse_protocol = protocol;
   }
 
-  pub fn mouse_protocol(&self) -> MouseProtocol {
+  pub const fn mouse_protocol(&self) -> MouseProtocol {
     self.mouse_protocol
   }
 
-  pub fn set_mouse_encoding(&mut self, encoding: MouseEncoding) {
+  pub const fn set_mouse_encoding(&mut self, encoding: MouseEncoding) {
     self.mouse_encoding = encoding;
   }
 
-  pub fn mouse_encoding(&self) -> MouseEncoding {
+  pub const fn mouse_encoding(&self) -> MouseEncoding {
     self.mouse_encoding
   }
 
-  pub fn set_focus_events(&mut self, on: bool) {
+  pub const fn set_focus_events(&mut self, on: bool) {
     self.focus_events = on;
   }
 
-  pub fn focus_events(&self) -> bool {
+  pub const fn focus_events(&self) -> bool {
     self.focus_events
   }
 

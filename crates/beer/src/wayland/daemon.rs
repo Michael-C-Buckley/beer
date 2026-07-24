@@ -1,6 +1,22 @@
 //! Daemon socket sources for the Wayland event loop.
 
-use super::*;
+use super::{
+  App,
+  Context,
+  Duration,
+  ErrorKind,
+  EventLoop,
+  Generic,
+  Instant,
+  Interest,
+  Mode,
+  PathBuf,
+  PostAction,
+  TimeoutAction,
+  Timer,
+  UnixStream,
+  ipc,
+};
 
 /// A client must send its tiny initial request promptly; this bounds idle IPC
 /// file descriptors without delaying the Wayland event loop.
@@ -49,7 +65,7 @@ pub(super) fn bind_server_socket(
     .handle()
     .insert_source(
       Timer::from_duration(IPC_REQUEST_SWEEP),
-      |_, _, app: &mut App| {
+      |_, (), app: &mut App| {
         app.expire_ipc_clients();
         TimeoutAction::ToDuration(IPC_REQUEST_SWEEP)
       },

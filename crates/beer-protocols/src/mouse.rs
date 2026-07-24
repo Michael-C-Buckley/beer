@@ -10,6 +10,7 @@ use crate::style::MouseEncoding;
 /// Encode a mouse event for the application. `button` is the base code (0/1/2
 /// for left/middle/right, 64/65 for wheel up/down); `col`/`row` are 0-based
 /// screen cells; `motion` marks a drag/move report. Returns the bytes to send.
+#[must_use]
 pub fn encode_mouse(
   encoding: MouseEncoding,
   button: u8,
@@ -37,8 +38,8 @@ pub fn encode_mouse(
       out.extend_from_slice(b"\x1b[M");
       push_coord(&mut out, u32::from(cb), false);
       let utf8 = enc == MouseEncoding::Utf8;
-      push_coord(&mut out, col as u32 + 33, utf8);
-      push_coord(&mut out, row as u32 + 33, utf8);
+      push_coord(&mut out, u32::try_from(col).unwrap_or(u32::MAX) + 33, utf8);
+      push_coord(&mut out, u32::try_from(row).unwrap_or(u32::MAX) + 33, utf8);
     },
   }
   out
@@ -50,13 +51,13 @@ fn push_coord(out: &mut Vec<u8>, value: u32, utf8: bool) {
   if utf8 {
     let v = value.min(0x7FF);
     if v >= 0x80 {
-      out.push(0xC0 | (v >> 6) as u8);
-      out.push(0x80 | (v & 0x3F) as u8);
+      out.push(0xC0 | u8::try_from(v >> 6).unwrap_or(0));
+      out.push(0x80 | u8::try_from(v & 0x3F).unwrap_or(0));
     } else {
-      out.push(v as u8);
+      out.push(u8::try_from(v).unwrap_or(u8::MAX));
     }
   } else {
-    out.push(value.min(255) as u8);
+    out.push(u8::try_from(value.min(u32::from(u8::MAX))).unwrap_or(u8::MAX));
   }
 }
 

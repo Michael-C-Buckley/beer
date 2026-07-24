@@ -1,7 +1,33 @@
 use vte::Perform;
 
-use super::*;
+use super::{
+  Charset,
+  ClipboardOp,
+  CursorShape,
+  DaLevel,
+  Dynamic,
+  Notification,
+  Params,
+  Term,
+  base64_decode,
+  charset,
+  dec_special,
+  file_uri_path,
+  n,
+  osc_text,
+  parse_index,
+  parse_spec,
+  prompt_kind,
+  raw,
+  rgb_tuple,
+};
 
+#[expect(
+  clippy::absolute_paths,
+  clippy::cast_possible_truncation,
+  reason = "VT parameter values are bounded protocol fields at this dispatch \
+            boundary"
+)]
 impl Perform for Term {
   fn print(&mut self, c: char) {
     let c = if self.active_charset() == Charset::DecSpecial {
@@ -75,7 +101,7 @@ impl Perform for Term {
           Some(b'>') => DaLevel::Secondary,
           Some(b'=') => DaLevel::Tertiary,
           _ => DaLevel::Primary,
-        })
+        });
       },
       'q' if intermediates.first() == Some(&b'>') => self.report_version(),
       'q' if intermediates.first() == Some(&b' ') => {
@@ -101,7 +127,7 @@ impl Perform for Term {
           Some(b'=') => {
             self
               .grid
-              .kitty_set(n(params, 0, 0) as u8, n(params, 1, 1) as u8)
+              .kitty_set(n(params, 0, 0) as u8, n(params, 1, 1) as u8);
           },
           _ => self.grid.restore_cursor(),
         }
@@ -221,19 +247,19 @@ impl Perform for Term {
       },
       // OSC 10/11: foreground / background; OSC 110/111 reset them.
       Some(&n) if n == b"10" => {
-        self.osc_dynamic_color(Dynamic::Fg, params.get(1), bell)
+        self.osc_dynamic_color(Dynamic::Fg, params.get(1), bell);
       },
       Some(&n) if n == b"11" => {
-        self.osc_dynamic_color(Dynamic::Bg, params.get(1), bell)
+        self.osc_dynamic_color(Dynamic::Bg, params.get(1), bell);
       },
       Some(&n) if n == b"110" => self.theme.reset_fg(),
       Some(&n) if n == b"111" => self.theme.reset_bg(),
       // OSC 17/19: selection (highlight) background / foreground.
       Some(&n) if n == b"17" => {
-        self.osc_dynamic_color(Dynamic::SelBg, params.get(1), bell)
+        self.osc_dynamic_color(Dynamic::SelBg, params.get(1), bell);
       },
       Some(&n) if n == b"19" => {
-        self.osc_dynamic_color(Dynamic::SelFg, params.get(1), bell)
+        self.osc_dynamic_color(Dynamic::SelFg, params.get(1), bell);
       },
       // OSC 12: set cursor colour; OSC 112: reset to default.
       Some(&n) if n == b"12" => {

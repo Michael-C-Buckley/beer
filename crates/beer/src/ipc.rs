@@ -34,6 +34,11 @@ pub struct OpenRequest {
 /// Daemon IPC carries a client's environment and starts a shell as the server,
 /// so it must live in the user's private runtime directory rather than a
 /// shared temp directory.
+#[expect(
+  clippy::absolute_paths,
+  reason = "daemon discovery intentionally uses the process environment and \
+            runtime directory"
+)]
 pub fn socket_path() -> io::Result<PathBuf> {
   let dir = std::env::var_os("XDG_RUNTIME_DIR")
     .filter(|value| !value.is_empty())
@@ -116,6 +121,10 @@ impl OpenRequest {
   /// Encode as a length-prefixed frame: a big-endian `u32` body length, then
   /// the body. Body layout: `[u32 cwd_len][cwd utf8] [u32 env_count]` followed
   /// by `env_count` pairs of `[u32 klen][k][u32 vlen][v]`.
+  #[expect(
+    clippy::cast_possible_truncation,
+    reason = "the IPC wire format deliberately uses u32 length fields"
+  )]
   pub fn encode(&self) -> Vec<u8> {
     let mut body = Vec::new();
     put_bytes(&mut body, self.cwd.as_deref().unwrap_or("").as_bytes());
@@ -176,7 +185,7 @@ pub fn run_client(req: &OpenRequest) -> io::Result<u8> {
 
 /// Incrementally read one request frame from a non-blocking client stream.
 #[derive(Default)]
-pub(crate) struct RequestReader {
+pub struct RequestReader {
   len:       [u8; 4],
   len_read:  usize,
   body:      Option<Vec<u8>>,
@@ -213,7 +222,12 @@ impl RequestReader {
         self.body = Some(vec![0; len]);
       }
 
-      let body = self.body.as_mut().expect("body initialized above");
+      let Some(body) = self.body.as_mut() else {
+        return Err(io::Error::new(
+          io::ErrorKind::InvalidData,
+          "request body was not initialized",
+        ));
+      };
       if self.body_read == body.len() {
         return OpenRequest::decode(body).map(Some).ok_or_else(|| {
           io::Error::new(io::ErrorKind::InvalidData, "malformed request")
@@ -238,6 +252,10 @@ fn put_u32(buf: &mut Vec<u8>, v: u32) {
   buf.extend_from_slice(&v.to_be_bytes());
 }
 
+#[expect(
+  clippy::cast_possible_truncation,
+  reason = "the IPC wire format deliberately uses u32 length fields"
+)]
 fn put_bytes(buf: &mut Vec<u8>, data: &[u8]) {
   put_u32(buf, data.len() as u32);
   buf.extend_from_slice(data);
@@ -362,7 +380,9 @@ mod tests {
   #[test]
   fn request_reader_rejects_an_oversized_frame_before_allocating() {
     let mut stream = NonblockingReader::default();
-    stream.push(&(MAX_REQUEST as u32 + 1).to_be_bytes());
+    stream.push(
+      &(u32::try_from(MAX_REQUEST).unwrap_or(u32::MAX) + 1).to_be_bytes(),
+    );
 
     let err = RequestReader::default().read_from(&mut stream).unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::InvalidData);
@@ -376,6 +396,11 @@ mod tests {
   }
 
   #[test]
+  #[expect(
+    clippy::absolute_paths,
+    reason = "the test intentionally exercises host filesystem metadata and \
+              temporary paths"
+  )]
   fn socket_permission_helper_is_owner_only() {
     use std::os::unix::fs::MetadataExt as _;
 

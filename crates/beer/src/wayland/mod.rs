@@ -8,16 +8,17 @@ mod handlers;
 mod rendering;
 
 use std::{
-  collections::HashMap,
+  collections::{HashMap, HashSet},
   fs::{self, File},
   io::{ErrorKind, Read as _, Write as _},
+  mem,
   num::NonZeroU16,
   os::{
     fd::OwnedFd,
     unix::{net::UnixStream, process::ExitStatusExt},
   },
   path::PathBuf,
-  process::ExitCode,
+  process::{Command, ExitCode, Stdio},
   time::{Duration, Instant},
 };
 
@@ -146,13 +147,15 @@ use wayland_protocols::wp::{
 };
 
 use crate::{
+  bindings::Bindings,
   config::Config,
-  font::Fonts,
+  font::{CellMetrics, Fonts},
   grid::{Cell, CursorShape, Grid, MouseProtocol, UrlHit},
   ipc,
   pty::Pty,
   render::Renderer,
-  vt::Term,
+  theme::Theme,
+  vt::{ClipboardOp, Notification, Term},
 };
 
 /// MIME types beer offers and accepts for clipboard text.
@@ -202,9 +205,15 @@ const DEFAULT_W: u32 = 800;
 const DEFAULT_H: u32 = 600;
 
 /// Run a single window until it is closed, returning the shell's exit code.
+#[expect(
+  clippy::absolute_paths,
+  clippy::cast_possible_truncation,
+  reason = "Wayland startup wires platform event sources and bounded \
+            animation timing"
+)]
 pub fn run(
   config: Config,
-  config_paths: Vec<std::path::PathBuf>,
+  config_paths: Vec<PathBuf>,
   server: bool,
 ) -> anyhow::Result<ExitCode> {
   let resident = config.main.server_resident;
@@ -255,7 +264,7 @@ pub fn run(
   renderer.set_padding(config.main.pad_x, config.main.pad_y);
   renderer.set_alpha_blending(config.colors.alpha_blending);
 
-  let bindings = crate::bindings::Bindings::from_config(
+  let bindings = Bindings::from_config(
     &config.key_bindings,
     &config.text_bindings,
     &config.mouse_bindings,
@@ -320,7 +329,7 @@ pub fn run(
   let blink_registered =
     event_loop
       .handle()
-      .insert_source(blink, |_, _, app: &mut App| {
+      .insert_source(blink, |_, (), app: &mut App| {
         app.blink_on = !app.blink_on;
         for win in &mut app.windows {
           win.needs_draw = true;
@@ -339,7 +348,7 @@ pub fn run(
   let anim_registered =
     event_loop
       .handle()
-      .insert_source(anim, |_, _, app: &mut App| {
+      .insert_source(anim, |_, (), app: &mut App| {
         let mut animating = false;
         for win in &mut app.windows {
           let (changed, anim) = match win.session.as_mut() {
@@ -369,7 +378,7 @@ pub fn run(
     Ok(signals) => {
       let registered = event_loop
         .handle()
-        .insert_source(signals, |_, _, app: &mut App| app.reload_config());
+        .insert_source(signals, |_, (), app: &mut App| app.reload_config());
       if let Err(err) = registered {
         tracing::warn!("register signal source: {err}");
       }
@@ -419,7 +428,7 @@ where
 /// Preserve focus on the same window when removing an earlier vector entry.
 /// If the focused window itself closes and has no successor, retain the
 /// existing first-window fallback.
-fn focused_after_removal(
+const fn focused_after_removal(
   focused: usize,
   removed: usize,
   remaining: usize,
@@ -454,17 +463,24 @@ mod tests {
 /// Columns and rows that fit a `width`×`height` px window at `metrics`, after
 /// reserving `2 * pad` pixels of inner padding on each axis.
 fn grid_size(
-  metrics: crate::font::CellMetrics,
+  metrics: CellMetrics,
   width: u32,
   height: u32,
   pad: (u32, u32),
 ) -> (u16, u16) {
   let cols = (width.saturating_sub(2 * pad.0) / metrics.width).max(1);
   let rows = (height.saturating_sub(2 * pad.1) / metrics.height).max(1);
-  (cols as u16, rows as u16)
+  (
+    u16::try_from(cols).unwrap_or(u16::MAX),
+    u16::try_from(rows).unwrap_or(u16::MAX),
+  )
 }
 
 /// Write every byte to `fd`, retrying short writes and interrupts.
+#[expect(
+  clippy::absolute_paths,
+  reason = "the fd helper uses rustix's explicit platform error type"
+)]
 fn write_all(fd: &OwnedFd, mut buf: &[u8]) -> rustix::io::Result<()> {
   while !buf.is_empty() {
     match rustix::io::write(fd, buf) {
@@ -519,6 +535,11 @@ pub struct WindowId(u64);
 /// Per-window state: the surface, its shm buffers, the terminal behind it, and
 /// all the input/paint bookkeeping scoped to one toplevel. `App` owns a `Vec`
 /// of these.
+#[expect(
+  clippy::struct_excessive_bools,
+  clippy::struct_field_names,
+  reason = "window flags represent independent compositor/input state"
+)]
 #[derive(Debug)]
 struct Window {
   /// Stable id, assigned at creation and never reused.
@@ -530,7 +551,7 @@ struct Window {
   idle_inhibitor:       Option<ZwpIdleInhibitorV1>,
   /// content-type-v1 hint object. Set once at startup; held only so the
   /// object (and thus the hint) outlives construction.
-  #[allow(
+  #[expect(
     dead_code,
     reason = "kept alive to preserve the surface content-type hint"
   )]
@@ -612,7 +633,7 @@ struct Window {
   unicode_input:        Option<String>,
   /// Raw key codes currently held, to tell press from repeat for the kitty
   /// keyboard protocol's event-type reporting.
-  keys_down:            std::collections::HashSet<u32>,
+  keys_down:            HashSet<u32>,
   /// A single-finger touch drag in progress (scrolls the viewport).
   touch_scroll:         Option<TouchScroll>,
   /// Whether the toplevel currently has keyboard focus (drives the cursor).
@@ -628,8 +649,8 @@ struct App {
   seat_state:           SeatState,
   shm:                  Shm,
   renderer:             Renderer,
-  loop_handle:          LoopHandle<'static, App>,
-  qh:                   QueueHandle<App>,
+  loop_handle:          LoopHandle<'static, Self>,
+  qh:                   QueueHandle<Self>,
   /// Surface-creation infrastructure, kept so `open_window` can build new
   /// toplevels after startup.
   compositor:           CompositorState,
@@ -665,9 +686,9 @@ struct App {
   config:               Config,
   /// Paths the config was loaded from, for SIGUSR1 live reload and new
   /// windows.
-  config_paths:         Vec<std::path::PathBuf>,
+  config_paths:         Vec<PathBuf>,
   /// Resolved key/text bindings.
-  bindings:             crate::bindings::Bindings,
+  bindings:             Bindings,
   /// Current font size in pixels (changed by font-resize bindings).
   font_size:            u32,
   /// Current blink phase, toggled by a timer; off hides blinking ink. Global
@@ -692,6 +713,15 @@ struct App {
   resident:             bool,
 }
 
+#[expect(
+  clippy::absolute_paths,
+  clippy::cast_possible_truncation,
+  clippy::cast_possible_wrap,
+  clippy::cast_sign_loss,
+  clippy::cast_precision_loss,
+  reason = "Wayland protocol dimensions and owned resources cross the \
+            compositor boundary here"
+)]
 impl App {
   /// The index of the window backing `surface`, if any. Compares each window's
   /// surface by identity, so surface-carrying handlers route to the right one.
@@ -710,7 +740,7 @@ impl App {
   }
 
   /// Allocate a fresh, never-reused window id.
-  fn alloc_window_id(&mut self) -> WindowId {
+  const fn alloc_window_id(&mut self) -> WindowId {
     let id = WindowId(self.next_window_id);
     self.next_window_id += 1;
     id
@@ -887,7 +917,7 @@ impl App {
     let cell = (m.width as u16, m.height as u16);
     let id = self.windows[idx].id;
     let cwd = self.windows[idx].pending_cwd.clone();
-    let env = std::mem::take(&mut self.windows[idx].pending_env);
+    let env = mem::take(&mut self.windows[idx].pending_env);
     let pty = match Pty::spawn(
       cols,
       rows,
@@ -918,7 +948,7 @@ impl App {
     let registered =
       self
         .loop_handle
-        .insert_source(source, move |_, fd, app: &mut App| {
+        .insert_source(source, move |_, fd, app: &mut Self| {
           // Resolve the window each fire; if it is gone the source is stale.
           let Some(idx) = app.window_index_by_id(id) else {
             return Ok(PostAction::Remove);
@@ -959,7 +989,7 @@ impl App {
     }
 
     let mut term = Term::new(cols as usize, rows as usize);
-    term.set_theme(crate::theme::Theme::from_config(&self.config.colors));
+    term.set_theme(Theme::from_config(&self.config.colors));
     let grid = term.grid_mut();
     grid.set_word_delimiters(self.config.main.word_delimiters.clone());
     grid.set_scrollback_cap(self.config.scrollback.lines);
@@ -1097,7 +1127,7 @@ impl App {
       Action::SearchStart => self.toggle_search(),
       Action::FontIncrease => self.change_font_size(self.font_size + 1),
       Action::FontDecrease => {
-        self.change_font_size(self.font_size.saturating_sub(1))
+        self.change_font_size(self.font_size.saturating_sub(1));
       },
       Action::FontReset => self.change_font_size(self.config.main.font_size),
       Action::Fullscreen => self.toggle_fullscreen(),
@@ -1203,7 +1233,7 @@ impl App {
         let Some(text) = event.utf8.as_ref() else {
           return;
         };
-        for c in text.chars().filter(|c| c.is_ascii_alphabetic()) {
+        for c in text.chars().filter(char::is_ascii_alphabetic) {
           self.windows[idx].url_input.push(c.to_ascii_lowercase());
         }
         // Exact match opens; if no label even has this prefix, cancel.
@@ -1234,7 +1264,11 @@ impl App {
 
   /// Feed the last command's output (between OSC 133 C and D) to the configured
   /// command on stdin.
-  fn pipe_command_output(&mut self) {
+  #[expect(
+    clippy::disallowed_methods,
+    reason = "the configured pipe command is an explicit user feature"
+  )]
+  fn pipe_command_output(&self) {
     let idx = self.focused_window;
     let argv = &self.config.shell_integration.pipe_command;
     let Some((program, args)) = argv.split_first() else {
@@ -1250,12 +1284,12 @@ impl App {
     else {
       return;
     };
-    let mut cmd = std::process::Command::new(program);
+    let mut cmd = Command::new(program);
     cmd
       .args(args)
-      .stdin(std::process::Stdio::piped())
-      .stdout(std::process::Stdio::null())
-      .stderr(std::process::Stdio::null());
+      .stdin(Stdio::piped())
+      .stdout(Stdio::null())
+      .stderr(Stdio::null());
     if let Some(cwd) = self.windows[idx]
       .session
       .as_ref()
@@ -1329,7 +1363,7 @@ impl App {
   fn reload_config(&mut self) {
     let idx = self.focused_window;
     let new = Config::load(&self.config_paths);
-    self.bindings = crate::bindings::Bindings::from_config(
+    self.bindings = Bindings::from_config(
       &new.key_bindings,
       &new.text_bindings,
       &new.mouse_bindings,
@@ -1346,9 +1380,7 @@ impl App {
     // Re-rasterize at the active scale and update padding in one place.
     self.rescale_render(idx);
     if let Some(session) = self.windows[idx].session.as_mut() {
-      session
-        .term
-        .set_theme(crate::theme::Theme::from_config(&new.colors));
+      session.term.set_theme(Theme::from_config(&new.colors));
       let grid = session.term.grid_mut();
       grid.set_word_delimiters(new.main.word_delimiters.clone());
       grid.set_scrollback_cap(new.scrollback.lines);
@@ -1474,7 +1506,7 @@ impl App {
 
   /// If the left button was pressed and released on the same hyperlinked cell
   /// (a click, not a drag), open the link.
-  fn maybe_open_clicked_link(&mut self) {
+  fn maybe_open_clicked_link(&self) {
     let idx = self.focused_window;
     let (px, py) = self.windows[idx].pointer_pos;
     let release = self.cell_at(idx, px, py);
@@ -1494,18 +1526,22 @@ impl App {
   }
 
   /// Launch the configured opener (default `xdg-open`) on a URL.
+  #[expect(
+    clippy::disallowed_methods,
+    reason = "opening the configured URL handler is an explicit user feature"
+  )]
   fn open_url(&self, url: &str) {
     let Some((program, args)) = self.config.url.launch.split_first() else {
       tracing::warn!("open url: no [url] launch command configured");
       return;
     };
-    let mut cmd = std::process::Command::new(program);
+    let mut cmd = Command::new(program);
     cmd
       .args(args)
       .arg(url)
-      .stdin(std::process::Stdio::null())
-      .stdout(std::process::Stdio::null())
-      .stderr(std::process::Stdio::null());
+      .stdin(Stdio::null())
+      .stdout(Stdio::null())
+      .stderr(Stdio::null());
     if let Err(err) = cmd.spawn() {
       tracing::warn!("open url {url:?}: {err}");
     }
@@ -1760,7 +1796,7 @@ impl App {
       let timer = Timer::immediate();
       self.windows[idx].autoscroll_timer = self
         .loop_handle
-        .insert_source(timer, |_, _, app: &mut App| app.autoscroll_step())
+        .insert_source(timer, |_, (), app: &mut Self| app.autoscroll_step())
         .ok();
     }
   }
@@ -1799,7 +1835,7 @@ impl App {
   }
 
   /// Left-button release: stop autoscrolling and publish the primary selection.
-  fn pointer_release(&mut self, qh: &QueueHandle<App>) {
+  fn pointer_release(&mut self, qh: &QueueHandle<Self>) {
     let idx = self.focused_window;
     if !self.windows[idx].selecting {
       return;
@@ -1964,7 +2000,7 @@ impl App {
   }
 
   /// Take ownership of the CLIPBOARD selection, serving `text` to pasters.
-  fn claim_clipboard(&mut self, text: String, qh: &QueueHandle<App>) {
+  fn claim_clipboard(&mut self, text: String, qh: &QueueHandle<Self>) {
     let Some(device) = self.data_device() else {
       return;
     };
@@ -1977,7 +2013,7 @@ impl App {
   }
 
   /// Take ownership of the primary selection, serving `text` to pasters.
-  fn claim_primary(&mut self, text: String, qh: &QueueHandle<App>) {
+  fn claim_primary(&mut self, text: String, qh: &QueueHandle<Self>) {
     let (Some(manager), Some(device)) =
       (self.primary_manager.as_ref(), self.primary_device())
     else {
@@ -1991,14 +2027,14 @@ impl App {
   }
 
   /// Claim the clipboard (CLIPBOARD) with the current selection (Ctrl+Shift+C).
-  fn set_clipboard(&mut self, qh: &QueueHandle<App>) {
+  fn set_clipboard(&mut self, qh: &QueueHandle<Self>) {
     if let Some(text) = self.selection_text(self.focused_window) {
       self.claim_clipboard(text, qh);
     }
   }
 
   /// Claim the primary selection with the current selection (select-to-copy).
-  fn set_primary(&mut self, qh: &QueueHandle<App>) {
+  fn set_primary(&mut self, qh: &QueueHandle<Self>) {
     if let Some(text) = self.selection_text(self.focused_window) {
       self.claim_primary(text, qh);
     }
@@ -2012,15 +2048,17 @@ impl App {
       return;
     };
     let (cx, cy) = session.term.grid().cursor();
-    let m = self.renderer.metrics();
-    let s = f64::from(self.windows[idx].scale120) / 120.0;
+    let metrics = self.renderer.metrics();
+    let scale = f64::from(self.windows[idx].scale120) / 120.0;
     let pad_x = f64::from(self.to_phys(idx, self.config.main.pad_x));
     let pad_y = f64::from(self.to_phys(idx, self.config.main.pad_y));
-    let x = ((pad_x + cx as f64 * f64::from(m.width)) / s) as i32;
-    let y = ((pad_y + cy as f64 * f64::from(m.height)) / s) as i32;
-    let w = (f64::from(m.width) / s) as i32;
-    let h = (f64::from(m.height) / s) as i32;
-    ti.set_cursor_rectangle(x, y, w.max(1), h.max(1));
+    let cursor_x =
+      ((cx as f64).mul_add(f64::from(metrics.width), pad_x) / scale) as i32;
+    let cursor_y =
+      ((cy as f64).mul_add(f64::from(metrics.height), pad_y) / scale) as i32;
+    let width = (f64::from(metrics.width) / scale) as i32;
+    let height = (f64::from(metrics.height) / scale) as i32;
+    ti.set_cursor_rectangle(cursor_x, cursor_y, width.max(1), height.max(1));
   }
 
   /// Apply one IME transaction: commit any committed text to the shell, adopt
@@ -2044,7 +2082,7 @@ impl App {
 
   /// Act on the OSC 52 clipboard requests an application made: take ownership
   /// of the selection it set, or answer a query with what we currently hold.
-  fn handle_clipboard_ops(&mut self, ops: Vec<crate::vt::ClipboardOp>) {
+  fn handle_clipboard_ops(&mut self, ops: Vec<ClipboardOp>) {
     use crate::vt::ClipboardOp;
     let qh = self.qh.clone();
     for op in ops {
@@ -2075,7 +2113,7 @@ impl App {
   }
 
   /// Paste the CLIPBOARD selection into the shell (Ctrl+Shift+V).
-  fn paste_clipboard(&mut self) {
+  fn paste_clipboard(&self) {
     let Some(offer) =
       self.data_device().and_then(|d| d.data().selection_offer())
     else {
@@ -2092,7 +2130,7 @@ impl App {
   }
 
   /// Paste the primary selection into the shell (middle click).
-  fn paste_primary(&mut self) {
+  fn paste_primary(&self) {
     let Some(offer) = self
       .primary_device()
       .and_then(|d| d.data().selection_offer())
@@ -2109,19 +2147,25 @@ impl App {
 
   /// Drain a clipboard read-pipe on the event loop, writing the bytes to the
   /// PTY once the source closes its end.
+  #[expect(
+    unsafe_code,
+    reason = "calloop's NoIoDrop wrapper exposes the owned pipe only through \
+              get_mut"
+  )]
   fn read_paste(
-    &mut self,
+    &self,
     pipe: smithay_client_toolkit::data_device_manager::ReadPipe,
   ) {
     let mut data: Vec<u8> = Vec::new();
     let registered =
       self
         .loop_handle
-        .insert_source(pipe, move |_, file, app: &mut App| {
-          // SAFETY: the file is owned by the source and not closed while read.
-          let f: &mut File = unsafe { file.get_mut() };
+        .insert_source(pipe, move |(), file, app: &mut Self| {
           let mut tmp = [0u8; 4096];
-          match f.read(&mut tmp) {
+          // SAFETY: the event source owns this file and keeps it alive for the
+          // duration of the callback; no other callback accesses it.
+          let file: &mut File = unsafe { file.get_mut() };
+          match file.read(&mut tmp) {
             Ok(0) => {
               tracing::debug!(
                 "paste: read {} bytes from clipboard",
@@ -2164,8 +2208,7 @@ impl App {
     for &b in data {
       match b {
         b'\n' => clean.push(b'\r'),
-        b'\t' | b'\r' => clean.push(b),
-        0x20..=0xFF => clean.push(b),
+        b'\t' | b'\r' | 0x20..=0xFF => clean.push(b),
         _ => {},
       }
     }
@@ -2219,16 +2262,20 @@ impl App {
 
   /// React to a `BEL`: optionally flash, run the configured bell command, and
   /// request the compositor's attention when unfocused.
+  #[expect(
+    clippy::disallowed_methods,
+    reason = "the configured bell command is an explicit user feature"
+  )]
   fn ring_bell(&mut self) {
     if self.config.bell.visual {
       self.start_flash();
     }
     if let Some((program, args)) = self.config.bell.command.split_first() {
-      let _ = std::process::Command::new(program)
+      let _ = Command::new(program)
         .args(args)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
         .inspect_err(|err| tracing::warn!("bell command: {err}"));
     }
@@ -2239,7 +2286,11 @@ impl App {
 
   /// Deliver a desktop notification through the configured notifier (default
   /// `notify-send`), appending the title and body as the final arguments.
-  fn send_notification(&self, note: &crate::vt::Notification) {
+  #[expect(
+    clippy::disallowed_methods,
+    reason = "the configured notifier is an explicit user feature"
+  )]
+  fn send_notification(&self, note: &Notification) {
     let Some((program, args)) = self.config.notify.command.split_first() else {
       return;
     };
@@ -2248,19 +2299,19 @@ impl App {
       .clone()
       .or_else(|| self.windows[self.focused_window].title.clone())
       .unwrap_or_else(|| "beer".to_string());
-    let _ = std::process::Command::new(program)
+    let _ = Command::new(program)
       .args(args)
       .arg(title)
       .arg(&note.body)
-      .stdin(std::process::Stdio::null())
-      .stdout(std::process::Stdio::null())
-      .stderr(std::process::Stdio::null())
+      .stdin(Stdio::null())
+      .stdout(Stdio::null())
+      .stderr(Stdio::null())
       .spawn()
       .inspect_err(|err| tracing::warn!("notify command: {err}"));
   }
 
   /// Ask the compositor to draw attention to the window (xdg-activation).
-  fn request_attention(&mut self) {
+  fn request_attention(&self) {
     let Some(activation) = self.activation.as_ref() else {
       return;
     };
@@ -2294,7 +2345,7 @@ impl App {
       let timer = Timer::from_duration(Duration::from_millis(FLASH_MS));
       self.windows[idx].flash_timer = self
         .loop_handle
-        .insert_source(timer, move |_, _, app: &mut App| {
+        .insert_source(timer, move |_, (), app: &mut Self| {
           // Resolve by id: the window may have closed since arming.
           if let Some(idx) = app.window_index_by_id(id) {
             app.windows[idx].flashing = false;
@@ -2380,7 +2431,7 @@ impl App {
           Timer::from_duration(Duration::from_millis(SYNC_TIMEOUT_MS));
         self.windows[idx].sync_timeout = self
           .loop_handle
-          .insert_source(timer, move |_, _, app: &mut App| {
+          .insert_source(timer, move |_, (), app: &mut Self| {
             // Resolve by id: the window may have closed since arming.
             if let Some(idx) = app.window_index_by_id(id) {
               if let Some(session) = app.windows[idx].session.as_mut() {
