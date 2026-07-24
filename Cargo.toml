@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members  = ["crates/beer", "crates/beer-protocols"]
+members  = [ "crates/beer", "crates/beer-protocols" ]
 
 [workspace.package]
 version      = "0.6.1"
@@ -14,7 +14,7 @@ beer-protocols = { path = "crates/beer-protocols", version = "0.6.1" }
 
 # Other dependencies
 anyhow = "1.0.102"
-calloop = { version = "0.14.4", features = ["signals"] }
+calloop = { version = "0.14.4", features = [ "signals" ] }
 calloop-wayland-source = "0.4.1"
 flate2 = "1.0.35"
 fontconfig = "0.11.0"
@@ -38,21 +38,17 @@ rustix = { version = "1.1.4", features = [
   "shm",
   "mm",
 ] }
-serde = { version = "1.0.228", features = ["derive"] }
+serde = { version = "1.0.228", features = [ "derive" ] }
 serde_ignored = "0.1.14"
 smithay-client-toolkit = "0.21.0"
 thiserror = "2.0.18"
 toml = "1.1.2"
 tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3.23", features = [ "env-filter" ] }
 unicode-width = "0.2.2"
 vte = "0.15.0"
 wayland-client = "0.31.14"
-wayland-protocols = { version = "0.32.13", features = [
-  "client",
-  "staging",
-  "unstable",
-] }
+wayland-protocols = { version = "0.32.13", features = [ "client", "staging", "unstable" ] }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn        = "deny"
@@ -62,7 +58,7 @@ missing_debug_implementations = "warn"
 all = { level = "warn", priority = -1 }
 
 [profile.release]
-opt-level     = 3
-lto           = "fat"
 codegen-units = 1
+lto           = "fat"
+opt-level     = 3
 strip         = true

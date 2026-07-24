@@ -1,9 +1,8 @@
 [advisories]
 version = 2
-yanked = "deny"
+yanked  = "deny"
 
 [licenses]
-version = 2
 allow = [
   "EUPL-1.2",
   "MIT",
@@ -17,11 +16,12 @@ allow = [
   "Zlib",
   "MPL-2.0",
 ]
+version = 2
 
 [bans]
 multiple-versions = "warn"
-wildcards = "allow"
+wildcards         = "allow"
 
 [sources]
+unknown-git      = "deny"
 unknown-registry = "deny"
-unknown-git = "deny"
