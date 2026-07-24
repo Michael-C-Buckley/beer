@@ -30,15 +30,17 @@ pub(super) struct FrameBuf {
 }
 
 /// Snapshot the determinants of viewport row `y`'s pixels.
-fn row_snap(grid: &Grid, y: usize, focused: bool, blink_on: bool) -> RowSnap {
+fn row_snap(
+  grid: &Grid,
+  y: usize,
+  focused: bool,
+  blink_on: bool,
+  overlay: Option<&str>,
+  preedit: Option<(usize, &str)>,
+) -> RowSnap {
   let abs = grid.view_to_abs(y);
   let cells = grid.view_row(y).to_vec();
-  let cursor = if grid.view_at_bottom() && grid.cursor().1 == y {
-    let visible = grid.cursor_visible() && (!grid.cursor_blink() || blink_on);
-    visible.then(|| (grid.cursor().0, grid.cursor_shape(), focused))
-  } else {
-    None
-  };
+  let cursor = row_cursor(grid, y, focused, blink_on);
   let has_blink = cells
     .iter()
     .any(|c| c.flags.contains(crate::grid::Flags::BLINK));
@@ -47,9 +49,60 @@ fn row_snap(grid: &Grid, y: usize, focused: bool, blink_on: bool) -> RowSnap {
     cursor,
     sel: grid.selection_span_on(abs),
     search: grid.search_spans_on(abs),
-    overlay: None,
-    preedit: None,
+    overlay: overlay.map(str::to_owned),
+    preedit: preedit.map(|(col, text)| (col, text.to_owned())),
     blink: if has_blink { blink_on } else { true },
+  }
+}
+
+/// Compare the current row directly to a buffer snapshot. This deliberately
+/// borrows grid cells: cloning is only needed after a row is known to be dirty.
+fn row_matches(
+  snapshot: Option<&RowSnap>,
+  grid: &Grid,
+  y: usize,
+  focused: bool,
+  blink_on: bool,
+  overlay: Option<&str>,
+  preedit: Option<(usize, &str)>,
+) -> bool {
+  let Some(snapshot) = snapshot else {
+    return false;
+  };
+  let abs = grid.view_to_abs(y);
+  let blink = if grid
+    .view_row(y)
+    .iter()
+    .any(|c| c.flags.contains(crate::grid::Flags::BLINK))
+  {
+    blink_on
+  } else {
+    true
+  };
+  snapshot.cells == grid.view_row(y)
+    && snapshot.cursor == row_cursor(grid, y, focused, blink_on)
+    && snapshot.sel == grid.selection_span_on(abs)
+    && snapshot.search == grid.search_spans_on(abs)
+    && snapshot.overlay.as_deref() == overlay
+    && snapshot
+      .preedit
+      .as_ref()
+      .map(|(col, text)| (*col, text.as_str()))
+      == preedit
+    && snapshot.blink == blink
+}
+
+fn row_cursor(
+  grid: &Grid,
+  y: usize,
+  focused: bool,
+  blink_on: bool,
+) -> Option<(usize, CursorShape, bool)> {
+  if grid.view_at_bottom() && grid.cursor().1 == y {
+    let visible = grid.cursor_visible() && (!grid.cursor_blink() || blink_on);
+    visible.then(|| (grid.cursor().0, grid.cursor_shape(), focused))
+  } else {
+    None
   }
 }
 impl App {
@@ -93,9 +146,6 @@ impl App {
     let flashed = win.flashing.then(|| session.term.theme().inverted());
     let theme = flashed.as_ref().unwrap_or(session.term.theme());
     let rows = grid.rows();
-    let mut cur: Vec<RowSnap> = (0..rows)
-      .map(|y| row_snap(grid, y, focused, blink_on))
-      .collect();
 
     // The search prompt occupies the bottom row while search mode is active.
     // Recording it in the snapshot keeps the row's damage/diff correct.
@@ -110,19 +160,13 @@ impl App {
         )
       })
     };
-    if let Some(text) = &bar_text
-      && rows > 0
-    {
-      cur[rows - 1].overlay = Some(text.clone());
-    }
-
     // The IME preedit is drawn inline at the cursor while composing.
-    if !win.preedit.is_empty() && grid.view_at_bottom() {
+    let preedit = if !win.preedit.is_empty() && grid.view_at_bottom() {
       let (cx, cy) = grid.cursor();
-      if cy < rows {
-        cur[cy].preedit = Some((cx, win.preedit.clone()));
-      }
-    }
+      (cy < rows).then_some((cy, cx, win.preedit.as_str()))
+    } else {
+      None
+    };
 
     // Reuse a buffer the compositor has released, else grow the ring.
     let stride = w as i32 * 4;
@@ -166,7 +210,13 @@ impl App {
     // Rows that differ from what this buffer last showed (all, if fresh).
     let prev = &win.frames[fidx].rows;
     let dirty: Vec<usize> = (0..rows)
-      .filter(|&y| prev.get(y) != Some(&cur[y]))
+      .filter(|&y| {
+        let overlay = (y + 1 == rows).then_some(bar_text.as_deref()).flatten();
+        let preedit = preedit
+          .filter(|&(row, ..)| row == y)
+          .map(|(_, col, text)| (col, text));
+        !row_matches(prev.get(y), grid, y, focused, blink_on, overlay, preedit)
+      })
       .collect();
     if dirty.is_empty() {
       return;
@@ -198,8 +248,10 @@ impl App {
     }
     // Draw the IME preedit inline over its (repainted) cursor row.
     for &y in &dirty {
-      if let Some((col, text)) = &cur[y].preedit {
-        renderer.render_preedit(canvas, dims, theme, y, *col, text);
+      if let Some((row, col, text)) = preedit
+        && row == y
+      {
+        renderer.render_preedit(canvas, dims, theme, y, col, text);
       }
     }
     // Draw URL hint labels on top, narrowing to those matching the input.
@@ -210,7 +262,20 @@ impl App {
         }
       }
     }
-    win.frames[fidx].rows = cur;
+    let snapshots = &mut win.frames[fidx].rows;
+    for &y in &dirty {
+      let overlay = (y + 1 == rows).then_some(bar_text.as_deref()).flatten();
+      let preedit = preedit
+        .filter(|&(row, ..)| row == y)
+        .map(|(_, col, text)| (col, text));
+      let snapshot = row_snap(grid, y, focused, blink_on, overlay, preedit);
+      if y < snapshots.len() {
+        snapshots[y] = snapshot;
+      } else {
+        snapshots.push(snapshot);
+      }
+    }
+    snapshots.truncate(rows);
 
     let surface = win.window.wl_surface();
     if let Err(err) = win.frames[fidx].buffer.attach_to(surface) {
@@ -236,5 +301,36 @@ impl App {
     surface.frame(&self.qh, FrameCallbackData(surface.clone()));
     win.window.commit();
     win.frame_pending = true;
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn row_comparison_detects_only_real_row_changes() {
+    let mut grid = Grid::new(2, 1);
+    let snapshot = row_snap(&grid, 0, true, true, None, None);
+    assert!(row_matches(
+      Some(&snapshot),
+      &grid,
+      0,
+      true,
+      true,
+      None,
+      None,
+    ));
+
+    grid.print('x');
+    assert!(!row_matches(
+      Some(&snapshot),
+      &grid,
+      0,
+      true,
+      true,
+      None,
+      None,
+    ));
   }
 }
