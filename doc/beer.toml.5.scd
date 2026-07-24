@@ -76,6 +76,15 @@ channel).
 *bold-as-bright* = _bool_
 	Render bold text with the bright palette variant. Default _true_.
 
+*alpha-blending* = _native_ | _linear_ | _linear-corrected_
+	How glyph coverage is composited over the background. _native_ blends in
+	sRGB space (like Foot). _linear_ blends in linear light (gamma-correct, but
+	thin text looks lighter). _linear-corrected_ (the default) blends in linear
+	light but remaps coverage to keep the perceived weight of _native_ while
+	avoiding dark fringing on coloured text, matching Kitty and Ghostty.
+	Subpixel (LCD) glyphs always composite in _native_; over a translucent
+	background all modes fall back to _native_.
+
 # [cursor]
 
 *style* = _string_
