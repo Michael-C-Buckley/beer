@@ -11,7 +11,7 @@
 
 use std::{
   collections::HashMap,
-  io::{Read as _, Seek as _, SeekFrom},
+  io::{BufReader, Cursor, Read, SeekFrom},
 };
 
 use beer_protocols::{
@@ -23,8 +23,14 @@ use beer_protocols::{
 /// client claiming an enormous size. 64 MiB is far beyond any real preview.
 const MAX_IMAGE_BYTES: usize = 64 * 1024 * 1024;
 
-/// Cap on accumulated direct-transmission base64 across chunks.
-const MAX_TRANSMIT_BYTES: usize = 96 * 1024 * 1024;
+/// Every encoded, file, shared-memory, and decompressed source is capped at
+/// the maximum decoded image size. A source larger than its resulting image is
+/// not useful to this renderer and only increases peak memory pressure.
+const MAX_SOURCE_BYTES: usize = MAX_IMAGE_BYTES;
+
+/// Cap on accumulated direct-transmission base64 across chunks. The image cap
+/// is a multiple of three, so this is its exact padded base64 representation.
+const MAX_TRANSMIT_BYTES: usize = MAX_SOURCE_BYTES / 3 * 4;
 
 /// Freshly decoded pixels before they become an image or animation frame:
 /// `width * height * 4` bytes of row-major, non-premultiplied RGBA.
@@ -329,6 +335,9 @@ impl Graphics {
     b64: &[u8],
   ) -> Result<Pixels, String> {
     let raw = base64_decode(b64).ok_or("EINVAL: bad base64 payload")?;
+    if raw.len() > MAX_SOURCE_BYTES {
+      return Err("EINVAL: source data too large".into());
+    }
     // For non-direct mediums the payload is the path / shared-memory name.
     let bytes = match cmd.medium {
       Medium::Direct => raw,
@@ -658,33 +667,42 @@ fn cell_rect(
   let by_px_h = src_h.div_ceil(cell_h).max(1);
   let (cols, rows) = match (c, r) {
     (0, 0) => (by_px_w, by_px_h),
-    (c, 0) => {
-      (
-        c,
-        ((c * cell_w) as u64 * src_h as u64
-          / (src_w.max(1) as u64 * cell_h as u64))
-          .max(1) as u32,
-      )
-    },
-    (0, r) => {
-      (
-        ((r * cell_h) as u64 * src_w as u64
-          / (src_h.max(1) as u64 * cell_w as u64))
-          .max(1) as u32,
-        r,
-      )
-    },
+    (c, 0) => (c, aspect_cells(c, cell_w, src_h, src_w.max(1), cell_h)),
+    (0, r) => (aspect_cells(r, cell_h, src_w, src_h.max(1), cell_w), r),
     (c, r) => (c, r),
   };
   (cols as usize, rows as usize)
+}
+
+/// Scale a requested cell dimension by source aspect ratio without allowing
+/// terminal-controlled dimensions to overflow intermediate arithmetic.
+fn aspect_cells(
+  cells: u32,
+  cell_px: u32,
+  source_num: u32,
+  source_den: u32,
+  other_cell_px: u32,
+) -> u32 {
+  let numerator =
+    u128::from(cells) * u128::from(cell_px) * u128::from(source_num);
+  let denominator = u128::from(source_den) * u128::from(other_cell_px);
+  (numerator / denominator).max(1).min(u128::from(u32::MAX)) as u32
 }
 
 /// Decode transmitted bytes into RGBA [`Pixels`] per the command's format.
 fn decode(cmd: &GraphicsCommand, bytes: Vec<u8>) -> Result<Pixels, String> {
   match cmd.format {
     Format::Png => {
-      let img =
-        image::load_from_memory(&bytes).map_err(|e| format!("EINVAL: {e}"))?;
+      let mut reader = image::ImageReader::with_format(
+        BufReader::new(Cursor::new(bytes)),
+        image::ImageFormat::Png,
+      );
+      let mut limits = image::Limits::default();
+      limits.max_image_width = Some((MAX_IMAGE_BYTES / 4) as u32);
+      limits.max_image_height = Some((MAX_IMAGE_BYTES / 4) as u32);
+      limits.max_alloc = Some(MAX_IMAGE_BYTES as u64);
+      reader.limits(limits);
+      let img = reader.decode().map_err(|e| format!("EINVAL: {e}"))?;
       let rgba = img.to_rgba8();
       let (width, height) = (rgba.width(), rgba.height());
       check_size(width, height)?;
@@ -695,8 +713,8 @@ fn decode(cmd: &GraphicsCommand, bytes: Vec<u8>) -> Result<Pixels, String> {
       })
     },
     Format::Rgba => {
-      check_size(cmd.width, cmd.height)?;
-      let want = cmd.width as usize * cmd.height as usize * 4;
+      let pixels = check_size(cmd.width, cmd.height)?;
+      let want = pixels * 4;
       if bytes.len() < want {
         return Err("EINVAL: RGBA data smaller than s*v*4".into());
       }
@@ -707,13 +725,13 @@ fn decode(cmd: &GraphicsCommand, bytes: Vec<u8>) -> Result<Pixels, String> {
       })
     },
     Format::Rgb => {
-      check_size(cmd.width, cmd.height)?;
-      let px = cmd.width as usize * cmd.height as usize;
-      if bytes.len() < px * 3 {
+      let pixels = check_size(cmd.width, cmd.height)?;
+      let want = pixels * 3;
+      if bytes.len() < want {
         return Err("EINVAL: RGB data smaller than s*v*3".into());
       }
-      let mut rgba = Vec::with_capacity(px * 4);
-      for chunk in bytes[..px * 3].chunks_exact(3) {
+      let mut rgba = Vec::with_capacity(pixels * 4);
+      for chunk in bytes[..want].chunks_exact(3) {
         rgba.extend_from_slice(chunk);
         rgba.push(0xFF);
       }
@@ -726,15 +744,21 @@ fn decode(cmd: &GraphicsCommand, bytes: Vec<u8>) -> Result<Pixels, String> {
   }
 }
 
-fn check_size(width: u32, height: u32) -> Result<(), String> {
+/// Validate decoded geometry and return its pixel count.
+fn check_size(width: u32, height: u32) -> Result<usize, String> {
   if width == 0 || height == 0 {
     return Err("EINVAL: zero image dimension".into());
   }
-  let bytes = width as usize * height as usize * 4;
+  let pixels = (width as usize)
+    .checked_mul(height as usize)
+    .ok_or("EINVAL: image dimensions overflow")?;
+  let bytes = pixels
+    .checked_mul(4)
+    .ok_or("EINVAL: image dimensions overflow")?;
   if bytes > MAX_IMAGE_BYTES {
     return Err("EINVAL: image too large".into());
   }
-  Ok(())
+  Ok(pixels)
 }
 
 /// Append `data` to `buf`, dropping the excess once `cap` is reached so a
@@ -831,11 +855,9 @@ fn blend_into(dst: &mut [u8], src: &[u8], overwrite: bool) {
 
 /// zlib-inflate `o=z` payloads.
 fn inflate(bytes: &[u8]) -> Result<Vec<u8>, String> {
-  let mut out = Vec::new();
-  flate2::read::ZlibDecoder::new(bytes)
-    .read_to_end(&mut out)
-    .map_err(|e| format!("EINVAL: zlib: {e}"))?;
-  Ok(out)
+  let mut decoder = flate2::read::ZlibDecoder::new(bytes);
+  read_limited(&mut decoder, MAX_SOURCE_BYTES)
+    .map_err(|e| format!("EINVAL: zlib: {e}"))
 }
 
 /// Read the data for a file / temp-file / shared-memory transmission. `name` is
@@ -872,8 +894,8 @@ fn read_shm(name: &str, offset: u32, size: u32) -> Result<Vec<u8>, String> {
   data
 }
 
-fn read_region(
-  f: &mut std::fs::File,
+fn read_region<R: Read + std::io::Seek>(
+  f: &mut R,
   offset: u32,
   size: u32,
 ) -> Result<Vec<u8>, String> {
@@ -881,14 +903,48 @@ fn read_region(
     f.seek(SeekFrom::Start(offset as u64))
       .map_err(|e| format!("EIO: {e}"))?;
   }
-  let mut buf = Vec::new();
   if size != 0 {
-    buf.resize(size as usize, 0);
+    let size = size as usize;
+    if size > MAX_SOURCE_BYTES {
+      return Err("EINVAL: source data too large".into());
+    }
+    let mut buf = vec![0; size];
     f.read_exact(&mut buf).map_err(|e| format!("EIO: {e}"))?;
+    Ok(buf)
   } else {
-    f.read_to_end(&mut buf).map_err(|e| format!("EIO: {e}"))?;
+    read_limited(f, MAX_SOURCE_BYTES).map_err(|e| format!("EIO: {e}"))
   }
-  Ok(buf)
+}
+
+/// Read one source without letting a special file or decompressor grow an
+/// unbounded buffer. Read one byte beyond the cap to distinguish exact-limit
+/// input from an oversized stream.
+fn read_limited<R: Read>(
+  reader: &mut R,
+  limit: usize,
+) -> std::io::Result<Vec<u8>> {
+  let mut out = Vec::new();
+  let mut chunk = [0u8; 8192];
+  loop {
+    if out.len() == limit {
+      let mut extra = [0u8; 1];
+      return match reader.read(&mut extra)? {
+        0 => Ok(out),
+        _ => {
+          Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "source data too large",
+          ))
+        },
+      };
+    }
+    let count = (limit - out.len()).min(chunk.len());
+    let n = reader.read(&mut chunk[..count])?;
+    if n == 0 {
+      return Ok(out);
+    }
+    out.extend_from_slice(&chunk[..n]);
+  }
 }
 
 /// Whether a temp-file path is safe to delete: it lives in a known temporary
@@ -987,6 +1043,34 @@ mod tests {
     assert_eq!(img.current_rgba(), [
       0x10, 0x10, 0x10, 0xFF, 0x10, 0x10, 0x10, 0xFF
     ]);
+  }
+
+  #[test]
+  fn oversized_dimensions_are_rejected_without_wrapping() {
+    assert!(check_size(u32::MAX, u32::MAX).is_err());
+
+    let mut g = Graphics::new();
+    let out = g.handle(
+      rgba_cmd(u32::MAX, u32::MAX, 7, Action::Transmit),
+      &[],
+      (8, 16),
+    );
+    assert!(out.response.as_deref().is_some_and(|response| {
+      response.windows(b"EINVAL".len()).any(|w| w == b"EINVAL")
+    }));
+    assert!(g.image(7).is_none());
+  }
+
+  #[test]
+  fn aspect_ratio_math_clamps_huge_placement_dimensions() {
+    let (_, rows) = cell_rect(u32::MAX, 0, u32::MAX, u32::MAX, u32::MAX, 1);
+    assert_eq!(rows, u32::MAX as usize);
+  }
+
+  #[test]
+  fn bounded_reader_rejects_data_past_its_limit() {
+    let mut data = Cursor::new(b"four".as_slice());
+    assert!(read_limited(&mut data, 3).is_err());
   }
 
   #[test]
