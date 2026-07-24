@@ -117,6 +117,23 @@ impl Default for Url {
   }
 }
 
+/// How glyph coverage is composited over the background.
+///
+/// `Native` blends in the stored sRGB space (fast, matches Foot's default).
+/// `Linear` blends in linear light (gamma-correct, but thin text looks
+/// lighter). `LinearCorrected` blends in linear light but remaps the coverage
+/// so the result keeps the perceived weight of `Native` while avoiding the
+/// dark colour fringing of `Native` on coloured text - this is what Kitty and
+/// Ghostty default to. Subpixel (LCD) glyphs always composite in `Native`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AlphaBlending {
+  Native,
+  Linear,
+  #[default]
+  LinearCorrected,
+}
+
 /// `[colors]`: foreground/background, the 16 base palette entries, and accents.
 /// Each value is an X11 colour spec (`#rrggbb` or `rgb:rr/gg/bb`); unset
 /// entries keep the built-in default.
@@ -138,6 +155,9 @@ pub struct Colors {
   pub alpha:                    Option<f32>,
   /// Render bold text with the bright palette variant.
   pub bold_as_bright:           Option<bool>,
+  /// How glyph coverage is composited over the background.
+  #[serde(default)]
+  pub alpha_blending:           AlphaBlending,
 }
 
 /// Subpixel (LCD) antialiasing order. `None` renders grayscale coverage, which

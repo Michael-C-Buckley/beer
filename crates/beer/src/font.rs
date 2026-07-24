@@ -76,6 +76,9 @@ pub struct CellMetrics {
   pub height: u32,
   /// Baseline offset from the top of the cell.
   pub ascent: u32,
+  /// Light stroke thickness in pixels, from the face's underline thickness.
+  /// Box-drawing lines use this so they match the font's visual weight.
+  pub stroke: u32,
 }
 
 /// A rasterized glyph: its bitmap plus the offsets to place it on the baseline.
@@ -510,10 +513,23 @@ fn cell_metrics(face: &Face, family: &str) -> Result<CellMetrics, FontError> {
   face.load_char('M' as usize, LoadFlag::DEFAULT)?;
   let width = (face.glyph().advance().x >> 6).max(1) as u32;
 
+  // Scale the face's underline thickness (font units) to pixels via the size's
+  // y-scale: `FT_MulFix` gives 26.6 pixels, then `>> 6`. Bitmap/colour faces
+  // may report zero, so fall back to a small fraction of the cell height.
+  let raw = i64::from(face.underline_thickness());
+  let scaled = (raw * metrics.y_scale + 0x8000) >> 16;
+  let underline_px = (scaled >> 6).max(0) as u32;
+  let stroke = if underline_px > 0 {
+    underline_px
+  } else {
+    (height / 12).max(1)
+  };
+
   Ok(CellMetrics {
     width,
     height,
     ascent,
+    stroke,
   })
 }
 
