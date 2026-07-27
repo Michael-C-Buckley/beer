@@ -670,6 +670,9 @@ impl App {
     }
 
     let Some(frame) = ctx.acquire(id, w, h) else {
+      // Every buffer is still held by the compositor; keep the redraw pending
+      // so a buffer release re-drives this paint.
+      ctx.request_redraw(id);
       return;
     };
     let buf_id = frame.id;
