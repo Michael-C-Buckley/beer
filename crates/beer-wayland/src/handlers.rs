@@ -201,6 +201,7 @@ impl CompositorHandler for WaylandState {
     self.plat.windows[idx].frame_pending = false;
     // The compositor is ready for another frame; repaint if the app has asked.
     if self.plat.windows[idx].wants_draw {
+      self.plat.windows[idx].wants_draw = false;
       let id = self.plat.windows[idx].id;
       self.app.render(&mut self.plat, id);
     }
