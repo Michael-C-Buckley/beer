@@ -14,7 +14,7 @@ use beer_protocols::{
 
 use crate::{
   config::{AlphaBlending, Subpixel},
-  font::{CellMetrics, FontError, Fonts, Glyph, GlyphData, Style},
+  font::{CellMetrics, Fonts, Glyph, GlyphData, Style},
   graphics::{Graphics, Image, Placement},
   grid::{Cell, Color, CursorShape, Flags, Grid, Underline},
   theme::{Plane, Rgb, Theme},
@@ -316,17 +316,6 @@ impl Renderer {
     } else {
       AlphaBlending::Native
     }
-  }
-
-  /// Rebuild the font set at a new size (font-resize bindings).
-  pub fn set_font(
-    &mut self,
-    family: &str,
-    size_px: u32,
-    subpixel: Subpixel,
-  ) -> Result<(), FontError> {
-    self.fonts = Fonts::new(family, size_px, subpixel)?;
-    Ok(())
   }
 
   /// Fill the whole buffer (including the padding margins) with the background

@@ -159,6 +159,10 @@ struct WinState {
   ime_preedit_pending: String,
   ime_commit_pending:  String,
   flashing:            bool,
+  /// Cell geometry of this window's renderer (physical px), refreshed whenever
+  /// its scale's renderer is (re)built. Read by the pointer/grid geometry so
+  /// it stays correct no matter which window's renderer was touched last.
+  metrics:             CellMetrics,
   /// Displayed state changed; a repaint is requested at the next trait-method
   /// boundary via `WindowCtx::request_redraw`.
   needs_draw:          bool,
@@ -209,6 +213,14 @@ impl WinState {
       ime_preedit_pending: String::new(),
       ime_commit_pending: String::new(),
       flashing: false,
+      // Non-zero placeholder until the window's renderer is ensured (before any
+      // geometry read); avoids a divide-by-zero if ever read early.
+      metrics: CellMetrics {
+        width:  1,
+        height: 1,
+        ascent: 0,
+        stroke: 1,
+      },
       needs_draw: false,
     }
   }
@@ -216,10 +228,10 @@ impl WinState {
 
 /// The terminal application state shared across all its windows.
 pub struct App {
-  renderer:     Renderer,
-  /// Scale (120ths) the shared renderer is currently rasterized for; windows
-  /// on differently-scaled outputs re-rasterize it before they paint.
-  render_scale: u32,
+  /// One renderer per output scale (120ths). Windows share the renderer for
+  /// their scale, so moving between differently-scaled outputs never
+  /// re-rasterizes the font.
+  renderers:    HashMap<u32, Renderer>,
   config:       Config,
   config_paths: Vec<PathBuf>,
   bindings:     Bindings,
@@ -261,6 +273,9 @@ impl App {
     server: bool,
   ) -> anyhow::Result<Self> {
     use anyhow::Context as _;
+    // Validate the font up front by building the scale-1.0 renderer; other
+    // output scales get their own renderer lazily (never re-rasterized on a
+    // window switch).
     let fonts = Fonts::new(
       &config.main.font,
       config.main.font_size,
@@ -270,6 +285,8 @@ impl App {
     let mut renderer = Renderer::new(fonts);
     renderer.set_padding(config.main.pad_x, config.main.pad_y);
     renderer.set_alpha_blending(config.colors.alpha_blending);
+    let mut renderers = HashMap::new();
+    renderers.insert(120, renderer);
     let bindings = Bindings::from_config(
       &config.key_bindings,
       &config.text_bindings,
@@ -278,9 +295,7 @@ impl App {
     let font_size = config.main.font_size;
     let resident = config.main.server_resident;
     Ok(Self {
-      renderer,
-      // Built at logical size, i.e. scale 1.0.
-      render_scale: 120,
+      renderers,
       config,
       config_paths,
       bindings,
@@ -337,7 +352,7 @@ impl App {
 
   fn grid_dims(&self, w: &WinState) -> (u16, u16) {
     let (pw, ph) = self.phys_dims(w);
-    let m = self.renderer.metrics();
+    let m = w.metrics;
     let pad = (
       self.to_phys(w, self.config.main.pad_x),
       self.to_phys(w, self.config.main.pad_y),
@@ -352,7 +367,7 @@ impl App {
   )]
   fn cell_at(&self, w: &WinState, px: f64, py: f64) -> Option<(usize, usize)> {
     let session = w.session.as_ref()?;
-    let m = self.renderer.metrics();
+    let m = w.metrics;
     let (pad_x, pad_y) = (
       f64::from(self.to_phys(w, self.config.main.pad_x)),
       f64::from(self.to_phys(w, self.config.main.pad_y)),
@@ -365,6 +380,15 @@ impl App {
       .min(grid.rows().saturating_sub(1));
     Some((grid.view_to_abs(vrow), col))
   }
+}
+
+/// Round a logical value to physical pixels for a 120ths scale (120 = 1.0).
+#[expect(
+  clippy::cast_possible_truncation,
+  reason = "the 120ths quotient of a bounded dimension fits u32"
+)]
+fn phys_at(v: u32, scale120: u32) -> u32 {
+  ((u64::from(v) * u64::from(scale120) + 60) / 120) as u32
 }
 
 /// Columns/rows for a physical size, metrics, and padding.
@@ -452,9 +476,9 @@ impl App {
   /// Spawn the shell for window `idx` at its current size and watch its master.
   #[expect(clippy::cast_possible_truncation, reason = "cell metrics fit u16")]
   fn spawn_session(&mut self, ctx: &mut dyn WindowCtx, idx: usize) {
-    self.ensure_render_scale(idx);
+    self.ensure_renderer(idx);
     let (cols, rows) = self.grid_dims(&self.windows[idx]);
-    let m = self.renderer.metrics();
+    let m = self.windows[idx].metrics;
     let cell = (m.width as u16, m.height as u16);
     let id = self.windows[idx].id;
     let cwd = self.windows[idx].pending_cwd.clone();
@@ -500,7 +524,7 @@ impl App {
   )]
   fn read_pty(&mut self, ctx: &mut dyn WindowCtx, idx: usize) {
     let id = self.windows[idx].id;
-    let cell = self.renderer.metrics();
+    let cell = self.windows[idx].metrics;
     let mut buf = [0u8; 4096];
     // One read per readiness. The backend watches the master level-triggered,
     // so leftover bytes simply re-fire this callback. The master is a blocking
@@ -647,7 +671,7 @@ impl App {
     if self.windows[idx].session.is_none() {
       return;
     }
-    self.ensure_render_scale(idx);
+    self.ensure_renderer(idx);
     // Synchronized output (DECSET 2026) withholds frames; arm a timeout so a
     // stuck `2026h` cannot freeze the window.
     let sync = self.windows[idx]
@@ -667,7 +691,8 @@ impl App {
     }
 
     let (w, h) = self.phys_dims(&self.windows[idx]);
-    let m = self.renderer.metrics();
+    let m = self.windows[idx].metrics;
+    let scale = self.windows[idx].scale120;
     let pad_y = self.to_phys(&self.windows[idx], self.config.main.pad_y);
     let focused = self.windows[idx].focused;
     let blink_on = self.blink_on;
@@ -736,32 +761,31 @@ impl App {
       hovered_link: win.hovered_link,
       images: session.term.graphics(),
     };
-    if fresh {
-      self.renderer.clear(pixels, dims, theme);
-    }
-    for &y in &dirty {
-      self.renderer.render_row(pixels, dims, grid, &rframe, y);
-    }
-    if let Some(text) = &bar_text
-      && dirty.contains(&(rows - 1))
-    {
-      self
-        .renderer
-        .render_search_bar(pixels, dims, theme, rows - 1, text);
-    }
-    for &y in &dirty {
-      if let Some((r, c, t)) = preedit
-        && r == y
-      {
-        self.renderer.render_preedit(pixels, dims, theme, y, c, t);
+    // Render through this window's scale renderer (disjoint from `windows`).
+    if let Some(renderer) = self.renderers.get_mut(&scale) {
+      if fresh {
+        renderer.clear(pixels, dims, theme);
       }
-    }
-    if win.url_mode {
-      for (hit, label) in win.url_hits.iter().zip(&win.url_labels) {
-        if label.starts_with(&win.url_input) {
-          self
-            .renderer
-            .render_label(pixels, dims, theme, hit.row, hit.col, label);
+      for &y in &dirty {
+        renderer.render_row(pixels, dims, grid, &rframe, y);
+      }
+      if let Some(text) = &bar_text
+        && dirty.contains(&(rows - 1))
+      {
+        renderer.render_search_bar(pixels, dims, theme, rows - 1, text);
+      }
+      for &y in &dirty {
+        if let Some((r, c, t)) = preedit
+          && r == y
+        {
+          renderer.render_preedit(pixels, dims, theme, y, c, t);
+        }
+      }
+      if win.url_mode {
+        for (hit, label) in win.url_hits.iter().zip(&win.url_labels) {
+          if label.starts_with(&win.url_input) {
+            renderer.render_label(pixels, dims, theme, hit.row, hit.col, label);
+          }
         }
       }
     }
@@ -1204,8 +1228,8 @@ impl App {
     idx: usize,
     event: PointerEvent,
   ) {
-    self.ensure_render_scale(idx);
-    let cell_h = f64::from(self.renderer.metrics().height);
+    self.ensure_renderer(idx);
+    let cell_h = f64::from(self.windows[idx].metrics.height);
     match event {
       PointerEvent::Enter { x, y, .. } => {
         self.windows[idx].pointer_pos = (x, y);
@@ -1416,7 +1440,7 @@ impl App {
   fn report_screen_cell(&self, idx: usize) -> Option<(usize, usize)> {
     let w = &self.windows[idx];
     let session = w.session.as_ref()?;
-    let m = self.renderer.metrics();
+    let m = w.metrics;
     let (pad_x, pad_y) = (
       f64::from(self.to_phys(w, self.config.main.pad_x)),
       f64::from(self.to_phys(w, self.config.main.pad_y)),
@@ -1563,8 +1587,8 @@ impl App {
     reason = "touch scroll deltas are small line counts"
   )]
   fn on_touch_event(&mut self, idx: usize, event: TouchEvent) {
-    self.ensure_render_scale(idx);
-    let cell_h = f64::from(self.renderer.metrics().height);
+    self.ensure_renderer(idx);
+    let cell_h = f64::from(self.windows[idx].metrics.height);
     match event {
       TouchEvent::Down { id, y, .. } => {
         if self.windows[idx].touch_scroll.is_none() {
@@ -1612,7 +1636,7 @@ impl App {
       return;
     };
     let (cx, cy) = session.term.grid().cursor();
-    let m = self.renderer.metrics();
+    let m = w.metrics;
     let scale = f64::from(w.scale120) / 120.0;
     let pad_x = f64::from(self.to_phys(w, self.config.main.pad_x));
     let pad_y = f64::from(self.to_phys(w, self.config.main.pad_y));
@@ -1786,37 +1810,48 @@ impl App {
 
   // ---- geometry / font ---------------------------------------------------
 
-  fn rescale_render(&mut self, idx: usize) {
-    let w = &self.windows[idx];
-    let (pad_x, pad_y) = (
-      self.to_phys(w, self.config.main.pad_x),
-      self.to_phys(w, self.config.main.pad_y),
+  /// Build a renderer rasterized for `scale120` at the current font size.
+  fn build_renderer(&self, scale120: u32) -> anyhow::Result<Renderer> {
+    use anyhow::Context as _;
+    let px = phys_at(self.font_size, scale120).max(1);
+    let fonts =
+      Fonts::new(&self.config.main.font, px, self.config.main.subpixel)
+        .context("load font")?;
+    let mut renderer = Renderer::new(fonts);
+    renderer.set_padding(
+      phys_at(self.config.main.pad_x, scale120),
+      phys_at(self.config.main.pad_y, scale120),
     );
-    let px = self.to_phys(w, self.font_size).max(1);
-    self.render_scale = w.scale120;
-    self.renderer.set_padding(pad_x, pad_y);
-    if let Err(err) = self.renderer.set_font(
-      &self.config.main.font,
-      px,
-      self.config.main.subpixel,
-    ) {
-      tracing::warn!("rasterize font: {err:#}");
-    }
+    renderer.set_alpha_blending(self.config.colors.alpha_blending);
+    Ok(renderer)
   }
 
-  /// Rasterize the shared renderer for window `idx`'s scale if it is currently
-  /// set for a different one (multiple windows can sit on different outputs).
-  fn ensure_render_scale(&mut self, idx: usize) {
-    if self.render_scale != self.windows[idx].scale120 {
-      self.rescale_render(idx);
+  /// Ensure a renderer exists for window `idx`'s scale (building it once) and
+  /// refresh the window's cached cell metrics from it. Cheap when cached, so a
+  /// window switch never re-rasterizes the font.
+  fn ensure_renderer(&mut self, idx: usize) {
+    let scale = self.windows[idx].scale120;
+    if !self.renderers.contains_key(&scale) {
+      match self.build_renderer(scale) {
+        Ok(renderer) => {
+          self.renderers.insert(scale, renderer);
+        },
+        Err(err) => {
+          tracing::warn!("rasterize font: {err:#}");
+          return;
+        },
+      }
+    }
+    if let Some(renderer) = self.renderers.get(&scale) {
+      self.windows[idx].metrics = renderer.metrics();
     }
   }
 
   #[expect(clippy::cast_possible_truncation, reason = "cell metrics fit u16")]
   fn resize_grid(&mut self, idx: usize) {
-    self.ensure_render_scale(idx);
+    self.ensure_renderer(idx);
     let (cols, rows) = self.grid_dims(&self.windows[idx]);
-    let m = self.renderer.metrics();
+    let m = self.windows[idx].metrics;
     let cell = (m.width as u16, m.height as u16);
     let Some(session) = self.windows[idx].session.as_mut() else {
       return;
@@ -1838,7 +1873,7 @@ impl App {
       return;
     }
     self.windows[idx].scale120 = scale120;
-    self.rescale_render(idx);
+    self.ensure_renderer(idx);
     self.windows[idx].snaps.clear();
     self.resize_grid(idx);
     self.windows[idx].needs_draw = true;
@@ -1847,7 +1882,7 @@ impl App {
   fn change_font_size(
     &mut self,
     _ctx: &mut dyn WindowCtx,
-    idx: usize,
+    _idx: usize,
     new_size: u32,
   ) {
     let new_size = new_size.clamp(6, 200);
@@ -1855,10 +1890,14 @@ impl App {
       return;
     }
     self.font_size = new_size;
-    self.rescale_render(idx);
-    self.windows[idx].snaps.clear();
-    self.resize_grid(idx);
-    self.windows[idx].needs_draw = true;
+    // Every cached renderer was rasterized at the old size; drop them all and
+    // refresh each window so they rebuild at the new size.
+    self.renderers.clear();
+    for i in 0..self.windows.len() {
+      self.resize_grid(i);
+      self.windows[i].snaps.clear();
+      self.windows[i].needs_draw = true;
+    }
   }
 }
 
@@ -1970,11 +2009,6 @@ impl App {
     {
       self.font_size = new.main.font_size;
     }
-    self.config.main.font = new.main.font.clone();
-    self.config.main.font_size = new.main.font_size;
-    self.config.main.pad_x = new.main.pad_x;
-    self.config.main.pad_y = new.main.pad_y;
-    self.rescale_render(idx);
     if let Some(session) = self.windows[idx].session.as_mut() {
       session.term.set_theme(Theme::from_config(&new.colors));
       let grid = session.term.grid_mut();
@@ -1985,8 +2019,10 @@ impl App {
       }
       grid.set_cursor_blink(new.cursor.blink);
     }
-    self.renderer.set_alpha_blending(new.colors.alpha_blending);
     self.config = new;
+    // Font, padding, and blending may all have changed; drop every cached
+    // renderer so each rebuilds from the new config.
+    self.renderers.clear();
     self.windows[idx].snaps.clear();
     self.resize_grid(idx);
     self.windows[idx].needs_draw = true;
