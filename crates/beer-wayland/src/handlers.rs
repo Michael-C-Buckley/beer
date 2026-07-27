@@ -548,10 +548,10 @@ impl PointerHandler for WaylandState {
           // Wheel notches arrive as value120 (÷120) or legacy discrete steps;
           // touchpads send absolute pixels. Hand the app a logical-pixel delta
           // plus whether it was a discrete notch.
-          let discrete = vertical.value120 != 0
-            || vertical.discrete != 0
-            || horizontal.value120 != 0
-            || horizontal.discrete != 0;
+          // `discrete` drives the app's vertical dy classification, so judge it
+          // from the vertical axis alone - a horizontal notch must not make a
+          // smooth vertical delta look like a wheel step.
+          let discrete = vertical.value120 != 0 || vertical.discrete != 0;
           let dy = if vertical.value120 != 0 {
             f64::from(vertical.value120) / 120.0
           } else if vertical.discrete != 0 {
