@@ -9,6 +9,7 @@ readme                 = "README.md"
 
 [dependencies]
 anyhow.workspace                 = true
+beer-ipc.workspace               = true
 beer-protocols.workspace         = true
 calloop.workspace                = true
 calloop-wayland-source.workspace = true

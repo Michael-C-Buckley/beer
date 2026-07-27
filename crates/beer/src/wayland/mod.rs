@@ -23,6 +23,7 @@ use std::{
 };
 
 use anyhow::Context;
+use beer_ipc as ipc;
 use calloop::{
   EventLoop,
   Interest,
@@ -151,7 +152,6 @@ use crate::{
   config::Config,
   font::{CellMetrics, Fonts},
   grid::{Cell, CursorShape, Grid, MouseProtocol, UrlHit},
-  ipc,
   pty::Pty,
   render::Renderer,
   theme::Theme,

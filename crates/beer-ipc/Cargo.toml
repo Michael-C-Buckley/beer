@@ -1,0 +1,13 @@
+[package]
+name                   = "beer-ipc"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+description            = "Unix-socket daemon/client IPC for the beer terminal"
+
+[dependencies]
+rustix.workspace = true
+
+[lints]
+workspace = true

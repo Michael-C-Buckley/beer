@@ -67,6 +67,7 @@ name = "beer"
 version = "0.8.1"
 dependencies = [
  "anyhow",
+ "beer-ipc",
  "beer-protocols",
  "calloop",
  "calloop-wayland-source",
@@ -90,6 +91,13 @@ dependencies = [
  "vte",
  "wayland-client",
  "wayland-protocols",
+]
+
+[[package]]
+name = "beer-ipc"
+version = "0.8.1"
+dependencies = [
+ "rustix",
 ]
 
 [[package]]

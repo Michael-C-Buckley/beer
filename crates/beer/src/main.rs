@@ -5,7 +5,6 @@ mod config;
 mod font;
 mod graphics;
 mod grid;
-mod ipc;
 mod pty;
 mod render;
 mod theme;
@@ -14,6 +13,7 @@ mod wayland;
 
 use std::{env, io, path::PathBuf, process::ExitCode};
 
+use beer_ipc as ipc;
 use pound::Parse;
 
 use crate::config::Config;

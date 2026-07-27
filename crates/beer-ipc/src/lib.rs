@@ -34,6 +34,11 @@ pub struct OpenRequest {
 /// Daemon IPC carries a client's environment and starts a shell as the server,
 /// so it must live in the user's private runtime directory rather than a
 /// shared temp directory.
+///
+/// # Errors
+///
+/// Fails if `XDG_RUNTIME_DIR` is unset/empty or does not resolve to a private,
+/// user-owned directory.
 #[expect(
   clippy::absolute_paths,
   reason = "daemon discovery intentionally uses the process environment and \
@@ -66,6 +71,11 @@ pub fn socket_path() -> io::Result<PathBuf> {
 
 /// Bind the daemon listener with owner-only access, replacing only a stale
 /// socket at its exact path.
+///
+/// # Errors
+///
+/// Fails if the runtime path cannot be resolved, a live server already owns the
+/// socket, or the bind/permission calls fail.
 pub fn bind_listener() -> io::Result<(UnixListener, PathBuf)> {
   let path = socket_path()?;
   let listener = bind_listener_at(&path)?;
@@ -125,6 +135,7 @@ impl OpenRequest {
     clippy::cast_possible_truncation,
     reason = "the IPC wire format deliberately uses u32 length fields"
   )]
+  #[must_use]
   pub fn encode(&self) -> Vec<u8> {
     let mut body = Vec::new();
     put_bytes(&mut body, self.cwd.as_deref().unwrap_or("").as_bytes());
@@ -141,6 +152,7 @@ impl OpenRequest {
 
   /// Parse a frame body (the bytes after the length prefix) into a request.
   /// Truncated or malformed input yields `None`.
+  #[must_use]
   pub fn decode(buf: &[u8]) -> Option<Self> {
     let mut rest = buf;
     let cwd_bytes = take_bytes(&mut rest)?;
@@ -184,7 +196,7 @@ pub fn run_client(req: &OpenRequest) -> io::Result<u8> {
 }
 
 /// Incrementally read one request frame from a non-blocking client stream.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct RequestReader {
   len:       [u8; 4],
   len_read:  usize,
@@ -194,6 +206,11 @@ pub struct RequestReader {
 
 impl RequestReader {
   /// Consume available bytes. `Ok(None)` means the frame is incomplete.
+  ///
+  /// # Errors
+  ///
+  /// Fails on an I/O error from `reader` or if the announced frame length
+  /// exceeds the maximum request size.
   pub fn read_from<R: Read>(
     &mut self,
     mut stream: R,
