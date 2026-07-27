@@ -514,6 +514,11 @@ impl PointerHandler for WaylandState {
       let (x, y) = event.position;
       let neutral = match &event.kind {
         PointerEventKind::Enter { serial } => {
+          // Record the enter serial so cursor-shape requests for this window
+          // carry a serial the compositor will accept.
+          if let Some(i) = self.plat.window_index_for_surface(&event.surface) {
+            self.plat.windows[i].pointer_enter_serial = *serial;
+          }
           WEvent::Enter {
             x,
             y,

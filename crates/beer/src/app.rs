@@ -26,6 +26,7 @@ use std::{
 use beer_protocols::{codec, key, mouse};
 use beer_window::{
   App as WindowApp,
+  CursorIcon,
   ImeEvent,
   KeyEvent,
   KeyKind,
@@ -1200,8 +1201,7 @@ impl App {
     match event {
       PointerEvent::Enter { x, y, .. } => {
         self.windows[idx].pointer_pos = (x, y);
-        ctx.set_ibeam(self.windows[idx].id, true);
-        self.update_hover(idx);
+        self.update_hover(ctx, idx);
         self.pointer_drag(ctx, idx);
       },
       PointerEvent::Leave => {},
@@ -1211,7 +1211,7 @@ impl App {
           return;
         }
         if !self.windows[idx].selecting {
-          self.update_hover(idx);
+          self.update_hover(ctx, idx);
         }
         self.pointer_drag(ctx, idx);
       },
@@ -1506,14 +1506,25 @@ impl App {
       .link_at(row, col)
   }
 
-  fn update_hover(&mut self, idx: usize) {
+  fn update_hover(&mut self, ctx: &mut dyn WindowCtx, idx: usize) {
     let link = self.link_under_pointer(idx);
-    if link == self.windows[idx].hovered_link {
-      return;
+    let id = self.windows[idx].id;
+    if link != self.windows[idx].hovered_link {
+      self.windows[idx].hovered_link = link;
+      self.windows[idx].snaps.clear();
+      self.windows[idx].needs_draw = true;
     }
-    self.windows[idx].hovered_link = link;
-    self.windows[idx].snaps.clear();
-    self.windows[idx].needs_draw = true;
+    // A hand over hyperlinks, the I-beam otherwise. Set it every hover update
+    // so entering the window applies it even when the hovered link is
+    // unchanged.
+    ctx.set_cursor(
+      id,
+      if link.is_some() {
+        CursorIcon::Pointer
+      } else {
+        CursorIcon::Text
+      },
+    );
   }
 
   fn maybe_open_clicked_link(&self, idx: usize) {

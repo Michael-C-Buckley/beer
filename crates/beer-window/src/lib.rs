@@ -37,6 +37,15 @@ pub enum PointerButton {
   Other(u16),
 }
 
+/// The pointer icon shown over a window. `Text` is the terminal I-beam,
+/// `Pointer` the hand shown over hyperlinks, `Default` the compositor arrow.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CursorIcon {
+  Default,
+  Text,
+  Pointer,
+}
+
 /// A scroll step in surface-logical pixels. `discrete` marks a wheel notch (as
 /// opposed to smooth touchpad scrolling), so the app can apply its multiplier.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -121,9 +130,8 @@ pub trait WindowCtx {
   fn scale120(&self, id: WindowId) -> u32;
   fn set_title(&mut self, id: WindowId, title: &str);
   fn set_fullscreen(&mut self, id: WindowId, on: bool);
-  /// Set the pointer to an I-beam (`true`) or default (`false`) over the
-  /// window.
-  fn set_ibeam(&mut self, id: WindowId, ibeam: bool);
+  /// Set the pointer icon shown over the window.
+  fn set_cursor(&mut self, id: WindowId, icon: CursorIcon);
   /// Hold an idle inhibitor while the window is focused, per user opt-in.
   fn set_idle_inhibit(&mut self, id: WindowId, inhibit: bool);
   /// Request the compositor's attention on an urgent bell while unfocused.

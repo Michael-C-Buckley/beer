@@ -10,7 +10,7 @@ use std::{
   time::Duration,
 };
 
-use beer_window::{Frame, WindowCtx, WindowId};
+use beer_window::{CursorIcon, Frame, WindowCtx, WindowId};
 use calloop::{
   Interest,
   Mode,
@@ -94,15 +94,19 @@ impl WindowCtx for Platform {
     }
   }
 
-  fn set_ibeam(&mut self, _id: WindowId, ibeam: bool) {
+  fn set_cursor(&mut self, id: WindowId, icon: CursorIcon) {
     let serial = self
-      .windows
-      .get(self.focused_window)
-      .map_or(0, |w| w.pointer_enter_serial);
+      .window_index(id)
+      .map_or(0, |i| self.windows[i].pointer_enter_serial);
+    let shape = match icon {
+      CursorIcon::Default => Shape::Default,
+      CursorIcon::Text => Shape::Text,
+      CursorIcon::Pointer => Shape::Pointer,
+    };
     if let Some(seat) = self.seats.get(self.active_seat)
       && let Some(dev) = seat.cursor_shape_device.as_ref()
     {
-      dev.set_shape(serial, if ibeam { Shape::Text } else { Shape::Default });
+      dev.set_shape(serial, shape);
     }
   }
 
