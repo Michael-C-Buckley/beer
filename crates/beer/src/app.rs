@@ -2233,6 +2233,8 @@ impl WindowApp for App {
           win.snaps.clear();
           win.needs_draw = true;
           win.flash_token = None;
+          // The one-shot timer already fired; drop its source-map entry.
+          ctx.cancel_timer(token);
         } else if let Some(idx) = self
           .windows
           .iter()
@@ -2243,6 +2245,7 @@ impl WindowApp for App {
           }
           self.windows[idx].sync_token = None;
           self.windows[idx].needs_draw = true;
+          ctx.cancel_timer(token);
         } else if let Some(idx) = self
           .windows
           .iter()
