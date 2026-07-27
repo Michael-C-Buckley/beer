@@ -217,6 +217,9 @@ impl WinState {
 /// The terminal application state shared across all its windows.
 pub struct App {
   renderer:     Renderer,
+  /// Scale (120ths) the shared renderer is currently rasterized for; windows
+  /// on differently-scaled outputs re-rasterize it before they paint.
+  render_scale: u32,
   config:       Config,
   config_paths: Vec<PathBuf>,
   bindings:     Bindings,
@@ -276,6 +279,8 @@ impl App {
     let resident = config.main.server_resident;
     Ok(Self {
       renderer,
+      // Built at logical size, i.e. scale 1.0.
+      render_scale: 120,
       config,
       config_paths,
       bindings,
@@ -447,6 +452,7 @@ impl App {
   /// Spawn the shell for window `idx` at its current size and watch its master.
   #[expect(clippy::cast_possible_truncation, reason = "cell metrics fit u16")]
   fn spawn_session(&mut self, ctx: &mut dyn WindowCtx, idx: usize) {
+    self.ensure_render_scale(idx);
     let (cols, rows) = self.grid_dims(&self.windows[idx]);
     let m = self.renderer.metrics();
     let cell = (m.width as u16, m.height as u16);
@@ -641,6 +647,7 @@ impl App {
     if self.windows[idx].session.is_none() {
       return;
     }
+    self.ensure_render_scale(idx);
     // Synchronized output (DECSET 2026) withholds frames; arm a timeout so a
     // stuck `2026h` cannot freeze the window.
     let sync = self.windows[idx]
@@ -1197,6 +1204,7 @@ impl App {
     idx: usize,
     event: PointerEvent,
   ) {
+    self.ensure_render_scale(idx);
     let cell_h = f64::from(self.renderer.metrics().height);
     match event {
       PointerEvent::Enter { x, y, .. } => {
@@ -1555,6 +1563,7 @@ impl App {
     reason = "touch scroll deltas are small line counts"
   )]
   fn on_touch_event(&mut self, idx: usize, event: TouchEvent) {
+    self.ensure_render_scale(idx);
     let cell_h = f64::from(self.renderer.metrics().height);
     match event {
       TouchEvent::Down { id, y, .. } => {
@@ -1784,6 +1793,7 @@ impl App {
       self.to_phys(w, self.config.main.pad_y),
     );
     let px = self.to_phys(w, self.font_size).max(1);
+    self.render_scale = w.scale120;
     self.renderer.set_padding(pad_x, pad_y);
     if let Err(err) = self.renderer.set_font(
       &self.config.main.font,
@@ -1794,8 +1804,17 @@ impl App {
     }
   }
 
+  /// Rasterize the shared renderer for window `idx`'s scale if it is currently
+  /// set for a different one (multiple windows can sit on different outputs).
+  fn ensure_render_scale(&mut self, idx: usize) {
+    if self.render_scale != self.windows[idx].scale120 {
+      self.rescale_render(idx);
+    }
+  }
+
   #[expect(clippy::cast_possible_truncation, reason = "cell metrics fit u16")]
   fn resize_grid(&mut self, idx: usize) {
+    self.ensure_render_scale(idx);
     let (cols, rows) = self.grid_dims(&self.windows[idx]);
     let m = self.renderer.metrics();
     let cell = (m.width as u16, m.height as u16);
