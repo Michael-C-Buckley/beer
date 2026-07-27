@@ -228,7 +228,9 @@ pub fn kitty_encode(
       Keysym::Return | Keysym::KP_Enter | Keysym::Tab | Keysym::BackSpace
     );
     if legacy_special && !report_all && bits == 0 {
-      if kind != KeyKind::Press {
+      // A repeat re-sends the legacy byte (holding backspace keeps deleting);
+      // only a release produces nothing.
+      if kind == KeyKind::Release {
         return None;
       }
       return Some(match event.keysym {
@@ -266,8 +268,9 @@ pub fn kitty_encode(
       let field = alt_field(cp, event.keysym, mods, report_alt);
       return Some(csi(&field, mod_param, kind, text, b'u'));
     }
-    // Without report-all, text keys only report presses.
-    if kind != KeyKind::Press {
+    // Without report-all, text keys send their text on press and repeat
+    // (legacy repeat); a release under event reporting produces nothing.
+    if kind == KeyKind::Release {
       return None;
     }
     // Plain or shift-only keys send their text; ctrl/alt/super → CSI u.
@@ -535,6 +538,55 @@ mod tests {
     assert_eq!(
       kitty_encode(&key(Keysym::Up, None), NONE, 0b1, KeyKind::Repeat, false),
       Some(b"\x1b[A".to_vec())
+    );
+  }
+
+  #[test]
+  fn kitty_legacy_and_text_keys_repeat_under_event_reporting() {
+    // With report-event-types on (0b10) but not report-all, backspace/enter/
+    // tab stay legacy and a repeat must keep re-sending the legacy byte -
+    // holding backspace should keep deleting. A release still sends nothing.
+    let flags = 0b11; // disambiguate | report-event-types
+    assert_eq!(
+      kitty_encode(
+        &key(Keysym::BackSpace, None),
+        NONE,
+        flags,
+        KeyKind::Repeat,
+        false
+      ),
+      Some(b"\x7f".to_vec())
+    );
+    assert_eq!(
+      kitty_encode(
+        &key(Keysym::BackSpace, None),
+        NONE,
+        flags,
+        KeyKind::Release,
+        false
+      ),
+      None
+    );
+    // Plain text keys likewise repeat their text under event reporting.
+    assert_eq!(
+      kitty_encode(
+        &key(Keysym::a, Some("a")),
+        NONE,
+        flags,
+        KeyKind::Repeat,
+        false
+      ),
+      Some(b"a".to_vec())
+    );
+    assert_eq!(
+      kitty_encode(
+        &key(Keysym::a, Some("a")),
+        NONE,
+        flags,
+        KeyKind::Release,
+        false
+      ),
+      None
     );
   }
 
