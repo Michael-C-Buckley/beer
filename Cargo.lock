@@ -69,6 +69,8 @@ dependencies = [
  "anyhow",
  "beer-ipc",
  "beer-protocols",
+ "beer-wayland",
+ "beer-window",
  "calloop",
  "calloop-wayland-source",
  "flate2",
@@ -105,6 +107,30 @@ name = "beer-protocols"
 version = "0.8.1"
 dependencies = [
  "criterion",
+ "smithay-client-toolkit",
+]
+
+[[package]]
+name = "beer-wayland"
+version = "0.8.1"
+dependencies = [
+ "anyhow",
+ "beer-protocols",
+ "beer-window",
+ "calloop",
+ "calloop-wayland-source",
+ "rustix",
+ "smithay-client-toolkit",
+ "tracing",
+ "wayland-client",
+ "wayland-protocols",
+]
+
+[[package]]
+name = "beer-window"
+version = "0.8.1"
+dependencies = [
+ "beer-protocols",
  "smithay-client-toolkit",
 ]
 

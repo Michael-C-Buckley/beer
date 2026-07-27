@@ -1,0 +1,1038 @@
+//! sctk `Handler`/`Dispatch` impls on [`WaylandState`]. Input and lifecycle
+//! events are translated into neutral [`beer_window`] events and handed to the
+//! app (`self.app.on_*(&mut self.plat, …)`); platform bookkeeping (seats,
+//! surfaces, scale, clipboard serving) stays here on `self.plat`.
+
+use beer_window::{
+  ImeEvent,
+  PointerButton,
+  PointerEvent as WEvent,
+  Scroll,
+  TouchEvent,
+};
+use smithay_client_toolkit::{
+  activation::{ActivationHandler, RequestData},
+  compositor::{CompositorHandler, FrameCallbackData, SurfaceData},
+  data_device_manager::{
+    WritePipe,
+    data_device::{DataDeviceData, DataDeviceHandler},
+    data_offer::{DataOfferData, DataOfferHandler, DragOffer},
+    data_source::{DataSourceData, DataSourceHandler},
+  },
+  delegate_registry,
+  globals::GlobalData,
+  output::{OutputData, OutputHandler, OutputState},
+  primary_selection::{
+    device::{PrimarySelectionDeviceData, PrimarySelectionDeviceHandler},
+    offer::PrimarySelectionOfferData,
+    selection::PrimarySelectionSourceHandler,
+  },
+  reexports::protocols::{
+    wp::{
+      cursor_shape::v1::client::{
+        wp_cursor_shape_device_v1::WpCursorShapeDeviceV1,
+        wp_cursor_shape_manager_v1::WpCursorShapeManagerV1,
+      },
+      primary_selection::zv1::client::{
+        zwp_primary_selection_device_manager_v1::ZwpPrimarySelectionDeviceManagerV1,
+        zwp_primary_selection_device_v1::ZwpPrimarySelectionDeviceV1,
+        zwp_primary_selection_offer_v1::ZwpPrimarySelectionOfferV1,
+        zwp_primary_selection_source_v1::ZwpPrimarySelectionSourceV1,
+      },
+    },
+    xdg::{
+      activation::v1::client::{
+        xdg_activation_token_v1::XdgActivationTokenV1,
+        xdg_activation_v1::XdgActivationV1,
+      },
+      decoration::zv1::client::{
+        zxdg_decoration_manager_v1::ZxdgDecorationManagerV1,
+        zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1,
+      },
+      dialog::v1::client::xdg_wm_dialog_v1::XdgWmDialogV1,
+      shell::client::{
+        xdg_surface::XdgSurface,
+        xdg_toplevel::XdgToplevel,
+        xdg_wm_base::XdgWmBase,
+      },
+      xdg_output::zv1::client::{
+        zxdg_output_manager_v1::ZxdgOutputManagerV1,
+        zxdg_output_v1::ZxdgOutputV1,
+      },
+    },
+  },
+  registry::{ProvidesRegistryState, RegistryState},
+  registry_handlers,
+  seat::{
+    Capability,
+    SeatData as SctkSeatData,
+    SeatHandler,
+    SeatState,
+    keyboard::{
+      KeyEvent,
+      KeyboardData,
+      KeyboardHandler,
+      Keysym,
+      Modifiers,
+      RawModifiers,
+      RepeatInfo,
+    },
+    pointer::{
+      BTN_LEFT,
+      BTN_MIDDLE,
+      BTN_RIGHT,
+      PointerData,
+      PointerEvent,
+      PointerEventKind,
+      PointerHandler,
+    },
+    touch::{TouchData, TouchHandler},
+  },
+  shell::{
+    WaylandSurface,
+    xdg::window::{
+      Window as XdgWindow,
+      WindowConfigure,
+      WindowData,
+      WindowHandler,
+    },
+  },
+  shm::{Shm, ShmHandler},
+};
+use wayland_client::{
+  Connection,
+  Dispatch,
+  Proxy,
+  QueueHandle,
+  protocol::{
+    wl_callback::WlCallback,
+    wl_compositor::WlCompositor,
+    wl_data_device::WlDataDevice,
+    wl_data_device_manager::{DndAction, WlDataDeviceManager},
+    wl_data_offer::WlDataOffer,
+    wl_data_source::WlDataSource,
+    wl_keyboard::WlKeyboard,
+    wl_output::{self, WlOutput},
+    wl_pointer::WlPointer,
+    wl_seat::WlSeat,
+    wl_shm::WlShm,
+    wl_surface::WlSurface,
+    wl_touch::WlTouch,
+  },
+};
+use wayland_protocols::wp::{
+  content_type::v1::client::{
+    wp_content_type_manager_v1::WpContentTypeManagerV1,
+    wp_content_type_v1::{self, WpContentTypeV1},
+  },
+  fractional_scale::v1::client::{
+    wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1,
+    wp_fractional_scale_v1::{self, WpFractionalScaleV1},
+  },
+  idle_inhibit::zv1::client::{
+    zwp_idle_inhibit_manager_v1::ZwpIdleInhibitManagerV1,
+    zwp_idle_inhibitor_v1::{self, ZwpIdleInhibitorV1},
+  },
+  text_input::zv3::client::{
+    zwp_text_input_manager_v3::ZwpTextInputManagerV3,
+    zwp_text_input_v3::{self, ContentHint, ContentPurpose, ZwpTextInputV3},
+  },
+  viewporter::client::{wp_viewport::WpViewport, wp_viewporter::WpViewporter},
+};
+
+use crate::state::WaylandState;
+
+/// Map a Wayland button code to a neutral [`PointerButton`].
+#[expect(
+  clippy::cast_possible_truncation,
+  reason = "extra button codes above u16 are not bindable and clamp harmlessly"
+)]
+const fn button(code: u32) -> PointerButton {
+  match code {
+    BTN_LEFT => PointerButton::Left,
+    BTN_MIDDLE => PointerButton::Middle,
+    BTN_RIGHT => PointerButton::Right,
+    other => PointerButton::Other(other as u16),
+  }
+}
+
+impl CompositorHandler for WaylandState {
+  fn scale_factor_changed(
+    &mut self,
+    _: &Connection,
+    _: &QueueHandle<Self>,
+    surface: &WlSurface,
+    factor: i32,
+  ) {
+    // Integer fallback for compositors without fractional-scale-v1; ignored
+    // when a fractional-scale object drives the scale instead.
+    let Some(idx) = self.plat.window_index_for_surface(surface) else {
+      return;
+    };
+    if self.plat.windows[idx].fractional_scale.is_none() {
+      let scale = u32::try_from(factor.max(1))
+        .unwrap_or(u32::MAX)
+        .saturating_mul(120);
+      let id = self.plat.windows[idx].id;
+      self.plat.windows[idx].scale120 = scale;
+      self.app.on_scale(&mut self.plat, id, scale);
+    }
+  }
+
+  fn transform_changed(
+    &mut self,
+    _: &Connection,
+    _: &QueueHandle<Self>,
+    _: &WlSurface,
+    _: wl_output::Transform,
+  ) {
+  }
+
+  fn frame(
+    &mut self,
+    _: &Connection,
+    _: &QueueHandle<Self>,
+    surface: &WlSurface,
+    _: u32,
+  ) {
+    let Some(idx) = self.plat.window_index_for_surface(surface) else {
+      return;
+    };
+    self.plat.windows[idx].frame_pending = false;
+    // The compositor is ready for another frame; repaint if the app has asked.
+    if self.plat.windows[idx].wants_draw {
+      let id = self.plat.windows[idx].id;
+      self.app.render(&mut self.plat, id);
+    }
+  }
+
+  fn surface_enter(
+    &mut self,
+    _: &Connection,
+    _: &QueueHandle<Self>,
+    _: &WlSurface,
+    _: &WlOutput,
+  ) {
+  }
+
+  fn surface_leave(
+    &mut self,
+    _: &Connection,
+    _: &QueueHandle<Self>,
+    _: &WlSurface,
+    _: &WlOutput,
+  ) {
+  }
+}
+
+impl WindowHandler for WaylandState {
+  fn request_close(
+    &mut self,
+    _: &Connection,
+    _: &QueueHandle<Self>,
+    window: &XdgWindow,
+  ) {
+    if let Some(id) = self.plat.window_id_for_surface(window.wl_surface()) {
+      self.app.on_close(&mut self.plat, id);
+    }
+  }
+
+  fn configure(
+    &mut self,
+    _: &Connection,
+    _: &QueueHandle<Self>,
+    window: &XdgWindow,
+    configure: WindowConfigure,
+    _serial: u32,
+  ) {
+    let Some(idx) = self.plat.window_index_for_surface(window.wl_surface())
+    else {
+      return;
+    };
+    if let (Some(w), Some(h)) = configure.new_size {
+      self.plat.windows[idx].width = w.get();
+      self.plat.windows[idx].height = h.get();
+      if let Some(vp) = &self.plat.windows[idx].viewport {
+        let (ww, hh) =
+          (self.plat.windows[idx].width, self.plat.windows[idx].height);
+        vp.set_destination(
+          i32::try_from(ww.max(1)).unwrap_or(i32::MAX),
+          i32::try_from(hh.max(1)).unwrap_or(i32::MAX),
+        );
+      }
+    }
+    let activated = configure.is_activated();
+    self.plat.windows[idx].focused = activated;
+    let (id, w, h) = {
+      let win = &self.plat.windows[idx];
+      (win.id, win.width, win.height)
+    };
+    self.app.on_configure(&mut self.plat, id, w, h, activated);
+  }
+}
+
+impl ShmHandler for WaylandState {
+  fn shm_state(&mut self) -> &mut Shm {
+    &mut self.plat.shm
+  }
+}
+
+impl SeatHandler for WaylandState {
+  fn seat_state(&mut self) -> &mut SeatState {
+    &mut self.plat.seat_state
+  }
+
+  fn new_seat(&mut self, _: &Connection, qh: &QueueHandle<Self>, seat: WlSeat) {
+    let i = self.plat.seat_index(&seat);
+    self.plat.ensure_clipboard_devices(qh, &seat, i);
+  }
+
+  fn new_capability(
+    &mut self,
+    _: &Connection,
+    qh: &QueueHandle<Self>,
+    seat: WlSeat,
+    capability: Capability,
+  ) {
+    let i = self.plat.seat_index(&seat);
+    self.plat.ensure_clipboard_devices(qh, &seat, i);
+    if capability == Capability::Keyboard
+      && self.plat.seats[i].keyboard.is_none()
+    {
+      let loop_handle = self.plat.loop_handle.clone();
+      let keyboard = self.plat.seat_state.get_keyboard_with_repeat(
+        qh,
+        &seat,
+        None,
+        loop_handle,
+        Box::new(|state: &mut Self, _kbd, event| {
+          if let Some(id) = state.plat.focused_id() {
+            let mods = state.plat.modifiers;
+            state.app.on_key(&mut state.plat, id, &event, mods);
+          }
+        }),
+      );
+      match keyboard {
+        Ok(keyboard) => self.plat.seats[i].keyboard = Some(keyboard),
+        Err(err) => tracing::warn!("get keyboard: {err}"),
+      }
+      if self.plat.seats[i].text_input.is_none()
+        && let Some(mgr) = self.plat.text_input_manager.as_ref()
+      {
+        self.plat.seats[i].text_input = Some(mgr.get_text_input(&seat, qh, ()));
+      }
+    }
+    if capability == Capability::Pointer && self.plat.seats[i].pointer.is_none()
+    {
+      match self.plat.seat_state.get_pointer(qh, &seat) {
+        Ok(pointer) => {
+          self.plat.seats[i].cursor_shape_device = self
+            .plat
+            .cursor_shape_manager
+            .as_ref()
+            .map(|m| m.get_shape_device(&pointer, qh));
+          self.plat.seats[i].pointer = Some(pointer);
+        },
+        Err(err) => tracing::warn!("get pointer: {err}"),
+      }
+    }
+    if capability == Capability::Touch && self.plat.seats[i].touch.is_none() {
+      match self.plat.seat_state.get_touch(qh, &seat) {
+        Ok(touch) => self.plat.seats[i].touch = Some(touch),
+        Err(err) => tracing::warn!("get touch: {err}"),
+      }
+    }
+  }
+
+  fn remove_capability(
+    &mut self,
+    _: &Connection,
+    _: &QueueHandle<Self>,
+    seat: WlSeat,
+    capability: Capability,
+  ) {
+    let Some(s) = self.plat.seats.iter_mut().find(|s| s.seat == seat) else {
+      return;
+    };
+    match capability {
+      Capability::Keyboard => {
+        if let Some(keyboard) = s.keyboard.take() {
+          keyboard.release();
+        }
+      },
+      Capability::Pointer => {
+        s.cursor_shape_device = None;
+        if let Some(pointer) = s.pointer.take() {
+          pointer.release();
+        }
+      },
+      Capability::Touch => {
+        if let Some(touch) = s.touch.take() {
+          touch.release();
+        }
+      },
+      _ => {},
+    }
+  }
+
+  fn remove_seat(
+    &mut self,
+    _: &Connection,
+    _: &QueueHandle<Self>,
+    seat: WlSeat,
+  ) {
+    self.plat.seats.retain(|s| s.seat != seat);
+    self.plat.active_seat = self
+      .plat
+      .active_seat
+      .min(self.plat.seats.len().saturating_sub(1));
+  }
+}
+
+impl KeyboardHandler for WaylandState {
+  fn enter(
+    &mut self,
+    _: &Connection,
+    _: &QueueHandle<Self>,
+    keyboard: &WlKeyboard,
+    surface: &WlSurface,
+    serial: u32,
+    _: &[u32],
+    _: &[Keysym],
+  ) {
+    self.plat.activate_keyboard(keyboard);
+    self.plat.serial = serial;
+    let Some(idx) = self.plat.window_index_for_surface(surface) else {
+      return;
+    };
+    self.plat.focused_window = idx;
+    self.plat.windows[idx].focused = true;
+    let id = self.plat.windows[idx].id;
+    self.app.on_focus(&mut self.plat, id, true);
+  }
+
+  fn leave(
+    &mut self,
+    _: &Connection,
+    _: &QueueHandle<Self>,
+    _: &WlKeyboard,
+    surface: &WlSurface,
+    _: u32,
+  ) {
+    let Some(idx) = self.plat.window_index_for_surface(surface) else {
+      return;
+    };
+    self.plat.windows[idx].focused = false;
+    let id = self.plat.windows[idx].id;
+    self.app.on_focus(&mut self.plat, id, false);
+  }
+
+  fn press_key(
+    &mut self,
+    _: &Connection,
+    _: &QueueHandle<Self>,
+    keyboard: &WlKeyboard,
+    serial: u32,
+    event: KeyEvent,
+  ) {
+    self.plat.activate_keyboard(keyboard);
+    self.plat.serial = serial;
+    if let Some(id) = self.plat.focused_id() {
+      let mods = self.plat.modifiers;
+      self.app.on_key(&mut self.plat, id, &event, mods);
+    }
+  }
+
+  fn repeat_key(
+    &mut self,
+    _: &Connection,
+    _: &QueueHandle<Self>,
+    _: &WlKeyboard,
+    _: u32,
+    _: KeyEvent,
+  ) {
+    // Repeats are delivered through the get_keyboard_with_repeat callback.
+  }
+
+  fn release_key(
+    &mut self,
+    _: &Connection,
+    _: &QueueHandle<Self>,
+    _: &WlKeyboard,
+    _: u32,
+    event: KeyEvent,
+  ) {
+    if let Some(id) = self.plat.focused_id() {
+      let mods = self.plat.modifiers;
+      self.app.on_key_release(&mut self.plat, id, &event, mods);
+    }
+  }
+
+  fn update_modifiers(
+    &mut self,
+    _: &Connection,
+    _: &QueueHandle<Self>,
+    _: &WlKeyboard,
+    _: u32,
+    modifiers: Modifiers,
+    _: RawModifiers,
+    _: u32,
+  ) {
+    self.plat.modifiers = modifiers;
+  }
+
+  fn update_repeat_info(
+    &mut self,
+    _: &Connection,
+    _: &QueueHandle<Self>,
+    _: &WlKeyboard,
+    _: RepeatInfo,
+  ) {
+  }
+}
+
+impl PointerHandler for WaylandState {
+  fn pointer_frame(
+    &mut self,
+    _: &Connection,
+    _: &QueueHandle<Self>,
+    pointer: &WlPointer,
+    events: &[PointerEvent],
+  ) {
+    self.plat.activate_pointer(pointer);
+    let Some(id) = self.plat.focused_id() else {
+      return;
+    };
+    for event in events {
+      let (x, y) = event.position;
+      let neutral = match &event.kind {
+        PointerEventKind::Enter { serial } => {
+          WEvent::Enter {
+            x,
+            y,
+            serial: *serial,
+          }
+        },
+        PointerEventKind::Leave { .. } => WEvent::Leave,
+        PointerEventKind::Motion { .. } => WEvent::Motion { x, y },
+        PointerEventKind::Press {
+          button: b, serial, ..
+        } => {
+          self.plat.serial = *serial;
+          WEvent::Press {
+            x,
+            y,
+            button: button(*b),
+            serial: *serial,
+          }
+        },
+        PointerEventKind::Release { button: b, .. } => {
+          WEvent::Release {
+            x,
+            y,
+            button: button(*b),
+          }
+        },
+        PointerEventKind::Axis {
+          horizontal,
+          vertical,
+          ..
+        } => {
+          // Wheel notches arrive as value120 (÷120) or legacy discrete steps;
+          // touchpads send absolute pixels. Hand the app a logical-pixel delta
+          // plus whether it was a discrete notch.
+          let discrete = vertical.value120 != 0
+            || vertical.discrete != 0
+            || horizontal.value120 != 0
+            || horizontal.discrete != 0;
+          let dy = if vertical.value120 != 0 {
+            f64::from(vertical.value120) / 120.0
+          } else if vertical.discrete != 0 {
+            f64::from(vertical.discrete)
+          } else {
+            vertical.absolute
+          };
+          let dx = if horizontal.value120 != 0 {
+            f64::from(horizontal.value120) / 120.0
+          } else if horizontal.discrete != 0 {
+            f64::from(horizontal.discrete)
+          } else {
+            horizontal.absolute
+          };
+          WEvent::Axis {
+            x,
+            y,
+            scroll: Scroll { dx, dy, discrete },
+          }
+        },
+      };
+      let mods = self.plat.modifiers;
+      self.app.on_pointer(&mut self.plat, id, neutral, mods);
+    }
+  }
+}
+
+impl TouchHandler for WaylandState {
+  fn down(
+    &mut self,
+    _: &Connection,
+    _: &QueueHandle<Self>,
+    _: &WlTouch,
+    _serial: u32,
+    _time: u32,
+    surface: WlSurface,
+    id: i32,
+    position: (f64, f64),
+  ) {
+    if let Some(wid) = self.plat.window_id_for_surface(&surface) {
+      self.app.on_touch(&mut self.plat, wid, TouchEvent::Down {
+        id,
+        x: position.0,
+        y: position.1,
+      });
+    }
+  }
+
+  fn up(
+    &mut self,
+    _: &Connection,
+    _: &QueueHandle<Self>,
+    _: &WlTouch,
+    _serial: u32,
+    _time: u32,
+    id: i32,
+  ) {
+    if let Some(wid) = self.plat.focused_id() {
+      self
+        .app
+        .on_touch(&mut self.plat, wid, TouchEvent::Up { id });
+    }
+  }
+
+  fn motion(
+    &mut self,
+    _: &Connection,
+    _: &QueueHandle<Self>,
+    _: &WlTouch,
+    _time: u32,
+    id: i32,
+    position: (f64, f64),
+  ) {
+    if let Some(wid) = self.plat.focused_id() {
+      self.app.on_touch(&mut self.plat, wid, TouchEvent::Motion {
+        id,
+        x: position.0,
+        y: position.1,
+      });
+    }
+  }
+
+  fn shape(
+    &mut self,
+    _: &Connection,
+    _: &QueueHandle<Self>,
+    _: &WlTouch,
+    _: i32,
+    _: f64,
+    _: f64,
+  ) {
+  }
+
+  fn orientation(
+    &mut self,
+    _: &Connection,
+    _: &QueueHandle<Self>,
+    _: &WlTouch,
+    _: i32,
+    _: f64,
+  ) {
+  }
+
+  fn cancel(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlTouch) {
+    if let Some(wid) = self.plat.focused_id() {
+      self.app.on_touch(&mut self.plat, wid, TouchEvent::Cancel);
+    }
+  }
+}
+
+impl OutputHandler for WaylandState {
+  fn output_state(&mut self) -> &mut OutputState {
+    &mut self.plat.output_state
+  }
+
+  fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: WlOutput) {
+  }
+  fn update_output(
+    &mut self,
+    _: &Connection,
+    _: &QueueHandle<Self>,
+    _: WlOutput,
+  ) {
+  }
+  fn output_destroyed(
+    &mut self,
+    _: &Connection,
+    _: &QueueHandle<Self>,
+    _: WlOutput,
+  ) {
+  }
+}
+
+impl ProvidesRegistryState for WaylandState {
+  fn registry(&mut self) -> &mut RegistryState {
+    &mut self.plat.registry_state
+  }
+  registry_handlers![OutputState, SeatState];
+}
+
+/// Serve held clipboard text when a paste target requests it.
+fn serve(text: &str, fd: WritePipe) {
+  use std::{fs::File, io::Write as _, os::fd::OwnedFd};
+  let mut file = File::from(OwnedFd::from(fd));
+  let _ = file.write_all(text.as_bytes());
+}
+
+impl DataDeviceHandler for WaylandState {
+  fn enter(
+    &mut self,
+    _: &Connection,
+    _: &QueueHandle<Self>,
+    _: &WlDataDevice,
+    _: f64,
+    _: f64,
+    _: &WlSurface,
+  ) {
+  }
+  fn leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice) {
+  }
+  fn motion(
+    &mut self,
+    _: &Connection,
+    _: &QueueHandle<Self>,
+    _: &WlDataDevice,
+    _: f64,
+    _: f64,
+  ) {
+  }
+  fn selection(
+    &mut self,
+    _: &Connection,
+    _: &QueueHandle<Self>,
+    _: &WlDataDevice,
+  ) {
+  }
+  fn drop_performed(
+    &mut self,
+    _: &Connection,
+    _: &QueueHandle<Self>,
+    _: &WlDataDevice,
+  ) {
+  }
+}
+
+impl DataOfferHandler for WaylandState {
+  fn source_actions(
+    &mut self,
+    _: &Connection,
+    _: &QueueHandle<Self>,
+    _: &mut DragOffer,
+    _: DndAction,
+  ) {
+  }
+  fn selected_action(
+    &mut self,
+    _: &Connection,
+    _: &QueueHandle<Self>,
+    _: &mut DragOffer,
+    _: DndAction,
+  ) {
+  }
+}
+
+impl DataSourceHandler for WaylandState {
+  fn accept_mime(
+    &mut self,
+    _: &Connection,
+    _: &QueueHandle<Self>,
+    _: &WlDataSource,
+    _: Option<String>,
+  ) {
+  }
+
+  fn send_request(
+    &mut self,
+    _: &Connection,
+    _: &QueueHandle<Self>,
+    source: &WlDataSource,
+    _mime: String,
+    fd: WritePipe,
+  ) {
+    if self
+      .plat
+      .copy_source
+      .as_ref()
+      .is_some_and(|s| s.inner() == source)
+    {
+      let text = self.app.clipboard_text(false).unwrap_or_default();
+      serve(&text, fd);
+    }
+  }
+
+  fn cancelled(
+    &mut self,
+    _: &Connection,
+    _: &QueueHandle<Self>,
+    source: &WlDataSource,
+  ) {
+    if self
+      .plat
+      .copy_source
+      .as_ref()
+      .is_some_and(|s| s.inner() == source)
+    {
+      self.plat.copy_source = None;
+    }
+  }
+
+  fn dnd_dropped(
+    &mut self,
+    _: &Connection,
+    _: &QueueHandle<Self>,
+    _: &WlDataSource,
+  ) {
+  }
+  fn dnd_finished(
+    &mut self,
+    _: &Connection,
+    _: &QueueHandle<Self>,
+    _: &WlDataSource,
+  ) {
+  }
+  fn action(
+    &mut self,
+    _: &Connection,
+    _: &QueueHandle<Self>,
+    _: &WlDataSource,
+    _: DndAction,
+  ) {
+  }
+}
+
+impl PrimarySelectionDeviceHandler for WaylandState {
+  fn selection(
+    &mut self,
+    _: &Connection,
+    _: &QueueHandle<Self>,
+    _: &ZwpPrimarySelectionDeviceV1,
+  ) {
+  }
+}
+
+impl PrimarySelectionSourceHandler for WaylandState {
+  fn send_request(
+    &mut self,
+    _: &Connection,
+    _: &QueueHandle<Self>,
+    source: &ZwpPrimarySelectionSourceV1,
+    _mime: String,
+    fd: WritePipe,
+  ) {
+    if self
+      .plat
+      .primary_source
+      .as_ref()
+      .is_some_and(|s| s.inner() == source)
+    {
+      let text = self.app.clipboard_text(true).unwrap_or_default();
+      serve(&text, fd);
+    }
+  }
+
+  fn cancelled(
+    &mut self,
+    _: &Connection,
+    _: &QueueHandle<Self>,
+    source: &ZwpPrimarySelectionSourceV1,
+  ) {
+    if self
+      .plat
+      .primary_source
+      .as_ref()
+      .is_some_and(|s| s.inner() == source)
+    {
+      self.plat.primary_source = None;
+    }
+  }
+}
+
+impl Dispatch<WpFractionalScaleV1, ()> for WaylandState {
+  fn event(
+    state: &mut Self,
+    _: &WpFractionalScaleV1,
+    event: wp_fractional_scale_v1::Event,
+    (): &(),
+    _: &Connection,
+    _: &QueueHandle<Self>,
+  ) {
+    if let wp_fractional_scale_v1::Event::PreferredScale { scale } = event {
+      let idx = state.plat.focused_window;
+      if idx < state.plat.windows.len() {
+        let id = state.plat.windows[idx].id;
+        state.plat.windows[idx].scale120 = scale;
+        state.app.on_scale(&mut state.plat, id, scale);
+      }
+    }
+  }
+}
+
+/// Raw protocol objects sctk does not wrap and whose events we ignore.
+macro_rules! noop_dispatch {
+  ($($iface:ty => $ev:ty),+ $(,)?) => {$(
+    impl Dispatch<$iface, ()> for WaylandState {
+      fn event(_: &mut Self, _: &$iface, _: $ev, (): &(), _: &Connection, _: &QueueHandle<Self>) {}
+    }
+  )+};
+}
+
+noop_dispatch! {
+  WpFractionalScaleManagerV1 => <WpFractionalScaleManagerV1 as Proxy>::Event,
+  WpViewporter => <WpViewporter as Proxy>::Event,
+  WpViewport => <WpViewport as Proxy>::Event,
+  ZwpIdleInhibitManagerV1 => <ZwpIdleInhibitManagerV1 as Proxy>::Event,
+  ZwpIdleInhibitorV1 => zwp_idle_inhibitor_v1::Event,
+  WpContentTypeManagerV1 => <WpContentTypeManagerV1 as Proxy>::Event,
+  WpContentTypeV1 => wp_content_type_v1::Event,
+  ZwpTextInputManagerV3 => <ZwpTextInputManagerV3 as Proxy>::Event,
+}
+
+impl ActivationHandler for WaylandState {
+  type RequestUdata = ();
+
+  fn new_token(&mut self, token: String, _: &RequestData<()>) {
+    if let (Some(activation), true) = (
+      self.plat.activation.as_ref(),
+      self.plat.focused_window < self.plat.windows.len(),
+    ) {
+      let surface = self.plat.windows[self.plat.focused_window]
+        .window
+        .wl_surface();
+      activation.activate::<Self>(surface, token);
+    }
+  }
+}
+
+// text-input-v3 batches preedit/commit between `enter` and `done`; translate
+// each event to a neutral `ImeEvent` for the app to apply.
+impl Dispatch<ZwpTextInputV3, ()> for WaylandState {
+  #[expect(
+    clippy::match_same_arms,
+    reason = "unsupported text-input deletion events stay no-ops"
+  )]
+  fn event(
+    state: &mut Self,
+    ti: &ZwpTextInputV3,
+    event: zwp_text_input_v3::Event,
+    (): &(),
+    _: &Connection,
+    _: &QueueHandle<Self>,
+  ) {
+    use zwp_text_input_v3::Event;
+    let Some(id) = state.plat.focused_id() else {
+      return;
+    };
+    match event {
+      Event::Enter { .. } => {
+        ti.enable();
+        ti.set_content_type(ContentHint::None, ContentPurpose::Terminal);
+        ti.commit();
+        state.app.on_ime(&mut state.plat, id, ImeEvent::Enable);
+      },
+      Event::Leave { .. } => {
+        ti.disable();
+        ti.commit();
+        state.app.on_ime(&mut state.plat, id, ImeEvent::Disable);
+      },
+      Event::PreeditString { text, .. } => {
+        state.app.on_ime(
+          &mut state.plat,
+          id,
+          ImeEvent::Preedit(text.unwrap_or_default()),
+        );
+      },
+      Event::CommitString { text } => {
+        state.app.on_ime(
+          &mut state.plat,
+          id,
+          ImeEvent::Commit(text.unwrap_or_default()),
+        );
+      },
+      Event::Done { .. } => {
+        state.app.on_ime(&mut state.plat, id, ImeEvent::Done);
+      },
+      Event::DeleteSurroundingText { .. } => {},
+      _ => {},
+    }
+  }
+}
+
+// sctk 0.21's blanket `delegate_dispatch2!` cycles on `TouchData`, so forward
+// each concrete (interface, user-data) pair to its `Dispatch2` impl by hand.
+macro_rules! forward_dispatch {
+  ($($iface:ty => $data:ty),+ $(,)?) => {$(
+    impl ::wayland_client::Dispatch<$iface, $data> for WaylandState {
+      fn event(
+        state: &mut Self,
+        proxy: &$iface,
+        event: <$iface as ::wayland_client::Proxy>::Event,
+        data: &$data,
+        conn: &::wayland_client::Connection,
+        qh: &::wayland_client::QueueHandle<Self>,
+      ) {
+        <$data as ::smithay_client_toolkit::dispatch2::Dispatch2<$iface, WaylandState>>::event(
+          data, state, proxy, event, conn, qh,
+        );
+      }
+      fn event_created_child(
+        opcode: u16,
+        qh: &::wayland_client::QueueHandle<Self>,
+      ) -> ::std::sync::Arc<dyn ::wayland_client::backend::ObjectData> {
+        <$data as ::smithay_client_toolkit::dispatch2::Dispatch2<$iface, WaylandState>>
+          ::event_created_child(opcode, qh)
+      }
+    }
+  )+};
+}
+
+forward_dispatch! {
+  WlCompositor => GlobalData,
+  WlSurface => SurfaceData<()>,
+  WlCallback => FrameCallbackData,
+  WlOutput => OutputData,
+  ZxdgOutputManagerV1 => GlobalData,
+  ZxdgOutputV1 => OutputData,
+  WlShm => GlobalData,
+  WlSeat => SctkSeatData,
+  WlKeyboard => KeyboardData<WaylandState, ()>,
+  WlPointer => PointerData<()>,
+  WlTouch => TouchData<()>,
+  XdgWmBase => GlobalData,
+  XdgSurface => WindowData,
+  XdgToplevel => WindowData,
+  XdgWmDialogV1 => GlobalData,
+  ZxdgDecorationManagerV1 => GlobalData,
+  ZxdgToplevelDecorationV1 => WindowData,
+  WlDataDeviceManager => GlobalData,
+  WlDataDevice => DataDeviceData,
+  WlDataSource => DataSourceData<()>,
+  WlDataOffer => DataOfferData,
+  ZwpPrimarySelectionDeviceManagerV1 => GlobalData,
+  ZwpPrimarySelectionDeviceV1 => PrimarySelectionDeviceData,
+  ZwpPrimarySelectionSourceV1 => GlobalData,
+  ZwpPrimarySelectionOfferV1 => PrimarySelectionOfferData,
+  WpCursorShapeManagerV1 => GlobalData,
+  WpCursorShapeDeviceV1 => GlobalData,
+  XdgActivationV1 => GlobalData,
+  XdgActivationTokenV1 => RequestData<()>,
+}
+
+delegate_registry!(WaylandState);

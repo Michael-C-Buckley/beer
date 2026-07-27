@@ -1,5 +1,6 @@
 //! beer, a fast, software-rendered, Wayland-native terminal emulator.
 
+mod app;
 mod bindings;
 mod config;
 mod font;
@@ -9,7 +10,6 @@ mod pty;
 mod render;
 mod theme;
 mod vt;
-mod wayland;
 
 use std::{env, io, path::PathBuf, process::ExitCode};
 
@@ -75,7 +75,9 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
   let paths = config_paths(cli.config);
   let config = Config::load(&paths);
   tracing::info!(server = cli.server, "starting beer");
-  wayland::run(config, paths, cli.server)
+  let app = app::App::new(config, paths, cli.server)?;
+  let code = beer_wayland::run(Box::new(app))?;
+  Ok(ExitCode::from(code))
 }
 
 /// Merge `--config` paths with `$BEER_CONFIG` (the env paths rank lower).

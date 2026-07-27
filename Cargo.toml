@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members  = [ "crates/beer", "crates/beer-ipc", "crates/beer-protocols" ]
+members  = [ "crates/beer", "crates/beer-ipc", "crates/beer-protocols", "crates/beer-window", "crates/beer-wayland" ]
 
 [workspace.package]
 version      = "0.8.1"
@@ -12,6 +12,8 @@ license      = "EUPL-1.2"
 # Workspace components
 beer-protocols = { path = "crates/beer-protocols", version = "0.8.1" }
 beer-ipc = { path = "crates/beer-ipc", version = "0.8.1" }
+beer-window = { path = "crates/beer-window", version = "0.8.1" }
+beer-wayland = { path = "crates/beer-wayland", version = "0.8.1" }
 
 # Other dependencies
 anyhow = "1.0.104"
