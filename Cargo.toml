@@ -3,14 +3,14 @@ resolver = "3"
 members  = [ "crates/beer", "crates/beer-protocols" ]
 
 [workspace.package]
-version      = "0.8.0"
+version      = "0.8.1"
 edition      = "2024"
 rust-version = "1.95.0"
 license      = "EUPL-1.2"
 
 [workspace.dependencies]
 # Workspace components
-beer-protocols = { path = "crates/beer-protocols", version = "0.8.0" }
+beer-protocols = { path = "crates/beer-protocols", version = "0.8.1" }
 
 # Other dependencies
 anyhow = "1.0.104"
