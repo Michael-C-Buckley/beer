@@ -2030,6 +2030,11 @@ impl WindowApp for App {
     let Some(idx) = self.win_index(id) else {
       return;
     };
+    // A pixel-size change makes the backend reallocate the buffer ring under
+    // new ids; drop the snapshots keyed by the old ids so they cannot linger.
+    if (width, height) != (self.windows[idx].width, self.windows[idx].height) {
+      self.windows[idx].snaps.clear();
+    }
     self.windows[idx].width = width;
     self.windows[idx].height = height;
     self.windows[idx].focused = activated;
