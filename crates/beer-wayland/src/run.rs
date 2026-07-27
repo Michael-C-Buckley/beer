@@ -129,6 +129,7 @@ pub fn run(app: Box<dyn App>) -> anyhow::Result<u8> {
     modifiers: Modifiers::default(),
     windows: Vec::new(),
     focused_window: 0,
+    touch_focus: HashMap::new(),
     next_window_id: 1,
     sources: HashMap::new(),
     exit: false,

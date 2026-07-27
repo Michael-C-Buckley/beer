@@ -9,6 +9,7 @@ use beer_window::{
   PointerEvent as WEvent,
   Scroll,
   TouchEvent,
+  WindowId,
 };
 use smithay_client_toolkit::{
   activation::{ActivationHandler, RequestData},
@@ -375,10 +376,12 @@ impl SeatHandler for WaylandState {
       _ => {},
     }
     // A touch device vanishing mid-gesture must not leave stale scroll state.
-    if capability == Capability::Touch
-      && let Some(id) = self.plat.focused_id()
-    {
-      self.app.on_touch(&mut self.plat, id, TouchEvent::Cancel);
+    if capability == Capability::Touch {
+      let wids: Vec<WindowId> =
+        self.plat.touch_focus.drain().map(|(_, w)| w).collect();
+      for wid in wids {
+        self.app.on_touch(&mut self.plat, wid, TouchEvent::Cancel);
+      }
     }
   }
 
@@ -507,10 +510,12 @@ impl PointerHandler for WaylandState {
     events: &[PointerEvent],
   ) {
     self.plat.activate_pointer(pointer);
-    let Some(id) = self.plat.focused_id() else {
-      return;
-    };
     for event in events {
+      // Pointer focus is independent of keyboard focus; route each event to the
+      // window its own surface names.
+      let Some(id) = self.plat.window_id_for_surface(&event.surface) else {
+        continue;
+      };
       let (x, y) = event.position;
       let neutral = match &event.kind {
         PointerEventKind::Enter { serial } => {
@@ -597,6 +602,8 @@ impl TouchHandler for WaylandState {
     position: (f64, f64),
   ) {
     if let Some(wid) = self.plat.window_id_for_surface(&surface) {
+      // Latch this touch point to the window it started on.
+      self.plat.touch_focus.insert(id, wid);
       self.app.on_touch(&mut self.plat, wid, TouchEvent::Down {
         id,
         x: position.0,
@@ -614,7 +621,7 @@ impl TouchHandler for WaylandState {
     _time: u32,
     id: i32,
   ) {
-    if let Some(wid) = self.plat.focused_id() {
+    if let Some(wid) = self.plat.touch_focus.remove(&id) {
       self
         .app
         .on_touch(&mut self.plat, wid, TouchEvent::Up { id });
@@ -630,7 +637,7 @@ impl TouchHandler for WaylandState {
     id: i32,
     position: (f64, f64),
   ) {
-    if let Some(wid) = self.plat.focused_id() {
+    if let Some(wid) = self.plat.touch_focus.get(&id).copied() {
       self.app.on_touch(&mut self.plat, wid, TouchEvent::Motion {
         id,
         x: position.0,
@@ -661,7 +668,10 @@ impl TouchHandler for WaylandState {
   }
 
   fn cancel(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlTouch) {
-    if let Some(wid) = self.plat.focused_id() {
+    // Cancel every window a live touch point was latched to.
+    let wids: Vec<WindowId> =
+      self.plat.touch_focus.drain().map(|(_, w)| w).collect();
+    for wid in wids {
       self.app.on_touch(&mut self.plat, wid, TouchEvent::Cancel);
     }
   }
@@ -877,22 +887,22 @@ impl PrimarySelectionSourceHandler for WaylandState {
   }
 }
 
-impl Dispatch<WpFractionalScaleV1, ()> for WaylandState {
+impl Dispatch<WpFractionalScaleV1, WindowId> for WaylandState {
   fn event(
     state: &mut Self,
     _: &WpFractionalScaleV1,
     event: wp_fractional_scale_v1::Event,
-    (): &(),
+    id: &WindowId,
     _: &Connection,
     _: &QueueHandle<Self>,
   ) {
-    if let wp_fractional_scale_v1::Event::PreferredScale { scale } = event {
-      let idx = state.plat.focused_window;
-      if idx < state.plat.windows.len() {
-        let id = state.plat.windows[idx].id;
-        state.plat.windows[idx].scale120 = scale;
-        state.app.on_scale(&mut state.plat, id, scale);
-      }
+    // The object carries its window's id, so a scale change is applied to the
+    // surface it actually names rather than to whatever holds keyboard focus.
+    if let wp_fractional_scale_v1::Event::PreferredScale { scale } = event
+      && let Some(idx) = state.plat.window_index(*id)
+    {
+      state.plat.windows[idx].scale120 = scale;
+      state.app.on_scale(&mut state.plat, *id, scale);
     }
   }
 }

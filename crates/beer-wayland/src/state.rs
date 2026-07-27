@@ -163,6 +163,9 @@ pub struct Platform {
   pub modifiers:            Modifiers,
   pub windows:              Vec<PlatformWindow>,
   pub focused_window:       usize,
+  /// Window a touch point is latched to, keyed by touch id, so a gesture stays
+  /// with the surface it started on regardless of keyboard focus.
+  pub touch_focus:          HashMap<i32, WindowId>,
   pub next_window_id:       u64,
   /// App-registered event sources (pty fd, IPC sockets, timers) keyed by the
   /// token the app addresses them with, so they can be removed.

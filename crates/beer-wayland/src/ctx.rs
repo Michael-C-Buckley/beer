@@ -256,7 +256,7 @@ impl WindowCtx for Platform {
       self
         .fractional_manager
         .as_ref()
-        .map(|mgr| mgr.get_fractional_scale(window.wl_surface(), &self.qh, ()))
+        .map(|mgr| mgr.get_fractional_scale(window.wl_surface(), &self.qh, id))
     });
     let content_type = self.content_type_manager.as_ref().map(|mgr| {
       mgr.get_surface_content_type(window.wl_surface(), &self.qh, ())
@@ -307,6 +307,12 @@ impl WindowCtx for Platform {
       return;
     };
     self.windows.remove(idx);
+    self.touch_focus.retain(|_, w| *w != id);
+    // Removing a window below the focused one shifts it down by one; keep the
+    // index pointing at the same window rather than its neighbour.
+    if idx < self.focused_window {
+      self.focused_window -= 1;
+    }
     if !self.windows.is_empty() && self.focused_window >= self.windows.len() {
       self.focused_window = self.windows.len() - 1;
     }
