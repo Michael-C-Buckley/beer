@@ -7,6 +7,7 @@
 
 use std::{
   collections::{HashMap, HashSet},
+  fs,
   io::{self, ErrorKind, Write as _},
   mem,
   num::NonZeroU16,
@@ -235,6 +236,17 @@ pub struct App {
   /// the source token the client is watched under.
   ipc_clients:  HashMap<u64, (UnixStream, ipc::RequestReader, Instant)>,
   ipc_listener: Option<UnixListener>,
+  /// Path of the bound daemon socket, unlinked on shutdown so a later server
+  /// can bind the same path.
+  ipc_socket:   Option<PathBuf>,
+}
+
+impl Drop for App {
+  fn drop(&mut self) {
+    if let Some(path) = self.ipc_socket.take() {
+      let _ = fs::remove_file(path);
+    }
+  }
 }
 
 impl App {
@@ -280,6 +292,7 @@ impl App {
       next_window: 1,
       ipc_clients: HashMap::new(),
       ipc_listener: None,
+      ipc_socket: None,
     })
   }
 
@@ -1988,10 +2001,11 @@ impl WindowApp for App {
     ctx.arm_timer(ANIM_TOKEN, ANIM_IDLE_MS);
     if self.server {
       match ipc::bind_listener() {
-        Ok((listener, _path)) => {
+        Ok((listener, path)) => {
           let _ = listener.set_nonblocking(true);
           ctx.watch_readable(listener.as_raw_fd(), IPC_LISTEN_TOKEN);
           self.ipc_listener = Some(listener);
+          self.ipc_socket = Some(path);
           ctx.arm_timer(IPC_SWEEP_TOKEN, 1000);
         },
         Err(err) => {
