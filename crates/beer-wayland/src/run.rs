@@ -144,21 +144,33 @@ pub fn run(app: Box<dyn App>) -> anyhow::Result<u8> {
     app.start(plat);
   }
 
-  // SIGUSR1 reloads the config in place.
-  match Signals::new(&[Signal::SIGUSR1]) {
+  // SIGUSR1 reloads the config in place; the termination signals unwind the
+  // loop cleanly so the app's Drop runs (e.g. unlinking the daemon socket).
+  let signals = Signals::new(&[
+    Signal::SIGUSR1,
+    Signal::SIGTERM,
+    Signal::SIGINT,
+    Signal::SIGHUP,
+  ]);
+  match signals {
     Ok(signals) => {
       let reg = event_loop.handle().insert_source(
         signals,
-        |_, (), state: &mut WaylandState| {
-          let WaylandState { app, plat } = state;
-          app.on_reload(plat);
+        |event, (), state: &mut WaylandState| {
+          match event.signal() {
+            Signal::SIGUSR1 => {
+              let WaylandState { app, plat } = state;
+              app.on_reload(plat);
+            },
+            _ => state.plat.exit = true,
+          }
         },
       );
       if let Err(err) = reg {
         tracing::warn!("register signal source: {err}");
       }
     },
-    Err(err) => tracing::warn!("install SIGUSR1 handler: {err}"),
+    Err(err) => tracing::warn!("install signal handlers: {err}"),
   }
 
   // Each iteration blocks until an event arrives, then repaints any window the
