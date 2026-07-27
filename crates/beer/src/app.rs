@@ -482,26 +482,31 @@ impl App {
     let id = self.windows[idx].id;
     let cell = self.renderer.metrics();
     let mut buf = [0u8; 4096];
-    loop {
-      let Some(session) = self.windows[idx].session.as_mut() else {
+    // One read per readiness. The backend watches the master level-triggered,
+    // so leftover bytes simply re-fire this callback. The master is a blocking
+    // fd, so a single read only returns once data is present and never stalls
+    // the loop - draining in a loop here would block on the trailing read.
+    let res = {
+      let Some(session) = self.windows[idx].session.as_ref() else {
         return;
       };
-      match rustix::io::read(session.pty.master(), &mut buf) {
-        Ok(0) => {
-          self.child_exited(ctx, id);
-          return;
-        },
-        Ok(n) => {
-          let Session { parser, term, .. } = session;
-          term.feed(parser, &buf[..n], (cell.width, cell.height));
-        },
-        Err(rustix::io::Errno::INTR) => {},
-        Err(rustix::io::Errno::AGAIN) => break,
-        Err(_) => {
-          self.child_exited(ctx, id);
-          return;
-        },
-      }
+      rustix::io::read(session.pty.master(), &mut buf)
+    };
+    let n = match res {
+      Ok(0) => {
+        self.child_exited(ctx, id);
+        return;
+      },
+      Ok(n) => n,
+      Err(rustix::io::Errno::INTR | rustix::io::Errno::AGAIN) => return,
+      Err(_) => {
+        self.child_exited(ctx, id);
+        return;
+      },
+    };
+    if let Some(session) = self.windows[idx].session.as_mut() {
+      let Session { parser, term, .. } = session;
+      term.feed(parser, &buf[..n], (cell.width, cell.height));
     }
     self.after_feed(ctx, idx);
   }
