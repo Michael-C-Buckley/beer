@@ -58,7 +58,14 @@ impl Pty {
 
     set_winsize(&master, cols, rows, cell)?;
 
-    let shell = std::env::var_os("SHELL").unwrap_or_else(|| "/bin/sh".into());
+    // Resolve the shell the way Ghostty and WezTerm do: `$SHELL` first, then
+    // the passwd entry, then `/bin/sh`. A terminal launched from a display
+    // manager often has no `SHELL` in its environment, so without the passwd
+    // lookup the fallback would ignore the user's configured login shell.
+    let shell = std::env::var_os("SHELL")
+      .filter(|s| !s.is_empty())
+      .or_else(passwd_shell)
+      .unwrap_or_else(|| "/bin/sh".into());
     let argv0 = login_argv0(&shell);
 
     // Hand the slave to the child's stdio. try_clone gives O_CLOEXEC dups, so
@@ -147,6 +154,58 @@ fn set_winsize(
   tcsetwinsize(master.as_fd(), ws).context("set pty winsize")
 }
 
+/// The current user's login shell from the passwd database via `getpwuid_r`.
+///
+/// This is the fallback when `$SHELL` is unset, e.g., a terminal launched from
+/// a display manager, which does not export `SHELL` so the user's configured
+/// login shell is honoured rather than defaulting to `/bin/sh`. NSS-aware, like
+/// Ghostty and `WezTerm`.
+///
+/// # Returns
+///
+/// `None` on any lookup error or an empty shell.
+#[expect(
+  unsafe_code,
+  reason = "getpwuid_r is a libc FFI call with no safe binding in our deps" // boo rustix
+)]
+fn passwd_shell() -> Option<OsString> {
+  use std::{ffi::CStr, mem, os::unix::ffi::OsStrExt, ptr};
+
+  // SAFETY: getuid takes no arguments and is always successful.
+  let uid = unsafe { libc::getuid() };
+  let mut buf = vec![0u8; 1024];
+  loop {
+    // SAFETY: a zeroed passwd is a valid initial state (null pointers);
+    // getpwuid_r fully populates it on success and we never read it on failure.
+    let mut pwd: libc::passwd = unsafe { mem::zeroed() };
+    let mut result: *mut libc::passwd = ptr::null_mut();
+    // SAFETY: `pwd` and `result` are valid out-pointers; `buf` provides
+    // `buf.len()` writable bytes. getpwuid_r writes only within them and sets
+    // `result` to `&pwd` on success or NULL when there is no entry.
+    let rc = unsafe {
+      libc::getpwuid_r(
+        uid,
+        &raw mut pwd,
+        buf.as_mut_ptr().cast::<libc::c_char>(),
+        buf.len(),
+        &raw mut result,
+      )
+    };
+    // The buffer was too small: grow it (bounded) and retry.
+    if rc == libc::ERANGE && buf.len() < (1 << 20) {
+      buf.resize(buf.len() * 2, 0);
+      continue;
+    }
+    if rc != 0 || result.is_null() || pwd.pw_shell.is_null() {
+      return None;
+    }
+    // SAFETY: on success `pw_shell` is a NUL-terminated C string within `buf`,
+    // valid until `buf` is dropped; the bytes are copied into the owned result.
+    let bytes = unsafe { CStr::from_ptr(pwd.pw_shell) }.to_bytes();
+    return (!bytes.is_empty()).then(|| OsStr::from_bytes(bytes).to_owned());
+  }
+}
+
 /// Login-shell argv[0] is the shell's basename with a leading '-'.
 fn login_argv0(shell: &OsStr) -> OsString {
   let name = Path::new(shell)
@@ -166,5 +225,15 @@ mod tests {
     assert_eq!(login_argv0(OsStr::new("/usr/bin/bash")), "-bash");
     assert_eq!(login_argv0(OsStr::new("zsh")), "-zsh");
     assert_eq!(login_argv0(OsStr::new("")), "-sh");
+  }
+
+  #[test]
+  fn passwd_shell_lookup_is_sane() {
+    // The call must never panic. When the current user has a passwd entry, its
+    // shell is a non-empty absolute path.
+    if let Some(shell) = passwd_shell() {
+      assert!(!shell.is_empty());
+      assert!(Path::new(&shell).is_absolute(), "{shell:?} not absolute");
+    }
   }
 }
