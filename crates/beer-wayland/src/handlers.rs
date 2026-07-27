@@ -374,6 +374,12 @@ impl SeatHandler for WaylandState {
       },
       _ => {},
     }
+    // A touch device vanishing mid-gesture must not leave stale scroll state.
+    if capability == Capability::Touch
+      && let Some(id) = self.plat.focused_id()
+    {
+      self.app.on_touch(&mut self.plat, id, TouchEvent::Cancel);
+    }
   }
 
   fn remove_seat(
