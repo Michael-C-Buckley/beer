@@ -92,6 +92,19 @@ fn write_all(fd: &OwnedFd, mut bytes: &[u8]) -> io::Result<()> {
   Ok(())
 }
 
+/// Whether `fd` has bytes (or EOF) waiting right now, via a zero-timeout poll.
+/// Lets the pty be drained in a loop without a blocking read ever stalling the
+/// event loop when the queue runs dry.
+fn readable_now(fd: &OwnedFd) -> bool {
+  use rustix::event::{PollFd, PollFlags, Timespec, poll};
+  let mut fds = [PollFd::new(fd, PollFlags::IN)];
+  let zero = Timespec {
+    tv_sec:  0,
+    tv_nsec: 0,
+  };
+  poll(&mut fds, Some(&zero)).is_ok_and(|ready| ready > 0)
+}
+
 /// The terminal behind one window: its pty, parser, and VT state.
 struct Session {
   pty:    Pty,
@@ -526,33 +539,45 @@ impl App {
     let id = self.windows[idx].id;
     let cell = self.windows[idx].metrics;
     let mut buf = [0u8; 4096];
-    // One read per readiness. The backend watches the master level-triggered,
-    // so leftover bytes simply re-fire this callback. The master is a blocking
-    // fd, so a single read only returns once data is present and never stalls
-    // the loop - draining in a loop here would block on the trailing read.
-    let res = {
-      let Some(session) = self.windows[idx].session.as_ref() else {
-        return;
+    // Drain everything the shell has queued before repainting, so a redraw the
+    // application emits as one burst (e.g. a graphics frame swap) is never
+    // shown half-applied. Each read is gated on a zero-timeout poll so the
+    // blocking master never stalls the loop; the loop ends the moment no more
+    // bytes are waiting, and a later arrival re-fires this level-triggered
+    // source.
+    let mut fed = false;
+    loop {
+      let res = {
+        let Some(session) = self.windows[idx].session.as_ref() else {
+          return;
+        };
+        if !readable_now(session.pty.master()) {
+          break;
+        }
+        rustix::io::read(session.pty.master(), &mut buf)
       };
-      rustix::io::read(session.pty.master(), &mut buf)
-    };
-    let n = match res {
-      Ok(0) => {
-        self.child_exited(ctx, id);
-        return;
-      },
-      Ok(n) => n,
-      Err(rustix::io::Errno::INTR | rustix::io::Errno::AGAIN) => return,
-      Err(_) => {
-        self.child_exited(ctx, id);
-        return;
-      },
-    };
-    if let Some(session) = self.windows[idx].session.as_mut() {
-      let Session { parser, term, .. } = session;
-      term.feed(parser, &buf[..n], (cell.width, cell.height));
+      let n = match res {
+        Ok(0) => {
+          self.child_exited(ctx, id);
+          return;
+        },
+        Ok(n) => n,
+        Err(rustix::io::Errno::INTR) => continue,
+        Err(rustix::io::Errno::AGAIN) => break,
+        Err(_) => {
+          self.child_exited(ctx, id);
+          return;
+        },
+      };
+      if let Some(session) = self.windows[idx].session.as_mut() {
+        let Session { parser, term, .. } = session;
+        term.feed(parser, &buf[..n], (cell.width, cell.height));
+      }
+      fed = true;
     }
-    self.after_feed(ctx, idx);
+    if fed {
+      self.after_feed(ctx, idx);
+    }
   }
 
   /// Reap window `id`'s exited shell, mirror its status to any client, close
