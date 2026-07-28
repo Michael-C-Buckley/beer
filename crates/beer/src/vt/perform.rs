@@ -8,6 +8,7 @@ use super::{
   Dynamic,
   Notification,
   Params,
+  Progress,
   Term,
   base64_decode,
   charset,
@@ -209,6 +210,24 @@ impl Perform for Term {
           .unwrap_or_default();
         let uri = std::str::from_utf8(&uri_bytes).unwrap_or("");
         self.grid.set_link((!uri.is_empty()).then_some(uri));
+      },
+      // OSC 9;4 is the terminal-progress protocol used by Neovim.
+      Some(&n) if n == b"9" && params.get(1) == Some(&&b"4"[..]) => {
+        self.progress = match params.get(2).copied() {
+          Some(b"0") => None,
+          Some(b"1") => {
+            params
+              .get(3)
+              .and_then(|p| std::str::from_utf8(p).ok())
+              .and_then(|p| p.parse::<u8>().ok())
+              .filter(|&p| p <= 100)
+              .map(Progress::Normal)
+          },
+          Some(b"2") => Some(Progress::Error),
+          Some(b"3") => Some(Progress::Paused),
+          Some(b"4") => Some(Progress::Indeterminate),
+          _ => self.progress,
+        };
       },
       // OSC 9: iTerm2-style notification (`OSC 9 ; body`).
       Some(&n) if n == b"9" => {

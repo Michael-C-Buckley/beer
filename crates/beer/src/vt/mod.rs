@@ -56,6 +56,15 @@ pub struct Notification {
   pub body:  String,
 }
 
+/// A terminal progress state reported through `OSC 9;4`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Progress {
+  Normal(u8),
+  Error,
+  Paused,
+  Indeterminate,
+}
+
 /// Which dynamic colour an OSC 10/11/17/19 escape targets.
 #[derive(Clone, Copy, Debug)]
 enum Dynamic {
@@ -117,6 +126,8 @@ pub struct Term {
   /// Desktop notifications requested via OSC 9/777/99, drained by the
   /// front-end.
   notifications: Vec<Notification>,
+  /// Progress reported through OSC 9;4, shown by the front-end in the title.
+  progress:      Option<Progress>,
   /// Kitty graphics protocol state (images, placements, transmissions).
   graphics:      Graphics,
   /// APC capture state, since `vte` does not surface APC sequences.
@@ -169,6 +180,7 @@ impl Term {
       bell:          false,
       cwd:           None,
       notifications: Vec::new(),
+      progress:      None,
       graphics:      Graphics::new(),
       apc:           ApcScan::default(),
       apc_buf:       Vec::new(),
@@ -346,6 +358,11 @@ impl Term {
   /// Drain the desktop notifications requested since the last call.
   pub fn take_notifications(&mut self) -> Vec<Notification> {
     std::mem::take(&mut self.notifications)
+  }
+
+  /// The progress state last reported by the application, if any.
+  pub const fn progress(&self) -> Option<Progress> {
+    self.progress
   }
 
   /// Take and clear the pending bell flag.
@@ -1076,6 +1093,9 @@ mod tests {
   #[test]
   fn osc_notifications_collected() {
     let mut t = Term::new(20, 2);
+    // Neovim uses OSC 9;4 for its native progress indicator. This is not an
+    // iTerm-style OSC 9 notification body.
+    feed(&mut t, b"\x1b]9;4;1;0\x1b\\");
     feed(&mut t, b"\x1b]9;hello\x07");
     feed(&mut t, b"\x1b]777;notify;Title;Body\x07");
     let n = t.take_notifications();
@@ -1090,6 +1110,16 @@ mod tests {
       },
     ]);
     assert!(t.take_notifications().is_empty());
+  }
+
+  #[test]
+  fn osc_progress_tracks_neovim_state_without_notifying() {
+    let mut t = Term::new(20, 2);
+    feed(&mut t, b"\x1b]9;4;1;42\x1b\\");
+    assert_eq!(t.progress(), Some(Progress::Normal(42)));
+    assert!(t.take_notifications().is_empty());
+    feed(&mut t, b"\x1b]9;4;0;0\x1b\\");
+    assert_eq!(t.progress(), None);
   }
 
   #[test]

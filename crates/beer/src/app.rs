@@ -47,7 +47,7 @@ use crate::{
   pty::Pty,
   render::Renderer,
   theme::Theme,
-  vt::{ClipboardOp, Notification, Term},
+  vt::{ClipboardOp, Notification, Progress, Term},
 };
 
 /// Max gap between clicks counted as a multi-click (ms).
@@ -58,6 +58,8 @@ const BLINK_MS: u64 = 500;
 const FLASH_MS: u64 = 60;
 /// Autoscroll step period while dragging past an edge.
 const AUTOSCROLL_MS: u64 = 40;
+/// Pause before reflowing after a live resize configure.
+const RESIZE_REFLOW_MS: u64 = 150;
 /// Graphics-animation beat while animating / idle.
 const ANIM_MS: u64 = 100;
 const ANIM_IDLE_MS: u64 = 500;
@@ -149,6 +151,7 @@ struct WinState {
   /// Source tokens (into the backend loop) owned by this window.
   pty_token:           u64,
   autoscroll_token:    Option<u64>,
+  resize_token:        Option<u64>,
   flash_token:         Option<u64>,
   sync_token:          Option<u64>,
   // Input / mode state.
@@ -204,6 +207,7 @@ impl WinState {
       snaps: HashMap::new(),
       pty_token,
       autoscroll_token: None,
+      resize_token: None,
       flash_token: None,
       sync_token: None,
       selecting: false,
@@ -626,10 +630,24 @@ impl App {
       if !reply.is_empty() {
         let _ = write_all(session.pty.master(), &reply);
       }
-      let new_title = session.term.title().map(str::to_owned);
-      if new_title.as_deref() != win.title.as_deref() {
-        win.title.clone_from(&new_title);
-        ctx.set_title(id, new_title.as_deref().unwrap_or("beer"));
+      let new_title = match session.term.progress() {
+        Some(Progress::Normal(percent)) => {
+          format!("{percent}% — {}", session.term.title().unwrap_or("beer"))
+        },
+        Some(Progress::Error) => {
+          format!("error — {}", session.term.title().unwrap_or("beer"))
+        },
+        Some(Progress::Paused) => {
+          format!("paused — {}", session.term.title().unwrap_or("beer"))
+        },
+        Some(Progress::Indeterminate) => {
+          format!("working — {}", session.term.title().unwrap_or("beer"))
+        },
+        None => session.term.title().unwrap_or("beer").to_owned(),
+      };
+      if new_title != win.title.as_deref().unwrap_or("beer") {
+        win.title = Some(new_title.clone());
+        ctx.set_title(id, &new_title);
       }
       (
         session.term.take_bell(),
@@ -658,6 +676,7 @@ impl App {
     for tok in [
       Some(self.windows[idx].pty_token),
       self.windows[idx].autoscroll_token,
+      self.windows[idx].resize_token,
       self.windows[idx].flash_token,
       self.windows[idx].sync_token,
     ]
@@ -2126,6 +2145,7 @@ impl WindowApp for App {
     width: u32,
     height: u32,
     activated: bool,
+    resizing: bool,
   ) {
     let Some(idx) = self.win_index(id) else {
       return;
@@ -2143,7 +2163,22 @@ impl WindowApp for App {
     }
     if self.windows[idx].session.is_none() {
       self.spawn_session(ctx, idx);
+    } else if resizing {
+      // Some compositors never send a final configure without RESIZING. Reflow
+      // after a quiet interval, or immediately when one does arrive.
+      let token = if let Some(token) = self.windows[idx].resize_token {
+        ctx.cancel_timer(token);
+        token
+      } else {
+        let token = self.alloc_token();
+        self.windows[idx].resize_token = Some(token);
+        token
+      };
+      ctx.arm_timer(token, RESIZE_REFLOW_MS);
     } else {
+      if let Some(token) = self.windows[idx].resize_token.take() {
+        ctx.cancel_timer(token);
+      }
       self.resize_grid(idx);
     }
     if let Some(idx) = self.win_index(id) {
@@ -2349,6 +2384,15 @@ impl WindowApp for App {
             s.term.grid_mut().set_sync(false);
           }
           self.windows[idx].sync_token = None;
+          self.windows[idx].needs_draw = true;
+          ctx.cancel_timer(token);
+        } else if let Some(idx) = self
+          .windows
+          .iter()
+          .position(|w| w.resize_token == Some(token))
+        {
+          self.windows[idx].resize_token = None;
+          self.resize_grid(idx);
           self.windows[idx].needs_draw = true;
           ctx.cancel_timer(token);
         } else if let Some(idx) = self

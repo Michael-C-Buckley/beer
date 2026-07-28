@@ -264,12 +264,15 @@ impl WindowHandler for WaylandState {
       }
     }
     let activated = configure.is_activated();
+    let resizing = configure.is_resizing();
     self.plat.windows[idx].focused = activated;
     let (id, w, h) = {
       let win = &self.plat.windows[idx];
       (win.id, win.width, win.height)
     };
-    self.app.on_configure(&mut self.plat, id, w, h, activated);
+    self
+      .app
+      .on_configure(&mut self.plat, id, w, h, activated, resizing);
   }
 }
 

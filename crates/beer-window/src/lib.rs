@@ -204,6 +204,7 @@ pub trait App {
     width: u32,
     height: u32,
     activated: bool,
+    resizing: bool,
   );
   fn on_scale(&mut self, ctx: &mut dyn WindowCtx, id: WindowId, scale120: u32);
   fn on_focus(&mut self, ctx: &mut dyn WindowCtx, id: WindowId, focused: bool);
