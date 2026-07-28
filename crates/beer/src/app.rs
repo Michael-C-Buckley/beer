@@ -1734,12 +1734,18 @@ impl App {
     win.needs_draw = true;
     let bracketed = session.term.grid().bracketed_paste();
     let mut clean: Vec<u8> = Vec::with_capacity(data.len());
+    let mut prev = 0u8;
     for &b in data {
       match b {
+        // Newlines become carriage returns, but a CRLF pair collapses to one
+        // CR (the CR was already pushed) so a Windows-style paste does not
+        // submit a blank line after every line.
+        b'\n' if prev == b'\r' => {},
         b'\n' => clean.push(b'\r'),
         b'\t' | b'\r' | 0x20..=0xFF => clean.push(b),
         _ => {},
       }
+      prev = b;
     }
     let fd = session.pty.master();
     if bracketed {
