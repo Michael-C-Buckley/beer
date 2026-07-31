@@ -1,19 +1,25 @@
 [workspace]
 resolver = "3"
-members  = [ "crates/beer", "crates/beer-ipc", "crates/beer-protocols", "crates/beer-window", "crates/beer-wayland" ]
+members = [
+  "crates/beer",
+  "crates/beer-ipc",
+  "crates/beer-protocols",
+  "crates/beer-window",
+  "crates/beer-wayland",
+]
 
 [workspace.package]
-version      = "0.8.1"
+version      = "0.9.0"
 edition      = "2024"
 rust-version = "1.95.0"
 license      = "EUPL-1.2"
 
 [workspace.dependencies]
 # Workspace components
-beer-protocols = { path = "crates/beer-protocols", version = "0.8.1" }
-beer-ipc = { path = "crates/beer-ipc", version = "0.8.1" }
-beer-window = { path = "crates/beer-window", version = "0.8.1" }
-beer-wayland = { path = "crates/beer-wayland", version = "0.8.1" }
+beer-protocols = { path = "crates/beer-protocols", version = "0.9.0" }
+beer-ipc       = { path = "crates/beer-ipc", version = "0.9.0" }
+beer-window    = { path = "crates/beer-window", version = "0.9.0" }
+beer-wayland   = { path = "crates/beer-wayland", version = "0.9.0" }
 
 # Other dependencies
 anyhow = "1.0.104"
