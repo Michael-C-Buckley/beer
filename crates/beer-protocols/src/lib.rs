@@ -3,11 +3,11 @@
 //! This crate gathers the self-contained pieces of beer's terminal-protocol
 //! support: the byte codecs an escape stream needs, the terminfo capability
 //! table, character-set translation, SGR colour/underline parsing, and the
-//! keyboard/mouse wire encoders. It deliberately holds no terminal state (no
+//! keyboard/mouse wire encoders. It holds no terminal state (no
 //! grid, no parser loop): every item here is a pure function or a plain data
 //! type, so each protocol detail can be read and tested on its own. beer wires
-//! these into its `vte`-driven dispatcher and its [`Grid`] model.
-//!
+//! these into its `vte`-driven dispatcher and grid model.
+
 //! The modules map onto the protocols a terminal user cares about:
 //!
 //! - [`codec`] - base64 (OSC 52 clipboard), hex (XTGETTCAP), and `file://` URI

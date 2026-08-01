@@ -31,9 +31,13 @@ pub struct WindowId(pub u64);
 /// for bindings that target extra buttons.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PointerButton {
+  /// Primary button.
   Left,
+  /// Middle button.
   Middle,
+  /// Secondary button.
   Right,
+  /// A platform-specific button code.
   Other(u16),
 }
 
@@ -41,8 +45,11 @@ pub enum PointerButton {
 /// `Pointer` the hand shown over hyperlinks, `Default` the compositor arrow.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CursorIcon {
+  /// The compositor's default pointer.
   Default,
+  /// A text insertion pointer.
   Text,
+  /// A pointer used for hyperlinks.
   Pointer,
 }
 
@@ -50,38 +57,62 @@ pub enum CursorIcon {
 /// opposed to smooth touchpad scrolling), so the app can apply its multiplier.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Scroll {
+  /// Horizontal scroll distance in logical pixels.
   pub dx:       f64,
+  /// Vertical scroll distance in logical pixels.
   pub dy:       f64,
+  /// Whether the event represents a discrete wheel step.
   pub discrete: bool,
 }
 
 /// A pointer event in surface-logical pixel coordinates.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum PointerEvent {
+  /// The pointer entered the surface.
   Enter {
+    /// Horizontal surface coordinate.
     x:      f64,
+    /// Vertical surface coordinate.
     y:      f64,
+    /// Compositor serial for the enter event.
     serial: u32,
   },
+  /// The pointer left the surface.
   Leave,
+  /// The pointer moved within the surface.
   Motion {
+    /// Horizontal surface coordinate.
     x: f64,
+    /// Vertical surface coordinate.
     y: f64,
   },
+  /// A pointer button was pressed.
   Press {
+    /// Horizontal surface coordinate.
     x:      f64,
+    /// Vertical surface coordinate.
     y:      f64,
+    /// Pressed button.
     button: PointerButton,
+    /// Compositor serial for the press event.
     serial: u32,
   },
+  /// A pointer button was released.
   Release {
+    /// Horizontal surface coordinate.
     x:      f64,
+    /// Vertical surface coordinate.
     y:      f64,
+    /// Released button.
     button: PointerButton,
   },
+  /// The pointer's scroll axis changed.
   Axis {
+    /// Horizontal surface coordinate.
     x:      f64,
+    /// Vertical surface coordinate.
     y:      f64,
+    /// Scroll delta.
     scroll: Scroll,
   },
 }
@@ -89,16 +120,39 @@ pub enum PointerEvent {
 /// A single-finger touch event; the backend filters multi-finger gestures out.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum TouchEvent {
-  Down { id: i32, x: f64, y: f64 },
-  Motion { id: i32, x: f64, y: f64 },
-  Up { id: i32 },
+  /// A touch point was placed on the surface.
+  Down {
+    /// Backend-assigned touch-point identifier.
+    id: i32,
+    /// Horizontal surface coordinate.
+    x:  f64,
+    /// Vertical surface coordinate.
+    y:  f64,
+  },
+  /// A touch point moved.
+  Motion {
+    /// Backend-assigned touch-point identifier.
+    id: i32,
+    /// Horizontal surface coordinate.
+    x:  f64,
+    /// Vertical surface coordinate.
+    y:  f64,
+  },
+  /// A touch point was lifted.
+  Up {
+    /// Backend-assigned touch-point identifier.
+    id: i32,
+  },
+  /// The compositor cancelled the touch sequence.
   Cancel,
 }
 
 /// IME (text-input) events forwarded from the compositor.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum ImeEvent {
+  /// Begin receiving text-input events.
   Enable,
+  /// Stop receiving text-input events.
   Disable,
   /// Uncommitted preedit text to show inline at the cursor.
   Preedit(String),
@@ -113,10 +167,12 @@ pub enum ImeEvent {
 /// newly allocated buffer whose margins are uninitialised (paint in full).
 #[derive(Debug)]
 pub struct Frame<'a> {
+  /// Mutable physical-pixel storage to paint.
   pub pixels: &'a mut [u8],
   /// Opaque id of the backing buffer, stable across reuse, so the app can key
   /// per-buffer damage snapshots to it.
   pub id:     u64,
+  /// Whether the buffer contents must be painted in full.
   pub fresh:  bool,
 }
 
@@ -128,7 +184,9 @@ pub trait WindowCtx {
   fn size(&self, id: WindowId) -> Option<(u32, u32)>;
   /// Compositor scale in 120ths (120 = 1.0, 180 = 1.5).
   fn scale120(&self, id: WindowId) -> u32;
+  /// Set the window title.
   fn set_title(&mut self, id: WindowId, title: &str);
+  /// Toggle fullscreen state.
   fn set_fullscreen(&mut self, id: WindowId, on: bool);
   /// Set the pointer icon shown over the window.
   fn set_cursor(&mut self, id: WindowId, icon: CursorIcon);
@@ -167,6 +225,7 @@ pub trait WindowCtx {
   /// Take ownership of the clipboard / primary selection, advertising `text`;
   /// the backend serves reads by calling [`App::clipboard_text`].
   fn claim_clipboard(&mut self, text: String);
+  /// Take ownership of the primary selection, advertising `text`.
   fn claim_primary(&mut self, text: String);
   /// Request the clipboard/primary contents; delivered later via
   /// [`App::on_paste`].
@@ -175,14 +234,17 @@ pub trait WindowCtx {
   /// Create a new toplevel and return its id; the app owns the session behind
   /// it and spawns the shell on the first configure.
   fn open_window(&mut self) -> WindowId;
+  /// Request that a window be closed.
   fn close_window(&mut self, id: WindowId);
 
   /// Watch `fd` for readability; fires [`App::on_readable`] with `token` until
   /// [`WindowCtx::unwatch`] is called. Used for the pty master and IPC sockets.
   fn watch_readable(&mut self, fd: RawFd, token: u64);
+  /// Stop watching a previously registered file descriptor token.
   fn unwatch(&mut self, token: u64);
   /// Arm a one-shot timer firing [`App::on_timer`] with `token` after `millis`.
   fn arm_timer(&mut self, token: u64, millis: u64);
+  /// Cancel a previously armed timer.
   fn cancel_timer(&mut self, token: u64);
 
   /// Exit the loop with process status `code` once control returns.
@@ -197,6 +259,7 @@ pub trait App {
   /// begin serving the IPC socket in server mode, and open the initial window.
   fn start(&mut self, ctx: &mut dyn WindowCtx);
 
+  /// Apply a compositor resize/configure event.
   fn on_configure(
     &mut self,
     ctx: &mut dyn WindowCtx,
@@ -206,8 +269,11 @@ pub trait App {
     activated: bool,
     resizing: bool,
   );
+  /// Apply a compositor scale change.
   fn on_scale(&mut self, ctx: &mut dyn WindowCtx, id: WindowId, scale120: u32);
+  /// Apply a focus change.
   fn on_focus(&mut self, ctx: &mut dyn WindowCtx, id: WindowId, focused: bool);
+  /// Handle a request to close a window.
   fn on_close(&mut self, ctx: &mut dyn WindowCtx, id: WindowId);
 
   /// A key was pressed or auto-repeated (the compositor's repeat timer delivers
@@ -229,8 +295,10 @@ pub trait App {
     event: &KeyEvent,
     mods: Modifiers,
   );
+  /// Handle an IME event.
   fn on_ime(&mut self, ctx: &mut dyn WindowCtx, id: WindowId, event: ImeEvent);
 
+  /// Handle a pointer event and its modifier state.
   fn on_pointer(
     &mut self,
     ctx: &mut dyn WindowCtx,
@@ -238,6 +306,7 @@ pub trait App {
     event: PointerEvent,
     mods: Modifiers,
   );
+  /// Handle a touch event.
   fn on_touch(
     &mut self,
     ctx: &mut dyn WindowCtx,

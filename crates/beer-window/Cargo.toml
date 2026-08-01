@@ -5,6 +5,7 @@ edition.workspace      = true
 rust-version.workspace = true
 license.workspace      = true
 description            = "Platform-neutral windowing contract for the beer terminal"
+readme                 = "README.md"
 
 [dependencies]
 beer-protocols.workspace         = true

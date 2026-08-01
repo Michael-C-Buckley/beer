@@ -5,10 +5,6 @@
 //! [`beer_window::App`] by translating Wayland input and lifecycle events into
 //! `App` calls. The app performs platform actions back through the
 //! `WindowCtx` this backend supplies.
-//!
-//! In progress: `state` (the backend data model) is in place; the sctk handler
-//! translations, the `WindowCtx` implementation, the present path, and the
-//! `run` entry point are being built on top of it.
 
 mod ctx;
 mod handlers;

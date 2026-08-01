@@ -5,6 +5,7 @@ edition.workspace      = true
 rust-version.workspace = true
 license.workspace      = true
 description            = "Unix-socket daemon/client IPC for the beer terminal"
+readme                 = "README.md"
 
 [dependencies]
 rustix.workspace = true

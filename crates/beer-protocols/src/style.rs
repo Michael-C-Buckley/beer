@@ -6,8 +6,11 @@
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Color {
   #[default]
+  /// The terminal's configured default colour.
   Default,
+  /// An index into the terminal palette.
   Indexed(u8),
+  /// A direct 24-bit red, green, and blue colour.
   Rgb(u8, u8, u8),
 }
 
@@ -15,11 +18,17 @@ pub enum Color {
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Underline {
   #[default]
+  /// No underline.
   None,
+  /// A single underline.
   Single,
+  /// A double underline.
   Double,
+  /// A curly underline.
   Curly,
+  /// A dotted underline.
   Dotted,
+  /// A dashed underline.
   Dashed,
 }
 
@@ -27,8 +36,11 @@ pub enum Underline {
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum CursorShape {
   #[default]
+  /// A block cursor.
   Block,
+  /// An underline cursor.
   Underline,
+  /// A vertical bar cursor.
   Beam,
 }
 
@@ -66,9 +78,13 @@ pub enum MouseEncoding {
 /// where the command finished.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PromptKind {
+  /// The beginning of a shell prompt.
   PromptStart,
+  /// The beginning of typed command input.
   CmdStart,
+  /// The beginning of command output.
   OutputStart,
+  /// The end of a command.
   CmdEnd,
 }
 

@@ -17,8 +17,6 @@ pub(super) struct SearchState {
 }
 
 impl Grid {
-  // --- scrollback search ---
-
   /// Set the search query and recompute matches over scrollback + the live
   /// screen, focusing the most recent hit and scrolling it into view. An
   /// empty query keeps search mode active but clears the hit list.

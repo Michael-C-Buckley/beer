@@ -25,8 +25,11 @@
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum VAlign {
   #[default]
+  /// Align at the top of the cell block.
   Top,
+  /// Align at the bottom of the cell block.
   Bottom,
+  /// Center within the cell block.
   Middle,
 }
 
@@ -35,8 +38,11 @@ pub enum VAlign {
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum HAlign {
   #[default]
+  /// Align at the left of the cell block.
   Left,
+  /// Align at the right of the cell block.
   Right,
+  /// Center within the cell block.
   Center,
 }
 

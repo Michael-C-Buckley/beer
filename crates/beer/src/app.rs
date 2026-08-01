@@ -344,8 +344,6 @@ impl App {
     self.windows.iter().position(|w| w.id == id)
   }
 
-  // ---- geometry ----------------------------------------------------------
-
   #[expect(
     clippy::unused_self,
     clippy::cast_possible_truncation,
@@ -488,8 +486,6 @@ fn row_matches(
 }
 
 impl App {
-  // ---- sessions ----------------------------------------------------------
-
   /// Spawn the shell for window `idx` at its current size and watch its master.
   #[expect(clippy::cast_possible_truncation, reason = "cell metrics fit u16")]
   fn spawn_session(&mut self, ctx: &mut dyn WindowCtx, idx: usize) {
@@ -545,7 +541,7 @@ impl App {
     let mut buf = [0u8; 4096];
     // Drain everything the shell has queued before repainting, so a redraw the
     // application emits as one burst (e.g. a graphics frame swap) is never
-    // shown half-applied. Each read is gated on a zero-timeout poll so the
+    // shown half-applied. Each read follows a zero-timeout poll so the
     // blocking master never stalls the loop; the loop ends the moment no more
     // bytes are waiting, and a later arrival re-fires this level-triggered
     // source.
@@ -632,16 +628,16 @@ impl App {
       }
       let new_title = match session.term.progress() {
         Some(Progress::Normal(percent)) => {
-          format!("{percent}% — {}", session.term.title().unwrap_or("beer"))
+          format!("{percent}% - {}", session.term.title().unwrap_or("beer"))
         },
         Some(Progress::Error) => {
-          format!("error — {}", session.term.title().unwrap_or("beer"))
+          format!("error - {}", session.term.title().unwrap_or("beer"))
         },
         Some(Progress::Paused) => {
-          format!("paused — {}", session.term.title().unwrap_or("beer"))
+          format!("paused - {}", session.term.title().unwrap_or("beer"))
         },
         Some(Progress::Indeterminate) => {
-          format!("working — {}", session.term.title().unwrap_or("beer"))
+          format!("working - {}", session.term.title().unwrap_or("beer"))
         },
         None => session.term.title().unwrap_or("beer").to_owned(),
       };
@@ -702,8 +698,6 @@ impl App {
 }
 
 impl App {
-  // ---- rendering ---------------------------------------------------------
-
   /// Repaint window `idx` if its displayed state changed: diff rows against the
   /// acquired buffer's snapshot, render the dirty ones, present.
   #[expect(
@@ -867,8 +861,6 @@ impl App {
 }
 
 impl App {
-  // ---- keyboard ----------------------------------------------------------
-
   fn write_to_pty(&mut self, idx: usize, bytes: &[u8]) {
     if let Some(session) = self.windows[idx].session.as_mut()
       && let Err(err) = write_all(session.pty.master(), bytes)
@@ -1260,8 +1252,6 @@ const fn mouse_button(b: PointerButton) -> Option<MouseButton> {
 }
 
 impl App {
-  // ---- pointer -----------------------------------------------------------
-
   #[expect(
     clippy::cast_possible_truncation,
     reason = "scroll-line counts are clamped to a small range"
@@ -1623,8 +1613,6 @@ impl App {
     }
   }
 
-  // ---- touch -------------------------------------------------------------
-
   #[expect(
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss,
@@ -1667,8 +1655,6 @@ impl App {
     }
   }
 
-  // ---- IME ---------------------------------------------------------------
-
   #[expect(
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss,
@@ -1704,8 +1690,6 @@ impl App {
     self.windows[idx].needs_draw = true;
     self.ime_set_cursor(ctx, idx);
   }
-
-  // ---- clipboard ---------------------------------------------------------
 
   fn selection_text(&self, idx: usize) -> Option<String> {
     let text = self.windows[idx]
@@ -1801,8 +1785,6 @@ impl App {
     }
   }
 
-  // ---- bell / notify -----------------------------------------------------
-
   #[expect(
     clippy::disallowed_methods,
     reason = "configured bell command is a user feature"
@@ -1857,8 +1839,6 @@ impl App {
       .stderr(Stdio::null())
       .spawn();
   }
-
-  // ---- geometry / font ---------------------------------------------------
 
   /// Build a renderer rasterized for `scale120` at the current font size.
   fn build_renderer(&self, scale120: u32) -> anyhow::Result<Renderer> {
@@ -1965,8 +1945,6 @@ fn cursor_shape_from(style: Option<&str>) -> Option<CursorShape> {
 }
 
 impl App {
-  // ---- windows / daemon --------------------------------------------------
-
   fn open(
     &mut self,
     ctx: &mut dyn WindowCtx,

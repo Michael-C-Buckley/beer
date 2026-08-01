@@ -538,8 +538,6 @@ impl Grid {
     (self.cursor.x, self.cursor.y)
   }
 
-  // --- pen / attributes ---
-
   pub const fn pen_mut(&mut self) -> &mut Cell {
     &mut self.pen
   }
@@ -616,8 +614,6 @@ impl Grid {
   pub const fn app_cursor(&self) -> bool {
     self.app_cursor
   }
-
-  // --- printing ---
 
   /// Place a printable character at the cursor, honouring width and autowrap.
   pub fn print(&mut self, c: char) {
@@ -970,8 +966,6 @@ impl Grid {
     }
   }
 
-  // --- cursor movement ---
-
   const fn region(&self) -> (usize, usize) {
     if self.origin {
       (self.top, self.bottom)
@@ -1031,8 +1025,6 @@ impl Grid {
     self.wrap_pending = false;
   }
 
-  // --- line discipline ---
-
   pub const fn carriage_return(&mut self) {
     self.cursor.x = 0;
     self.wrap_pending = false;
@@ -1069,8 +1061,6 @@ impl Grid {
     self.line_feed();
   }
 
-  // --- tab stops ---
-
   pub fn tab(&mut self) {
     let mut x = self.cursor.x + 1;
     while x < self.cols && !self.tabs[x] {
@@ -1095,8 +1085,6 @@ impl Grid {
   pub fn clear_all_tabs(&mut self) {
     self.tabs.iter_mut().for_each(|t| *t = false);
   }
-
-  // --- scrolling within the region ---
 
   pub fn set_scroll_region(&mut self, top: usize, bottom: usize) {
     if top < bottom && bottom < self.rows {
@@ -1166,8 +1154,6 @@ impl Grid {
     line.wrapped = false;
   }
 
-  // --- erase ---
-
   /// ED: 0=below, 1=above, 2/3=all.
   pub fn erase_display(&mut self, mode: u16) {
     let (x, y) = (self.cursor.x, self.cursor.y);
@@ -1218,8 +1204,6 @@ impl Grid {
       *cell = blank.clone();
     }
   }
-
-  // --- intra-line editing ---
 
   /// ICH: insert n blanks at the cursor, shifting the rest right.
   pub fn insert_chars(&mut self, n: usize) {
@@ -1278,8 +1262,6 @@ impl Grid {
     }
   }
 
-  // --- alternate screen ---
-
   pub fn enter_alt_screen(&mut self) {
     if self.alt_saved.is_some() {
       return;
@@ -1294,8 +1276,6 @@ impl Grid {
       self.lines = main;
     }
   }
-
-  // --- scrollback viewport ---
 
   /// Scroll the viewport by `delta` lines: positive = back into history,
   /// negative = toward the live screen. No-op on the alternate screen.
@@ -1365,8 +1345,6 @@ impl Grid {
       .map(|_| (lead, dy))
   }
 
-  // --- selection ---
-
   /// The absolute row currently shown at viewport row `y`.
   pub fn view_to_abs(&self, y: usize) -> usize {
     self.scrollback.len() - self.view_offset + y
@@ -1406,8 +1384,6 @@ impl Grid {
         .and_then(|l| l.prompt)
     }
   }
-
-  // --- shell integration (OSC 133) ---
 
   /// Attach an OSC 133 prompt mark to the live line under the cursor.
   pub fn set_prompt_mark(&mut self, kind: PromptKind) {
@@ -1512,8 +1488,6 @@ impl Grid {
   pub const fn focus_events(&self) -> bool {
     self.focus_events
   }
-
-  // --- inspection (logging + tests) ---
 
   /// The visible text of one row, trailing blanks trimmed.
   #[cfg(test)]

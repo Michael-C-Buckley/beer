@@ -4,7 +4,9 @@
 /// A designated character set (`ESC ( c` / `ESC ) c`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Charset {
+  /// ASCII character set.
   Ascii,
+  /// DEC special graphics character set.
   DecSpecial,
 }
 

@@ -20,7 +20,7 @@ use crate::{
   theme::{Plane, Rgb, Theme},
 };
 
-/// sRGB (8-bit) → linear-light [0,1] lookup, for gamma-correct compositing.
+/// sRGB (8-bit) → linear-light `[0, 1]` lookup, for gamma-correct compositing.
 #[expect(
   clippy::cast_precision_loss,
   reason = "the fixed 8-bit sRGB lookup intentionally maps a bounded index to \
@@ -34,7 +34,7 @@ static SRGB_TO_LINEAR: LazyLock<[f32; 256]> = LazyLock::new(|| {
   t
 });
 
-/// sRGB transfer decode of a normalized [0,1] channel to linear light.
+/// sRGB transfer decode of a normalized `[0, 1]` channel to linear light.
 fn srgb_to_linear_f(c: f32) -> f32 {
   if c <= 0.04045 {
     c / 12.92
@@ -43,7 +43,8 @@ fn srgb_to_linear_f(c: f32) -> f32 {
   }
 }
 
-/// sRGB transfer encode of a linear [0,1] channel back to a normalized float.
+/// sRGB transfer encode of a linear `[0, 1]` channel back to a normalized
+/// float.
 fn linear_to_srgb_f(c: f32) -> f32 {
   let c = c.clamp(0.0, 1.0);
   if c <= 0.003_130_8 {

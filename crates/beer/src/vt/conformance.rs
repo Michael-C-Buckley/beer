@@ -22,8 +22,6 @@ fn term(cols: usize, rows: usize, bytes: &[u8]) -> Term {
   t
 }
 
-// --- Cursor movement (vttest menu 1) --------------------------------------
-
 #[test]
 fn cup_positions_one_based() {
   // CSI 2;3 H puts the cursor at row 2, col 3 (1-based) => (2, 1) 0-based.
@@ -61,8 +59,6 @@ fn decsc_decrc_round_trip() {
   feed(&mut t, b"\x1b8"); // restore
   assert_eq!(t.grid().cursor(), (3, 2));
 }
-
-// --- Erase and edit (vttest menu 2) ---------------------------------------
 
 #[test]
 fn el_modes_clear_the_right_span() {
@@ -125,8 +121,6 @@ fn il_dl_insert_and_delete_lines() {
   assert_eq!(t.grid().row_text(1), "three");
 }
 
-// --- Scroll regions and origin mode (vttest menu 1) -----------------------
-
 #[test]
 fn decstbm_confines_scrolling() {
   // Region rows 2-3. Fill it, then a line feed at the bottom scrolls only
@@ -155,8 +149,6 @@ fn decom_origin_mode_is_region_relative() {
   assert_eq!(t.grid().row_text(3), "Y");
 }
 
-// --- Tab stops (vttest menu 3) --------------------------------------------
-
 #[test]
 fn default_tab_stops_every_eight() {
   let t = term(30, 1, b"a\tb\tc");
@@ -172,8 +164,6 @@ fn hts_and_tbc_edit_tab_stops() {
   feed(&mut t, b"\r\tX"); // CR, tab jumps to col 4, print X
   assert_eq!(t.grid().cell(3, 0).c, 'X');
 }
-
-// --- SGR attributes (vttest menu 4) ---------------------------------------
 
 #[test]
 fn sgr_sets_and_resets_flags() {
@@ -213,8 +203,6 @@ fn sgr_styled_underline_and_colour() {
   assert_eq!(u.underline, Underline::Curly);
   assert_eq!(u.underline_color, Color::Indexed(42));
 }
-
-// --- Autowrap, line drawing, alt screen -----------------------------------
 
 #[test]
 fn autowrap_wraps_at_the_margin() {

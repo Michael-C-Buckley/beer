@@ -46,7 +46,8 @@ Feature requests are welcome, but not everything will be implemented.
 
 ## What's in here
 
-This is a Cargo workspace with two crates:
+This is a Cargo workspace with five production crates and one separate fuzzing
+crate:
 
 - **[`crates/beer`](crates/beer/README.md)** - the terminal application itself.
   Start here for the feature list, installation, configuration, and day-to-day
@@ -54,6 +55,14 @@ This is a Cargo workspace with two crates:
 - **[`crates/beer-protocols`](crates/beer-protocols/README.md)** - the reusable,
   self-documenting building blocks the terminal is made of, and a readable
   reference for the escape sequences and protocols `beer` speaks.
+- **[`crates/beer-ipc`](crates/beer-ipc/README.md)** - the Unix-socket protocol
+  used by daemon and client processes.
+- **[`crates/beer-window`](crates/beer-window/README.md)** - the
+  platform-neutral application/windowing contract.
+- **[`crates/beer-wayland`](crates/beer-wayland/README.md)** - the Wayland
+  backend that drives the application contract.
+
+`cargo-fuzz` targets for protocol parsers and decoders.
 
 If you just want to run it, head to the
 [application README](crates/beer/README.md). If you are curious how a terminal

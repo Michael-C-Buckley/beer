@@ -62,8 +62,11 @@ pub fn encode(
 /// A key event's kind, for the kitty keyboard protocol's event-type sub-field.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum KeyKind {
+  /// Initial key press.
   Press   = 1,
+  /// Automatic key repeat.
   Repeat  = 2,
+  /// Key release.
   Release = 3,
 }
 

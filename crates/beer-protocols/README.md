@@ -17,15 +17,17 @@ Notation: `ESC` is `0x1b`, `CSI` is `ESC [`, `OSC` is `ESC ]`, `DCS` is `ESC P`,
 
 <!--markdownlint-disable MD013-->
 
-| Module    | What it covers                                                                 |
-| --------- | ------------------------------------------------------------------------------ |
-| `codec`   | base64 (OSC 52), hex (XTGETTCAP names), `file://` URI percent-decoding (OSC 7) |
-| `caps`    | terminfo capabilities answered over XTGETTCAP                                  |
-| `charset` | G0/G1 designation and DEC special-graphics line drawing                        |
-| `sgr`     | the multi-parameter SGR colour and underline forms                             |
-| `key`     | legacy xterm/VT and kitty keyboard-protocol key encoding                       |
-| `mouse`   | X10 / UTF-8 / SGR mouse-report encoding                                        |
-| `style`   | the enums an SGR/DECSET stream selects                                         |
+| Module      | What it covers                                                                 |
+| ----------- | ------------------------------------------------------------------------------ |
+| `codec`     | base64 (OSC 52), hex (XTGETTCAP names), `file://` URI percent-decoding (OSC 7) |
+| `caps`      | terminfo capabilities answered over XTGETTCAP                                  |
+| `charset`   | G0/G1 designation and DEC special-graphics line drawing                        |
+| `graphics`  | kitty graphics APC control-data parsing                                        |
+| `sgr`       | the multi-parameter SGR colour and underline forms                             |
+| `key`       | legacy xterm/VT and kitty keyboard-protocol key encoding                       |
+| `mouse`     | X10 / UTF-8 / SGR mouse-report encoding                                        |
+| `style`     | the enums an SGR/DECSET stream selects                                         |
+| `text_size` | kitty text-sizing (`OSC 66`) metadata parsing                                  |
 
 <!--markdownlint-enable MD013-->
 

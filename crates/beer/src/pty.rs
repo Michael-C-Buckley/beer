@@ -206,7 +206,7 @@ fn passwd_shell() -> Option<OsString> {
   }
 }
 
-/// Login-shell argv[0] is the shell's basename with a leading '-'.
+/// Login-shell `argv[0]` is the shell's basename with a leading `-`.
 fn login_argv0(shell: &OsStr) -> OsString {
   let name = Path::new(shell)
     .file_name()
