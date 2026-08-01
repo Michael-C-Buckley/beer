@@ -7,72 +7,72 @@
 #
 # Colours are X11 specs: "#rrggbb" or "rgb:rr/gg/bb".
 
-[main]
-font            = "monospace"           # primary family, resolved via fontconfig
-font-size       = 16                    # pixels
-idle-inhibit    = false                 # hold off screen blanking while focused
-initial-cols    = 80
-initial-rows    = 24
-pad-x           = 2                     # inner padding, pixels
-pad-y           = 2
-server-resident = true                  # a --server process outlives its last window
-subpixel        = "none"                # LCD antialiasing: none, rgb, or bgr
-term            = "beer"                # TERM exported to the child shell
-word-delimiters = " ,│`|:\"'()[]{}<>\t" # unset keeps the built-in set
+# [main]
+# font            = "monospace"           # primary family, resolved via fontconfig
+# font-size       = 16                    # pixels
+# idle-inhibit    = false                 # hold off screen blanking while focused
+# initial-cols    = 80
+# initial-rows    = 24
+# pad-x           = 2                     # inner padding, pixels
+# pad-y           = 2
+# server-resident = true                  # a --server process outlives its last window
+# subpixel        = "none"                # LCD antialiasing: none, rgb, or bgr
+# term            = "beer"                # TERM exported to the child shell
+# word-delimiters = " ,│`|:\"'()[]{}<>\t" # unset keeps the built-in set
 
-[colors]
-alpha                    = 1.0                                                                                        # 0.0 transparent .. 1.0 opaque
-alpha-blending           = "linear-corrected"                                                                         # native, linear, or linear-corrected
-background               = "#181818"
-bold-as-bright           = true
-bright                   = [ "#928374", "#fb4934", "#b8bb26", "#fabd2f", "#83a598", "#d3869b", "#8ec07c", "#ebdbb2" ]
-cursor                   = "#c5c8c6"                                                                                  # unset: invert the cell under the cursor
-foreground               = "#c5c8c6"
-match-background         = "#ffd700"
-match-current-background = "#ff8c00"
-regular                  = [ "#282828", "#cc241d", "#98971a", "#d79921", "#458588", "#b16286", "#689d6a", "#a89984" ]
-selection-background     = "#44475a"
-selection-foreground     = "#181818"
+# [colors]
+# alpha                    = 1.0                                                                                        # 0.0 transparent .. 1.0 opaque
+# alpha-blending           = "linear-corrected"                                                                         # native, linear, or linear-corrected
+# background               = "#181818"
+# bold-as-bright           = true
+# bright                   = [ "#928374", "#fb4934", "#b8bb26", "#fabd2f", "#83a598", "#d3869b", "#8ec07c", "#ebdbb2" ]
+# cursor                   = "#c5c8c6"                                                                                  # unset: invert the cell under the cursor
+# foreground               = "#c5c8c6"
+# match-background         = "#ffd700"
+# match-current-background = "#ff8c00"
+# regular                  = [ "#282828", "#cc241d", "#98971a", "#d79921", "#458588", "#b16286", "#689d6a", "#a89984" ]
+# selection-background     = "#44475a"
+# selection-foreground     = "#181818"
 
-[cursor]
-blink = false
-style = "block" # block | beam (bar) | underline
+# [cursor]
+# blink = false
+# style = "block" # block | beam (bar) | underline
 
-[scrollback]
-lines = 10000 # history retained on the main screen
+# [scrollback]
+# lines = 10000 # history retained on the main screen
 
-[bell]
-command = [  ]  # e.g. ["paplay", "/usr/share/sounds/bell.oga"]
-urgent  = false # request attention when unfocused
-visual  = false # flash the screen on the bell
+# [bell]
+# command = [  ]  # e.g. ["paplay", "/usr/share/sounds/bell.oga"]
+# urgent  = false # request attention when unfocused
+# visual  = false # flash the screen on the bell
 
-[mouse]
-alternate-scroll  = true # wheel -> cursor keys on the alt screen
-scroll-multiplier = 1.0
+# [mouse]
+# alternate-scroll  = true # wheel -> cursor keys on the alt screen
+# scroll-multiplier = 1.0
 
-[shell-integration]
-pipe-command = [  ] # target of the pipe-command-output action, e.g. ["less"]
+# [shell-integration]
+# pipe-command = [  ] # target of the pipe-command-output action, e.g. ["less"]
 
-[url]
-launch = [ "xdg-open" ] # the URL is appended as the last argument
+# [url]
+# launch = [ "xdg-open" ] # the URL is appended as the last argument
 
-[notify]
-command = [ "notify-send" ] # title and body appended as the last two arguments
+# [notify]
+# command = [ "notify-send" ] # title and body appended as the last two arguments
 
 # Chord -> action, merged over the built-in defaults. "none" unbinds a chord.
 # Actions: copy, paste, paste-primary, scrollback-up, scrollback-down,
 # scrollback-top, scrollback-bottom, search, font-increase, font-decrease,
 # font-reset, fullscreen, new-window, jump-prompt-up, jump-prompt-down,
 # pipe-command-output, url-mode, unicode-input.
-[key-bindings]
-"Ctrl+Shift+C" = "copy"
-"Ctrl+Shift+V" = "paste"
+# [key-bindings]
+# "Ctrl+Shift+C" = "copy"
+# "Ctrl+Shift+V" = "paste"
 
 # Mouse chord -> action.
 # Buttons: Left, Middle, Right (Left drag is built in).
-[mouse-bindings]
-"Middle" = "paste-primary"
+# [mouse-bindings]
+# "Middle" = "paste-primary"
 
 # Chord -> literal text, with the escapes \e \n \r \t \\ \xNN.
-[text-bindings]
-"Ctrl+Shift+Return" = "\\x1b\r"
+# [text-bindings]
+# "Ctrl+Shift+Return" = "\\x1b\r"
