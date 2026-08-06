@@ -17,6 +17,8 @@
       default = pkgsForEach.${system}.callPackage ./nix/shell.nix {};
     });
 
+    nixosModules.default = ./nix/nixos.nix;
+
     hydraJobs = self.packages;
   };
 }
