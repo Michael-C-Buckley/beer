@@ -5,7 +5,12 @@
 //! then glyphs - so a wide glyph that overflows its cell is not clipped by the
 //! neighbouring cell's background fill.
 
-use std::{mem, num::NonZeroU16, sync::LazyLock};
+use std::{
+  collections::{HashMap, HashSet},
+  mem,
+  num::NonZeroU16,
+  sync::LazyLock,
+};
 
 use beer_protocols::{
   graphics::{PLACEHOLDER, diacritic_value},
@@ -269,6 +274,38 @@ pub struct Frame<'a> {
   pub images:       &'a Graphics,
 }
 
+/// Glyphs shaped for one cell of a run: the shaping face, the run's style, and
+/// each glyph's index and pixel offset from the cell origin.
+struct ShapedCell {
+  face_idx: usize,
+  style:    Style,
+  glyphs:   Vec<(u32, i32, i32)>,
+}
+
+/// The shaping plan for one row: which cells draw shaped glyphs, and which are
+/// covered by a ligature to their left and so draw nothing.
+#[derive(Default)]
+struct ShapePlan {
+  shaped:  HashMap<usize, ShapedCell>,
+  covered: HashSet<usize>,
+}
+
+/// Whether a cell takes part in run shaping. Cells drawn by another path
+/// (combining clusters, braille, box drawing, images, sized blocks) or hidden
+/// this blink phase are excluded so a run never crosses them.
+fn shapeable(cell: &Cell, blink_on: bool) -> bool {
+  if cell.flags.contains(Flags::WIDE_CONT) || cell.sized.is_some() {
+    return false;
+  }
+  if cell.combining.is_some() || cell.c == PLACEHOLDER {
+    return false;
+  }
+  if cell.flags.contains(Flags::BLINK) && !blink_on {
+    return false;
+  }
+  !is_braille(cell.c) && !is_box_draw(cell.c)
+}
+
 #[derive(Debug)]
 pub struct Renderer {
   fonts: Fonts,
@@ -421,6 +458,14 @@ impl Renderer {
       |z| z < 0,
     );
 
+    // Shape the row's runs up front so the draw loop can place ligature glyphs
+    // and skip the cells they absorb.
+    let plan = if self.fonts.ligatures() {
+      self.plan_shaping(cells, cols, blink_on)
+    } else {
+      ShapePlan::default()
+    };
+
     for (x, cell) in cells.iter().take(cols).enumerate() {
       if cell.flags.contains(Flags::WIDE_CONT) {
         continue;
@@ -486,6 +531,28 @@ impl Renderer {
       {
         // Box drawing, block elements, and sextants are drawn geometrically so
         // they fill the cell exactly and tile seamlessly - fonts leave seams.
+      } else if let Some(sc) = plan.shaped.get(&x) {
+        // Glyphs the run shaper placed for this cell (including ligatures that
+        // spill into the covered cells to the right).
+        let sub = self.sub_mode(opaque_bg);
+        for &(gid, gx, gy) in &sc.glyphs {
+          if let Ok(glyph) =
+            self.fonts.glyph_indexed(sc.face_idx, gid, sc.style)
+          {
+            blit_glyph(
+              &mut canvas,
+              glyph,
+              m,
+              origin_x + gx,
+              row_top,
+              gy,
+              fg,
+              sub,
+            );
+          }
+        }
+      } else if plan.covered.contains(&x) {
+        // Absorbed by a ligature that a cell to the left already drew.
       } else {
         if cell.c != ' ' {
           self.draw_glyph(
@@ -727,6 +794,72 @@ impl Renderer {
       Subpixel::Bgr if opaque => Some(true),
       _ => None,
     }
+  }
+
+  /// Shape the row's text into a [`ShapePlan`]. Consecutive shapeable cells of
+  /// one style form a run shaped together; each glyph is bound to the cell of
+  /// its cluster, and cells a ligature absorbed are recorded as covered so the
+  /// draw loop skips them. Cells the shaping face does not cover fall through
+  /// to the per-cell path, which does its own fontconfig fallback.
+  fn plan_shaping(
+    &mut self,
+    cells: &[Cell],
+    cols: usize,
+    blink_on: bool,
+  ) -> ShapePlan {
+    let mut plan = ShapePlan::default();
+    let cols = cols.min(cells.len());
+    let mut x = 0;
+    while x < cols {
+      if !shapeable(&cells[x], blink_on) {
+        x += 1;
+        continue;
+      }
+      let style = cell_style(&cells[x]);
+      let mut text = String::new();
+      let mut offsets: Vec<(usize, usize)> = Vec::new();
+      while x < cols
+        && shapeable(&cells[x], blink_on)
+        && cell_style(&cells[x]) == style
+      {
+        offsets.push((text.len(), x));
+        text.push(cells[x].c);
+        x += 1;
+      }
+      // A lone cell cannot ligate, so leave it to the cheaper per-cell path.
+      if offsets.len() < 2 {
+        continue;
+      }
+      let Some(run) = self.fonts.shape_run(&text, style) else {
+        continue;
+      };
+      let mut present: HashSet<usize> = HashSet::new();
+      let mut by_cluster: HashMap<usize, Vec<(u32, i32, i32)>> = HashMap::new();
+      for glyph in &run.glyphs {
+        let cluster = glyph.cluster as usize;
+        present.insert(cluster);
+        if glyph.gid != 0 {
+          by_cluster
+            .entry(cluster)
+            .or_default()
+            .push((glyph.gid, glyph.x, glyph.y));
+        }
+      }
+      for &(offset, cell_x) in &offsets {
+        if let Some(glyphs) = by_cluster.remove(&offset) {
+          plan.shaped.insert(cell_x, ShapedCell {
+            face_idx: run.face_idx,
+            style,
+            glyphs,
+          });
+        } else if !present.contains(&offset) {
+          // Merged into a ligature that a cell to the left draws.
+          plan.covered.insert(cell_x);
+        }
+        // A present-but-.notdef cluster falls through to the per-cell path.
+      }
+    }
+    plan
   }
 
   #[expect(

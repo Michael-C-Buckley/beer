@@ -3,8 +3,8 @@
 **A terminal worth pouring time into.**
 
 A small, fast, Wayland-native terminal emulator written in Rust drawn entirely
-on the CPU, with no GPU pipeline, no tabs, no ligatures, and no async runtime to
-get in the way.
+on the CPU, with no GPU pipeline, no tabs, and no async runtime to get in the
+way.
 
 ## Why another terminal?
 

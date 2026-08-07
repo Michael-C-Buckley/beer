@@ -26,6 +26,45 @@ channel).
 *font-size* = _integer_
 	Font size in pixels. Default _16_.
 
+*font-bold* = _string_, *font-italic* = _string_, *font-bold-italic* = _string_
+	Font families for the bold, italic, and bold-italic styles. Unset resolves
+	the primary family's corresponding style through fontconfig.
+
+*font-fallback* = _array of string_
+	Fallback families, tried in order for code points the primary family lacks,
+	before fontconfig coverage matching. Default empty.
+
+*font-features* = _array of string_
+	OpenType feature settings applied while shaping. Each entry is a four-letter
+	tag with an optional value: _ss01_ or _+ss01_ enables a feature, _-liga_
+	disables it, and _cv01=2_ sets an explicit value. Default empty.
+
+*font-variations* = _array of string_
+	Variation-axis settings for variable fonts, each _tag=value_ (for example
+	_wght=550_ or _slnt=-8_), applied to the primary family and its style and
+	fallback variants. Unnamed axes keep their default and static fonts are
+	unaffected. Default empty.
+
+*ligatures* = _bool_
+	Shape each row's runs so ligatures and contextual alternates form. When
+	_false_, cells render in isolation. Default _true_.
+
+*hinting* = _none_ | _slight_ | _normal_
+	Outline grid-fitting strength. _none_ disables grid-fitting, _slight_ uses
+	the light autohinter (grayscale only), and _normal_ (the default) keeps the
+	FreeType default.
+
+*adjust-cell-width* = _integer_, *adjust-cell-height* = _integer_
+	Pixels added to the cell width and height. Negative values tighten the
+	grid. Scaled with the output. Default _0_ each.
+
+*adjust-baseline* = _integer_
+	Pixels the text baseline is shifted down within the cell. Default _0_.
+
+*thicken* = _bool_
+	Thicken every glyph by one coverage pixel, a light synthetic weight applied
+	on top of any real or synthetic bold. Default _false_.
+
 *subpixel* = _none_ | _rgb_ | _bgr_
 	Subpixel (LCD) antialiasing order. _none_ (the default) renders grayscale
 	coverage. _rgb_ and _bgr_ enable horizontal LCD rendering; pick the one

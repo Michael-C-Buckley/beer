@@ -8,17 +8,29 @@
 # Colours are X11 specs: "#rrggbb" or "rgb:rr/gg/bb".
 
 # [main]
-# font            = "monospace"           # primary family, resolved via fontconfig
-# font-size       = 16                    # pixels
-# idle-inhibit    = false                 # hold off screen blanking while focused
-# initial-cols    = 80
-# initial-rows    = 24
-# pad-x           = 2                     # inner padding, pixels
-# pad-y           = 2
-# server-resident = true                  # a --server process outlives its last window
-# subpixel        = "none"                # LCD antialiasing: none, rgb, or bgr
-# term            = "beer"                # TERM exported to the child shell
-# word-delimiters = " ,│`|:\"'()[]{}<>\t" # unset keeps the built-in set
+# font               = "monospace"           # primary family, resolved via fontconfig
+# font-bold          = "monospace"           # unset resolves the primary family's bold style
+# font-italic        = "monospace"           # unset resolves the primary family's italic style
+# font-bold-italic   = "monospace"           # unset resolves the primary family's bold-italic style
+# font-fallback      = [  ]                   # families tried in order before fontconfig coverage
+# font-features      = [  ]                   # OpenType features, e.g. ["ss01", "-liga", "cv01=2"]
+# font-variations    = [  ]                   # variable-font axes, e.g. ["wght=550", "slnt=-8"]
+# font-size          = 16                     # pixels
+# ligatures          = true                   # shape runs for ligatures and contextual alternates
+# hinting            = "normal"               # grid-fitting: none, slight, or normal
+# adjust-cell-width  = 0                      # pixels added to the cell width; negative tightens
+# adjust-cell-height = 0                      # pixels added to the cell height
+# adjust-baseline    = 0                      # pixels the baseline shifts down within the cell
+# thicken            = false                  # thicken every glyph by one coverage pixel
+# idle-inhibit       = false                  # hold off screen blanking while focused
+# initial-cols       = 80
+# initial-rows       = 24
+# pad-x              = 2                      # inner padding, pixels
+# pad-y              = 2
+# server-resident    = true                   # a --server process outlives its last window
+# subpixel           = "none"                 # LCD antialiasing: none, rgb, or bgr
+# term               = "beer"                 # TERM exported to the child shell
+# word-delimiters    = " ,│`|:\"'()[]{}<>\t"  # unset keeps the built-in set
 
 # [colors]
 # alpha                    = 1.0                                                                                        # 0.0 transparent .. 1.0 opaque

@@ -74,6 +74,10 @@ pub struct FontOptions<'a> {
   /// Variation-axis settings, each `tag=value`, applied to the primary family
   /// and its style and fallback variants.
   pub variations:         &'a [String],
+  /// OpenType feature settings, each a tag with an optional `+`/`-`/`=value`.
+  pub features:           &'a [String],
+  /// Whether to shape runs (ligatures, contextual alternates).
+  pub ligatures:          bool,
   pub size_px:            u32,
   pub hinting:            Hinting,
   /// Pixels added to the cell advance width, height, and baseline offset.
@@ -96,6 +100,8 @@ impl<'a> FontOptions<'a> {
       bold_italic_family: None,
       fallback: &[],
       variations: &[],
+      features: &[],
+      ligatures: true,
       size_px,
       hinting: Hinting::Normal,
       adjust_width: 0,
@@ -186,6 +192,25 @@ pub struct ShapedCluster {
   pub glyphs:   Vec<Placed>,
 }
 
+/// One shaped glyph of a text run: its glyph index, the byte offset in the run
+/// of the cluster it belongs to, and its pixel offset from that cluster's cell
+/// origin. `gid == 0` marks a code point the shaping face does not cover.
+#[derive(Clone, Copy, Debug)]
+pub struct RunGlyph {
+  pub gid:     u32,
+  pub cluster: u32,
+  pub x:       i32,
+  pub y:       i32,
+}
+
+/// The result of shaping a run of cells against one face: the face used and the
+/// positioned glyphs, whose `cluster` maps each back to the originating cell.
+#[derive(Clone, Debug)]
+pub struct ShapedRun {
+  pub face_idx: usize,
+  pub glyphs:   Vec<RunGlyph>,
+}
+
 /// A loaded face plus where it came from, so `HarfBuzz` can be handed the same
 /// font bytes that `FreeType` rasterizes from.
 struct FaceEntry {
@@ -215,6 +240,10 @@ pub struct Fonts {
   style_family:      [Option<String>; 4],
   /// Parsed variation-axis settings `(tag, value)` applied to named faces.
   variations:        Vec<(u32, f32)>,
+  /// Parsed OpenType feature settings passed to every shaping call.
+  features:          Vec<harfbuzz::Feature>,
+  /// Whether run shaping (ligatures) is enabled.
+  ligatures:         bool,
   /// Configured fallback families, tried in order before coverage matching.
   fallback_families: Vec<String>,
   /// Face indices for the configured fallback families, resolved on first use.
@@ -233,6 +262,8 @@ pub struct Fonts {
   gcache:            LruCache<(u32, usize, usize), Glyph>,
   /// Shaped clusters keyed by `(cluster string, style)`.
   shape_cache:       LruCache<(Box<str>, usize), Option<ShapedCluster>>,
+  /// Shaped runs keyed by `(run string, style)`.
+  run_cache:         LruCache<(Box<str>, usize), Option<ShapedRun>>,
 }
 
 impl fmt::Debug for Fonts {
@@ -302,6 +333,8 @@ impl Fonts {
       metrics,
       style_family,
       variations,
+      features: parse_features(options.features),
+      ligatures: options.ligatures,
       fallback_families: options.fallback.to_vec(),
       fallback_chain: Vec::new(),
       fallback_ready: false,
@@ -311,11 +344,17 @@ impl Fonts {
       cache: LruCache::new(cap(GLYPH_CACHE_CAP)?),
       gcache: LruCache::new(cap(GLYPH_CACHE_CAP)?),
       shape_cache: LruCache::new(cap(SHAPE_CACHE_CAP)?),
+      run_cache: LruCache::new(cap(SHAPE_CACHE_CAP)?),
     })
   }
 
   pub const fn metrics(&self) -> CellMetrics {
     self.metrics
+  }
+
+  /// Whether run shaping (ligatures, contextual alternates) is enabled.
+  pub const fn ligatures(&self) -> bool {
+    self.ligatures
   }
 
   /// The active subpixel order; `None` when rendering grayscale coverage.
@@ -414,9 +453,10 @@ impl Fonts {
     style: Style,
   ) -> Option<ShapedCluster> {
     let face_idx = self.face_for(base, style).ok()?;
+    let features = self.features.clone();
     let font = self.hb_font(face_idx)?;
     let buffer = harfbuzz::UnicodeBuffer::new().add_str(cluster);
-    let output = harfbuzz::shape(font, buffer, &[]);
+    let output = harfbuzz::shape(font, buffer, &features);
     let infos = output.get_glyph_infos();
     let positions = output.get_glyph_positions();
     let mut glyphs = Vec::with_capacity(infos.len());
@@ -436,6 +476,58 @@ impl Fonts {
       pen += pos.x_advance;
     }
     Some(ShapedCluster { face_idx, glyphs })
+  }
+
+  /// Shape a run of text against the styled face using `HarfBuzz`, producing
+  /// ligatures and contextual alternates. Every glyph carries the byte offset
+  /// of its cluster so the renderer can map it back to a cell; `.notdef`
+  /// glyphs are kept so the caller can fall back per code point. Returns `None`
+  /// only when shaping is unavailable for the face. Results are cached.
+  pub fn shape_run(&mut self, text: &str, style: Style) -> Option<ShapedRun> {
+    if text.is_empty() {
+      return None;
+    }
+    let key = (Box::from(text), style.index());
+    if let Some(cached) = self.run_cache.get(&key) {
+      return cached.clone();
+    }
+    let shaped = self.shape_run_uncached(text, style);
+    self.run_cache.put(key, shaped.clone());
+    shaped
+  }
+
+  fn shape_run_uncached(
+    &mut self,
+    text: &str,
+    style: Style,
+  ) -> Option<ShapedRun> {
+    let face_idx = self.styled_face(style).ok()?;
+    let features = self.features.clone();
+    let font = self.hb_font(face_idx)?;
+    let buffer = harfbuzz::UnicodeBuffer::new().add_str(text);
+    let output = harfbuzz::shape(font, buffer, &features);
+    let infos = output.get_glyph_infos();
+    let positions = output.get_glyph_positions();
+    let mut glyphs = Vec::with_capacity(infos.len());
+    let mut pen = 0i32;
+    let mut cluster = u32::MAX;
+    let mut cluster_pen = 0i32;
+    for (info, pos) in infos.iter().zip(positions) {
+      // Each glyph is placed relative to the origin of its own cluster's cell;
+      // advances accumulate only within a cluster (for stacked marks).
+      if info.cluster != cluster {
+        cluster = info.cluster;
+        cluster_pen = pen;
+      }
+      glyphs.push(RunGlyph {
+        gid:     info.codepoint,
+        cluster: info.cluster,
+        x:       (pen - cluster_pen + pos.x_offset) >> 6,
+        y:       pos.y_offset >> 6,
+      });
+      pen += pos.x_advance;
+    }
+    Some(ShapedRun { face_idx, glyphs })
   }
 
   /// Lazily build the `HarfBuzz` font for `face_idx` from the same file bytes
@@ -625,6 +717,36 @@ fn parse_variations(specs: &[String]) -> Vec<(u32, f32)> {
       out.push(pair);
     } else {
       tracing::warn!("ignoring malformed font variation {spec:?}");
+    }
+  }
+  out
+}
+
+/// Parse OpenType feature settings into `HarfBuzz` features applied over the
+/// whole buffer. A leading `-` disables a feature (value 0), a leading `+` or a
+/// bare tag enables it (value 1), and `tag=value` sets an explicit value.
+/// Malformed entries are skipped and logged.
+fn parse_features(specs: &[String]) -> Vec<harfbuzz::Feature> {
+  let mut out = Vec::new();
+  for spec in specs {
+    let trimmed = spec.trim();
+    // Default to enabling the bare tag; `tag=value` sets an explicit value and
+    // a leading `-`/`+` disables/enables it.
+    let mut tag = trimmed;
+    let mut value = Some(1u32);
+    if let Some((name, raw)) = trimmed.split_once('=') {
+      tag = name.trim();
+      value = raw.trim().parse().ok();
+    } else if let Some(name) = trimmed.strip_prefix('-') {
+      tag = name.trim();
+      value = Some(0);
+    } else if let Some(name) = trimmed.strip_prefix('+') {
+      tag = name.trim();
+    }
+    if let (Some(tag), Some(value)) = (pack_tag(tag), value) {
+      out.push(harfbuzz::Feature::new(harfbuzz::Tag(tag), value, ..));
+    } else {
+      tracing::warn!("ignoring malformed font feature {spec:?}");
     }
   }
   out
@@ -1107,6 +1229,40 @@ mod tests {
     let wght = pack_tag("wght").expect("valid tag");
     let slnt = pack_tag("slnt").expect("valid tag");
     assert_eq!(parse_variations(&specs), vec![(wght, 550.0), (slnt, -8.0)]);
+  }
+
+  #[test]
+  fn parse_features_reads_values_and_toggles() {
+    let specs = vec![
+      "ss01".to_string(),
+      "-liga".to_string(),
+      "+calt".to_string(),
+      "cv01=2".to_string(),
+      "bad".to_string(),
+    ];
+    let feats = parse_features(&specs);
+    let seen: Vec<(String, u32)> = feats
+      .iter()
+      .map(|f| (f.tag().to_string(), f.value()))
+      .collect();
+    assert_eq!(seen, vec![
+      ("ss01".to_string(), 1),
+      ("liga".to_string(), 0),
+      ("calt".to_string(), 1),
+      ("cv01".to_string(), 2),
+    ]);
+  }
+
+  #[test]
+  fn shape_run_maps_glyphs_to_clusters() {
+    let mut f = fonts();
+    // A short ASCII run shapes to one glyph per byte, each anchored at the
+    // cluster of its own cell; monospace has no ligature to merge them.
+    let run = f.shape_run("ab", Style::default()).expect("run shapes");
+    assert_eq!(run.glyphs.len(), 2);
+    assert_eq!(run.glyphs[0].cluster, 0);
+    assert_eq!(run.glyphs[1].cluster, 1);
+    assert!(run.glyphs.iter().all(|g| g.gid != 0));
   }
 
   #[test]
