@@ -418,6 +418,7 @@ fn font_options(main: &Main, px: u32, scale120: u32) -> FontOptions<'_> {
   options.italic_family = main.font_italic.as_deref();
   options.bold_italic_family = main.font_bold_italic.as_deref();
   options.fallback = &main.font_fallback;
+  options.variations = &main.font_variations;
   options.hinting = main.hinting;
   options.adjust_width = phys_adj(main.adjust_cell_width, scale120);
   options.adjust_height = phys_adj(main.adjust_cell_height, scale120);

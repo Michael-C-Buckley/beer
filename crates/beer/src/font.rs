@@ -4,10 +4,19 @@
 //! `FreeType` rasterizes each glyph to an 8-bit coverage mask or, for colour
 //! fonts, a pre-multiplied BGRA bitmap. Layout is fixed-cell, so a glyph's own
 //! advance is never consulted - only the [`CellMetrics`] taken from the primary
-//! face. C interop goes through the `freetype`/`fontconfig` safe wrappers; the
-//! sole `unsafe` is reading a face's fixed-strike array (see `nearest_strike`).
+//! face. C interop goes through the `freetype`/`fontconfig` safe wrappers,
+//! except two spots that reach the raw `FreeType` API: reading a face's
+//! fixed-strike array (`nearest_strike`) and setting variable-font axes
+//! (`apply_variations`).
 
-use std::{collections::HashMap, fmt, fs, num::NonZeroUsize, path::PathBuf};
+use std::{
+  collections::HashMap,
+  fmt,
+  fs,
+  num::NonZeroUsize,
+  path::PathBuf,
+  ptr,
+};
 
 use fontconfig::{CharSet, Fontconfig, Pattern};
 use freetype::{
@@ -18,6 +27,7 @@ use freetype::{
   Vector,
   bitmap::PixelMode,
   face::{LoadFlag, StyleFlag},
+  ffi,
 };
 use harfbuzz_rs_now as harfbuzz;
 use lru::LruCache;
@@ -61,6 +71,9 @@ pub struct FontOptions<'a> {
   pub bold_italic_family: Option<&'a str>,
   /// Fallback families tried in order before fontconfig coverage matching.
   pub fallback:           &'a [String],
+  /// Variation-axis settings, each `tag=value`, applied to the primary family
+  /// and its style and fallback variants.
+  pub variations:         &'a [String],
   pub size_px:            u32,
   pub hinting:            Hinting,
   /// Pixels added to the cell advance width, height, and baseline offset.
@@ -82,6 +95,7 @@ impl<'a> FontOptions<'a> {
       italic_family: None,
       bold_italic_family: None,
       fallback: &[],
+      variations: &[],
       size_px,
       hinting: Hinting::Normal,
       adjust_width: 0,
@@ -199,6 +213,8 @@ pub struct Fonts {
   /// Per-style family override; slot 0 (regular) is unused. `None` resolves
   /// the primary family's style variant instead.
   style_family:      [Option<String>; 4],
+  /// Parsed variation-axis settings `(tag, value)` applied to named faces.
+  variations:        Vec<(u32, f32)>,
   /// Configured fallback families, tried in order before coverage matching.
   fallback_families: Vec<String>,
   /// Face indices for the configured fallback families, resolved on first use.
@@ -251,12 +267,14 @@ impl Fonts {
     };
 
     let size_px = options.size_px;
+    let variations = parse_variations(options.variations);
     let regular = resolve_face(
       &library,
       &fontconfig,
       options.family,
       Style::default(),
       size_px,
+      &variations,
     )?;
     let metrics = adjust_metrics(
       cell_metrics(&regular.face, options.family)?,
@@ -283,6 +301,7 @@ impl Fonts {
       thicken: options.thicken,
       metrics,
       style_family,
+      variations,
       fallback_families: options.fallback.to_vec(),
       fallback_chain: Vec::new(),
       fallback_ready: false,
@@ -435,6 +454,16 @@ impl Fonts {
       let scale = i32::try_from(self.size_px).unwrap_or(i32::MAX) * 64;
       font.set_scale(scale, scale);
       font.set_ppem(self.size_px, self.size_px);
+      if !self.variations.is_empty() {
+        let vars: Vec<harfbuzz::Variation> = self
+          .variations
+          .iter()
+          .map(|&(tag, value)| {
+            harfbuzz::Variation::new(harfbuzz::Tag(tag), value)
+          })
+          .collect();
+        font.set_variations(&vars);
+      }
       self.faces[face_idx].hb = Some(font);
     }
     self.faces[face_idx].hb.as_ref()
@@ -485,6 +514,7 @@ impl Fonts {
         &family,
         Style::default(),
         self.size_px,
+        &self.variations,
       ) {
         Ok(entry) => {
           self.faces.push(entry);
@@ -511,6 +541,7 @@ impl Fonts {
       family,
       style,
       self.size_px,
+      &self.variations,
     ) {
       Ok(entry) => {
         self.faces.push(entry);
@@ -569,12 +600,92 @@ fn synth_flags(face: &Face, style: Style) -> (bool, bool) {
   (synth_bold, synth_italic)
 }
 
+/// Pack a four-character axis tag into the big-endian `u32` OpenType uses.
+fn pack_tag(tag: &str) -> Option<u32> {
+  let b = tag.as_bytes();
+  if b.len() != 4 || !tag.is_ascii() {
+    return None;
+  }
+  Some(
+    (u32::from(b[0]) << 24)
+      | (u32::from(b[1]) << 16)
+      | (u32::from(b[2]) << 8)
+      | u32::from(b[3]),
+  )
+}
+
+/// Parse `tag=value` variation specs, skipping and logging malformed entries.
+fn parse_variations(specs: &[String]) -> Vec<(u32, f32)> {
+  let mut out = Vec::new();
+  for spec in specs {
+    let parsed = spec
+      .split_once('=')
+      .and_then(|(t, v)| Some((pack_tag(t.trim())?, v.trim().parse().ok()?)));
+    if let Some(pair) = parsed {
+      out.push(pair);
+    } else {
+      tracing::warn!("ignoring malformed font variation {spec:?}");
+    }
+  }
+  out
+}
+
+/// Set the design coordinates of a variable font. Each axis keeps its default
+/// unless `variations` names it; a non-variable face is left untouched. Values
+/// are clamped to the axis range.
+#[expect(
+  unsafe_code,
+  reason = "variation axes are reachable only through FreeType's Multiple \
+            Master C API, which freetype-rs does not wrap"
+)]
+#[expect(
+  clippy::cast_possible_truncation,
+  reason = "an axis value in 16.16 fixed point fits the FT_Fixed target"
+)]
+fn apply_variations(library: &Library, face: &Face, variations: &[(u32, f32)]) {
+  if variations.is_empty() {
+    return;
+  }
+  let face_ptr = ptr::from_ref(face.raw()).cast_mut();
+  let mut mm: *mut ffi::FT_MM_Var = ptr::null_mut();
+  // SAFETY: `face_ptr` is the live FT_Face backing `face`. On success
+  // FT_Get_MM_Var stores a heap-allocated FT_MM_Var, released below; a
+  // non-variable face returns an error and leaves `mm` null.
+  if unsafe { ffi::FT_Get_MM_Var(face_ptr, &raw mut mm) } != 0 || mm.is_null() {
+    return;
+  }
+  // SAFETY: FT_Get_MM_Var succeeded, so `*mm` is initialized and `axis` points
+  // to `num_axis` valid entries.
+  let (num_axis, axes) = unsafe { ((*mm).num_axis, (*mm).axis) };
+  let count = num_axis as usize;
+  let mut coords: Vec<ffi::FT_Fixed> = Vec::with_capacity(count);
+  for i in 0..count {
+    // SAFETY: `i < num_axis` indexes the axis array FreeType allocated.
+    let axis = unsafe { *axes.add(i) };
+    let mut value = axis.def;
+    for &(tag, requested) in variations {
+      if axis.tag == ffi::FT_ULong::from(tag) {
+        let fixed = (f64::from(requested) * 65536.0).round() as ffi::FT_Fixed;
+        value = fixed.clamp(axis.minimum, axis.maximum);
+      }
+    }
+    coords.push(value);
+  }
+  // SAFETY: `coords` holds exactly `num_axis` entries for this face, and
+  // `library` owns `mm`.
+  unsafe {
+    ffi::FT_Set_Var_Design_Coordinates(face_ptr, num_axis, coords.as_ptr());
+    ffi::FT_Done_MM_Var(library.raw(), mm);
+  }
+}
+
 fn resolve_face(
   library: &Library,
   fontconfig: &Fontconfig,
   family: &str,
   style: Style,
   size_px: u32,
+  variations: &[(u32, f32)],
 ) -> Result<FaceEntry, FontError> {
   let font = fontconfig
     .find(family, Some(style.fontconfig_style()))
@@ -583,6 +694,7 @@ fn resolve_face(
   let face = library
     .new_face(&font.path, isize::try_from(index).unwrap_or(isize::MAX))?;
   size_face(&face, size_px)?;
+  apply_variations(library, &face, variations);
   Ok(FaceEntry {
     face,
     path: font.path,
@@ -978,11 +1090,43 @@ mod tests {
   }
 
   #[test]
+  fn pack_tag_requires_four_ascii() {
+    assert_eq!(pack_tag("wght"), Some(0x7767_6874));
+    assert!(pack_tag("wg").is_none());
+    assert!(pack_tag("wghtx").is_none());
+    assert!(pack_tag("wgÿt").is_none());
+  }
+
+  #[test]
+  fn parse_variations_reads_pairs_and_skips_garbage() {
+    let specs = vec![
+      "wght=550".to_string(),
+      "no-equals".to_string(),
+      "slnt = -8".to_string(),
+    ];
+    let wght = pack_tag("wght").expect("valid tag");
+    let slnt = pack_tag("slnt").expect("valid tag");
+    assert_eq!(parse_variations(&specs), vec![(wght, 550.0), (slnt, -8.0)]);
+  }
+
+  #[test]
+  fn variations_build_is_tolerant() {
+    // A face that is not variable ignores the axes; the build and a render
+    // must still succeed.
+    let vars = vec!["wght=600".to_string()];
+    let mut opts = FontOptions::new("monospace", 16, Subpixel::None);
+    opts.variations = &vars;
+    let mut f = Fonts::new(&opts).expect("builds even when the face is static");
+    f.glyph('a', Style::default()).expect("still renders");
+  }
+
+  #[test]
   fn hinting_and_thicken_still_render() {
     let mut opts = FontOptions::new("monospace", 16, Subpixel::None);
     opts.hinting = Hinting::Slight;
     opts.thicken = true;
-    let mut f = Fonts::new(&opts).expect("font builds with hinting and thicken");
+    let mut f =
+      Fonts::new(&opts).expect("font builds with hinting and thicken");
     let glyph = f.glyph('M', Style::default()).expect("thickened M renders");
     assert!(glyph.width > 0 && glyph.height > 0);
   }
