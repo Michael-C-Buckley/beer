@@ -178,49 +178,108 @@ pub enum Subpixel {
   Bgr,
 }
 
+/// Outline grid-fitting strength passed to `FreeType`. Grid-fitting snaps
+/// stems to the pixel grid for crisper text at small sizes at the cost of some
+/// fidelity to the outline; the levels trade the two off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Hinting {
+  /// No grid-fitting; outlines render at their natural sub-pixel positions.
+  None,
+  /// Light autohinter: vertical grid-fitting only, leaving horizontal metrics
+  /// untouched so glyph shapes and spacing stay closer to the design.
+  Slight,
+  /// Full grid-fitting, the `FreeType` default.
+  #[default]
+  Normal,
+}
+
 /// `[main]`: fonts, window geometry, padding, and the terminal name.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
 pub struct Main {
   /// Primary font family, resolved via fontconfig.
-  pub font:            String,
+  pub font:               String,
+  /// Font family for bold text. Unset resolves the primary family's bold
+  /// style.
+  pub font_bold:          Option<String>,
+  /// Font family for italic text. Unset resolves the primary family's italic
+  /// style.
+  pub font_italic:        Option<String>,
+  /// Font family for bold-italic text. Unset resolves the primary family's
+  /// bold-italic style.
+  pub font_bold_italic:   Option<String>,
+  /// Fallback families, tried in order before fontconfig coverage matching for
+  /// code points the primary family lacks.
+  pub font_fallback:      Vec<String>,
+  /// OpenType feature settings applied while shaping. Each entry is a tag with
+  /// an optional value: `"ss01"` or `"+ss01"` enables a feature, `"-liga"`
+  /// disables it, and `"cv01=2"` sets an explicit value.
+  pub font_features:      Vec<String>,
+  /// Variation-axis settings for variable fonts, each `"tag=value"`, e.g.
+  /// `"wght=550"`. Applied to the primary family and its style variants.
+  pub font_variations:    Vec<String>,
+  /// Contextual shaping and ligatures. When off, cells render in isolation.
+  pub ligatures:          bool,
   /// Font size in pixels.
-  pub font_size:       u32,
+  pub font_size:          u32,
+  /// Outline grid-fitting strength.
+  pub hinting:            Hinting,
+  /// Pixels added to each cell's advance width; negative tightens the grid.
+  pub adjust_cell_width:  i32,
+  /// Pixels added to each cell's height; negative tightens line spacing.
+  pub adjust_cell_height: i32,
+  /// Pixels the text baseline is shifted down within the cell.
+  pub adjust_baseline:    i32,
+  /// Thicken every glyph by one coverage pixel, a light synthetic weight.
+  pub thicken:            bool,
   /// Subpixel (LCD) antialiasing order; `None` keeps grayscale coverage.
-  pub subpixel:        Subpixel,
+  pub subpixel:           Subpixel,
   /// `TERM` value exported to the child shell.
-  pub term:            String,
+  pub term:               String,
   /// Initial size in character cells.
-  pub initial_cols:    u16,
-  pub initial_rows:    u16,
+  pub initial_cols:       u16,
+  pub initial_rows:       u16,
   /// Inner padding in pixels between the window edge and the cell grid.
-  pub pad_x:           u32,
-  pub pad_y:           u32,
+  pub pad_x:              u32,
+  pub pad_y:              u32,
   /// Characters that break a word for double-click selection. Empty/unset
   /// keeps the built-in default.
-  pub word_delimiters: Option<String>,
+  pub word_delimiters:    Option<String>,
   /// Hold an idle inhibitor while the window is focused, so the compositor
   /// does not blank the screen or start the screensaver. Default off.
-  pub idle_inhibit:    bool,
+  pub idle_inhibit:       bool,
   /// Keep a `--server` process alive after its last window closes. Off makes
   /// the server exit with its last window, like a standalone process.
-  pub server_resident: bool,
+  pub server_resident:    bool,
 }
 
 impl Default for Main {
   fn default() -> Self {
     Self {
-      font:            "monospace".to_string(),
-      font_size:       16,
-      subpixel:        Subpixel::None,
-      term:            "beer".to_string(),
-      initial_cols:    80,
-      initial_rows:    24,
-      pad_x:           2,
-      pad_y:           2,
-      word_delimiters: None,
-      idle_inhibit:    false,
-      server_resident: true,
+      font:               "monospace".to_string(),
+      font_bold:          None,
+      font_italic:        None,
+      font_bold_italic:   None,
+      font_fallback:      Vec::new(),
+      font_features:      Vec::new(),
+      font_variations:    Vec::new(),
+      ligatures:          true,
+      font_size:          16,
+      hinting:            Hinting::Normal,
+      adjust_cell_width:  0,
+      adjust_cell_height: 0,
+      adjust_baseline:    0,
+      thicken:            false,
+      subpixel:           Subpixel::None,
+      term:               "beer".to_string(),
+      initial_cols:       80,
+      initial_rows:       24,
+      pad_x:              2,
+      pad_y:              2,
+      word_delimiters:    None,
+      idle_inhibit:       false,
+      server_resident:    true,
     }
   }
 }
