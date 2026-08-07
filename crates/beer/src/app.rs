@@ -293,8 +293,9 @@ impl App {
     // Validate the font up front by building the scale-1.0 renderer; other
     // output scales get their own renderer lazily (never re-rasterized on a
     // window switch).
-    let fonts = Fonts::new(&font_options(&config.main, config.main.font_size))
-      .context("load font")?;
+    let fonts =
+      Fonts::new(&font_options(&config.main, config.main.font_size, 120))
+        .context("load font")?;
     let mut renderer = Renderer::new(fonts);
     renderer.set_padding(config.main.pad_x, config.main.pad_y);
     renderer.set_alpha_blending(config.colors.alpha_blending);
@@ -402,14 +403,26 @@ fn phys_at(v: u32, scale120: u32) -> u32 {
   ((u64::from(v) * u64::from(scale120) + 60) / 120) as u32
 }
 
+/// Scale a signed pixel adjustment to the output scale, preserving its sign.
+fn phys_adj(v: i32, scale120: u32) -> i32 {
+  let scaled = i32::try_from(phys_at(v.unsigned_abs(), scale120)).unwrap_or(0);
+  if v < 0 { -scaled } else { scaled }
+}
+
 /// Build [`FontOptions`] from configuration for a font size of `px` physical
-/// pixels.
-fn font_options(main: &Main, px: u32) -> FontOptions<'_> {
+/// pixels at `scale120`. Metric adjustments scale with the output so they keep
+/// their logical size across fractional-scale outputs.
+fn font_options(main: &Main, px: u32, scale120: u32) -> FontOptions<'_> {
   let mut options = FontOptions::new(&main.font, px, main.subpixel);
   options.bold_family = main.font_bold.as_deref();
   options.italic_family = main.font_italic.as_deref();
   options.bold_italic_family = main.font_bold_italic.as_deref();
   options.fallback = &main.font_fallback;
+  options.hinting = main.hinting;
+  options.adjust_width = phys_adj(main.adjust_cell_width, scale120);
+  options.adjust_height = phys_adj(main.adjust_cell_height, scale120);
+  options.adjust_baseline = phys_adj(main.adjust_baseline, scale120);
+  options.thicken = main.thicken;
   options
 }
 
@@ -1851,8 +1864,8 @@ impl App {
   fn build_renderer(&self, scale120: u32) -> anyhow::Result<Renderer> {
     use anyhow::Context as _;
     let px = phys_at(self.font_size, scale120).max(1);
-    let fonts =
-      Fonts::new(&font_options(&self.config.main, px)).context("load font")?;
+    let fonts = Fonts::new(&font_options(&self.config.main, px, scale120))
+      .context("load font")?;
     let mut renderer = Renderer::new(fonts);
     renderer.set_padding(
       phys_at(self.config.main.pad_x, scale120),

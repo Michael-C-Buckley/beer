@@ -23,7 +23,7 @@ use harfbuzz_rs_now as harfbuzz;
 use lru::LruCache;
 use thiserror::Error;
 
-use crate::config::Subpixel;
+use crate::config::{Hinting, Subpixel};
 
 /// Upper bound on cached glyphs; the working set of a terminal is far smaller,
 /// but this caps memory under adversarial all-of-Unicode output.
@@ -62,6 +62,13 @@ pub struct FontOptions<'a> {
   /// Fallback families tried in order before fontconfig coverage matching.
   pub fallback:           &'a [String],
   pub size_px:            u32,
+  pub hinting:            Hinting,
+  /// Pixels added to the cell advance width, height, and baseline offset.
+  pub adjust_width:       i32,
+  pub adjust_height:      i32,
+  pub adjust_baseline:    i32,
+  /// Thicken every glyph by one coverage pixel, a light synthetic weight.
+  pub thicken:            bool,
   pub subpixel:           Subpixel,
 }
 
@@ -76,6 +83,11 @@ impl<'a> FontOptions<'a> {
       bold_italic_family: None,
       fallback: &[],
       size_px,
+      hinting: Hinting::Normal,
+      adjust_width: 0,
+      adjust_height: 0,
+      adjust_baseline: 0,
+      thicken: false,
       subpixel,
     }
   }
@@ -179,6 +191,10 @@ pub struct Fonts {
   size_px:           u32,
   /// Subpixel order for LCD rendering; `None` keeps grayscale coverage.
   subpixel:          Subpixel,
+  /// Outline grid-fitting strength for every rasterization.
+  hinting:           Hinting,
+  /// Thicken every glyph by one coverage pixel.
+  thicken:           bool,
   metrics:           CellMetrics,
   /// Per-style family override; slot 0 (regular) is unused. `None` resolves
   /// the primary family's style variant instead.
@@ -242,7 +258,12 @@ impl Fonts {
       Style::default(),
       size_px,
     )?;
-    let metrics = cell_metrics(&regular.face, options.family)?;
+    let metrics = adjust_metrics(
+      cell_metrics(&regular.face, options.family)?,
+      options.adjust_width,
+      options.adjust_height,
+      options.adjust_baseline,
+    );
 
     let style_family = [
       None,
@@ -258,6 +279,8 @@ impl Fonts {
       family: options.family.to_owned(),
       size_px,
       subpixel,
+      hinting: options.hinting,
+      thicken: options.thicken,
       metrics,
       style_family,
       fallback_families: options.fallback.to_vec(),
@@ -292,7 +315,8 @@ impl Fonts {
       // Synthesize bold/italic only when the resolved face lacks the real
       // variant (most monospace families ship both).
       let (synth_bold, synth_italic) = synth_flags(face, style);
-      let glyph = rasterize(face, c, synth_bold, synth_italic, lcd)?;
+      let bold = synth_bold || self.thicken;
+      let glyph = rasterize(face, c, bold, synth_italic, lcd, self.hinting)?;
       self.cache.put(key, glyph);
     }
     self.cache.get(&key).ok_or(FontError::CacheInvariant)
@@ -312,7 +336,9 @@ impl Fonts {
       let lcd = self.subpixel != Subpixel::None;
       let face = &self.faces[face_idx].face;
       let (synth_bold, synth_italic) = synth_flags(face, style);
-      let glyph = rasterize_index(face, gid, synth_bold, synth_italic, lcd)?;
+      let bold = synth_bold || self.thicken;
+      let glyph =
+        rasterize_index(face, gid, bold, synth_italic, lcd, self.hinting)?;
       self.gcache.put(key, glyph);
     }
     self.gcache.get(&key).ok_or(FontError::CacheInvariant)
@@ -335,7 +361,8 @@ impl Fonts {
     let idx = self.face_for(c, style)?;
     let face = &self.faces[idx].face;
     let (synth_bold, synth_italic) = synth_flags(face, style);
-    rasterize_scaled(face, c, scale.max(0.01), synth_bold, synth_italic)
+    let bold = synth_bold || self.thicken;
+    rasterize_scaled(face, c, scale.max(0.01), bold, synth_italic)
   }
 
   /// Shape `base` plus its combining `marks` into positioned glyphs using
@@ -607,6 +634,26 @@ fn nearest_strike(face: &Face, target: u32) -> i32 {
   best
 }
 
+/// Apply the configured pixel adjustments to the measured cell geometry.
+/// Width, height, and baseline stay at least one pixel; the baseline is kept
+/// within the cell.
+#[expect(
+  clippy::cast_possible_wrap,
+  clippy::cast_sign_loss,
+  reason = "cell geometry is small and clamped to positive before casting back"
+)]
+fn adjust_metrics(m: CellMetrics, dw: i32, dh: i32, db: i32) -> CellMetrics {
+  let width = (m.width as i32 + dw).max(1) as u32;
+  let height = (m.height as i32 + dh).max(1) as u32;
+  let ascent = (m.ascent as i32 + db).clamp(1, height as i32) as u32;
+  CellMetrics {
+    width,
+    height,
+    ascent,
+    stroke: m.stroke,
+  }
+}
+
 fn cell_metrics(face: &Face, family: &str) -> Result<CellMetrics, FontError> {
   let metrics = face
     .size_metrics()
@@ -650,8 +697,9 @@ fn rasterize(
   synth_bold: bool,
   synth_italic: bool,
   lcd: bool,
+  hinting: Hinting,
 ) -> Result<Glyph, FontError> {
-  let flags = load_flags(lcd);
+  let flags = load_flags(lcd, hinting);
   rasterize_with(face, synth_bold, synth_italic, |face| {
     face.load_char(usize::try_from(u32::from(c)).unwrap_or(usize::MAX), flags)
   })
@@ -664,8 +712,9 @@ fn rasterize_index(
   synth_bold: bool,
   synth_italic: bool,
   lcd: bool,
+  hinting: Hinting,
 ) -> Result<Glyph, FontError> {
-  let flags = load_flags(lcd);
+  let flags = load_flags(lcd, hinting);
   rasterize_with(face, synth_bold, synth_italic, |face| {
     face.load_glyph(gid, flags)
   })
@@ -673,9 +722,17 @@ fn rasterize_index(
 
 /// Load flags for a normal render: `TARGET_LCD` requests horizontal subpixel
 /// coverage; otherwise `FreeType` renders 8-bit grayscale. `COLOR` still yields
-/// a BGRA bitmap for colour glyphs regardless of the target.
-fn load_flags(lcd: bool) -> LoadFlag {
+/// a BGRA bitmap for colour glyphs regardless of the target. Hinting refines
+/// grid-fitting: `None` disables it outright, `Slight` uses the light
+/// autohinter (grayscale only, since LCD needs its own render target), and
+/// `Normal` keeps `FreeType`'s default.
+fn load_flags(lcd: bool, hinting: Hinting) -> LoadFlag {
   let mut flags = LoadFlag::RENDER | LoadFlag::COLOR;
+  match hinting {
+    Hinting::None => flags |= LoadFlag::NO_HINTING,
+    Hinting::Slight if !lcd => flags |= LoadFlag::TARGET_LIGHT,
+    Hinting::Slight | Hinting::Normal => {},
+  }
   if lcd {
     flags |= LoadFlag::TARGET_LCD;
   }
@@ -902,6 +959,32 @@ mod tests {
   fn fonts() -> Fonts {
     Fonts::new(&FontOptions::new("monospace", 16, Subpixel::None))
       .expect("system has a monospace font")
+  }
+
+  #[test]
+  fn adjust_metrics_shifts_and_clamps() {
+    let base = CellMetrics {
+      width:  10,
+      height: 20,
+      ascent: 16,
+      stroke: 1,
+    };
+    let bigger = adjust_metrics(base, 2, 4, 1);
+    assert_eq!((bigger.width, bigger.height, bigger.ascent), (12, 24, 17));
+    // Over-shrinking floors width/height at one pixel and keeps the baseline
+    // inside the cell.
+    let tiny = adjust_metrics(base, -100, -100, 100);
+    assert_eq!((tiny.width, tiny.height, tiny.ascent), (1, 1, 1));
+  }
+
+  #[test]
+  fn hinting_and_thicken_still_render() {
+    let mut opts = FontOptions::new("monospace", 16, Subpixel::None);
+    opts.hinting = Hinting::Slight;
+    opts.thicken = true;
+    let mut f = Fonts::new(&opts).expect("font builds with hinting and thicken");
+    let glyph = f.glyph('M', Style::default()).expect("thickened M renders");
+    assert!(glyph.width > 0 && glyph.height > 0);
   }
 
   #[test]
