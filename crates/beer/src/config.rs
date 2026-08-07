@@ -197,6 +197,10 @@ pub enum Hinting {
 /// `[main]`: fonts, window geometry, padding, and the terminal name.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
+#[expect(
+  clippy::struct_excessive_bools,
+  reason = "each field maps to one TOML key"
+)]
 pub struct Main {
   /// Primary font family, resolved via fontconfig.
   pub font:               String,

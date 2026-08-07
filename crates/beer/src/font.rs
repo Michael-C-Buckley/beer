@@ -48,6 +48,39 @@ pub enum FontError {
   CacheInvariant,
 }
 
+/// Everything the font subsystem needs from configuration, borrowed for the
+/// duration of [`Fonts::new`]. [`FontOptions::new`] fills in the defaults so a
+/// caller sets only the fields it cares about.
+#[derive(Clone, Copy, Debug)]
+pub struct FontOptions<'a> {
+  /// Primary family, resolved via fontconfig.
+  pub family:             &'a str,
+  /// Per-style family overrides; `None` resolves the primary family's style.
+  pub bold_family:        Option<&'a str>,
+  pub italic_family:      Option<&'a str>,
+  pub bold_italic_family: Option<&'a str>,
+  /// Fallback families tried in order before fontconfig coverage matching.
+  pub fallback:           &'a [String],
+  pub size_px:            u32,
+  pub subpixel:           Subpixel,
+}
+
+impl<'a> FontOptions<'a> {
+  /// Options for `family` at `size_px` with `subpixel` order and every other
+  /// knob left at its default.
+  pub const fn new(family: &'a str, size_px: u32, subpixel: Subpixel) -> Self {
+    Self {
+      family,
+      bold_family: None,
+      italic_family: None,
+      bold_italic_family: None,
+      fallback: &[],
+      size_px,
+      subpixel,
+    }
+  }
+}
+
 /// Bold/italic selection, used both to pick a face and to key the glyph cache.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub struct Style {
@@ -140,25 +173,34 @@ struct FaceEntry {
 /// The font set for one terminal: a primary family with lazily-loaded
 /// bold/italic variants and per-codepoint fallback faces, plus glyph caches.
 pub struct Fonts {
-  library:     Library,
-  fontconfig:  Fontconfig,
-  family:      String,
-  size_px:     u32,
+  library:           Library,
+  fontconfig:        Fontconfig,
+  family:            String,
+  size_px:           u32,
   /// Subpixel order for LCD rendering; `None` keeps grayscale coverage.
-  subpixel:    Subpixel,
-  metrics:     CellMetrics,
+  subpixel:          Subpixel,
+  metrics:           CellMetrics,
+  /// Per-style family override; slot 0 (regular) is unused. `None` resolves
+  /// the primary family's style variant instead.
+  style_family:      [Option<String>; 4],
+  /// Configured fallback families, tried in order before coverage matching.
+  fallback_families: Vec<String>,
+  /// Face indices for the configured fallback families, resolved on first use.
+  fallback_chain:    Vec<usize>,
+  /// Whether [`Self::fallback_chain`] has been populated.
+  fallback_ready:    bool,
   /// All loaded faces; indices into this vector are stable.
-  faces:       Vec<FaceEntry>,
+  faces:             Vec<FaceEntry>,
   /// Index of each style variant, by [`Style::index`]; filled on demand.
-  styled:      [Option<usize>; 4],
+  styled:            [Option<usize>; 4],
   /// Fallback faces resolved by coverage, deduplicated by file path.
-  fallbacks:   HashMap<PathBuf, usize>,
+  fallbacks:         HashMap<PathBuf, usize>,
   /// Glyphs keyed by `char` (the common, unshaped path).
-  cache:       LruCache<(char, usize), Glyph>,
+  cache:             LruCache<(char, usize), Glyph>,
   /// Glyphs keyed by `(glyph index, face, style)` (the shaped path).
-  gcache:      LruCache<(u32, usize, usize), Glyph>,
+  gcache:            LruCache<(u32, usize, usize), Glyph>,
   /// Shaped clusters keyed by `(cluster string, style)`.
-  shape_cache: LruCache<(Box<str>, usize), Option<ShapedCluster>>,
+  shape_cache:       LruCache<(Box<str>, usize), Option<ShapedCluster>>,
 }
 
 impl fmt::Debug for Fonts {
@@ -174,40 +216,53 @@ impl fmt::Debug for Fonts {
 }
 
 impl Fonts {
-  /// Resolve `family` at `size_px` and compute the cell metrics. `subpixel`
-  /// selects LCD rendering; it is downgraded to grayscale if the `FreeType`
-  /// build lacks LCD-filter support.
-  pub fn new(
-    family: &str,
-    size_px: u32,
-    subpixel: Subpixel,
-  ) -> Result<Self, FontError> {
+  /// Resolve the primary family at `options.size_px` and compute the cell
+  /// metrics. `options.subpixel` selects LCD rendering; it is downgraded to
+  /// grayscale if the `FreeType` build lacks LCD-filter support.
+  pub fn new(options: &FontOptions) -> Result<Self, FontError> {
     let library = Library::init()?;
     let fontconfig = Fontconfig::new().ok_or(FontError::FontconfigInit)?;
 
     // The LCD filter is a library-global FreeType setting; enable it once here
     // so LCD-rendered glyphs are filtered to suppress colour fringing.
-    let subpixel = if subpixel != Subpixel::None
+    let subpixel = if options.subpixel != Subpixel::None
       && library.set_lcd_filter(LcdFilter::LcdFilterDefault).is_err()
     {
       tracing::warn!("FreeType lacks LCD filter support; using grayscale");
       Subpixel::None
     } else {
-      subpixel
+      options.subpixel
     };
 
-    let regular =
-      resolve_face(&library, &fontconfig, family, Style::default(), size_px)?;
-    let metrics = cell_metrics(&regular.face, family)?;
+    let size_px = options.size_px;
+    let regular = resolve_face(
+      &library,
+      &fontconfig,
+      options.family,
+      Style::default(),
+      size_px,
+    )?;
+    let metrics = cell_metrics(&regular.face, options.family)?;
+
+    let style_family = [
+      None,
+      options.bold_family.map(str::to_owned),
+      options.italic_family.map(str::to_owned),
+      options.bold_italic_family.map(str::to_owned),
+    ];
 
     let cap = |n| NonZeroUsize::new(n).ok_or(FontError::CacheInvariant);
     Ok(Self {
       library,
       fontconfig,
-      family: family.to_owned(),
+      family: options.family.to_owned(),
       size_px,
       subpixel,
       metrics,
+      style_family,
+      fallback_families: options.fallback.to_vec(),
+      fallback_chain: Vec::new(),
+      fallback_ready: false,
       faces: vec![regular],
       styled: [Some(0), None, None, None],
       fallbacks: HashMap::new(),
@@ -372,12 +427,45 @@ impl Fonts {
     {
       return Ok(regular);
     }
+    self.ensure_fallback_chain();
+    for i in 0..self.fallback_chain.len() {
+      let idx = self.fallback_chain[i];
+      if face_has_glyph(&self.faces[idx].face, c) {
+        return Ok(idx);
+      }
+    }
     for &idx in self.fallbacks.values() {
       if face_has_glyph(&self.faces[idx].face, c) {
         return Ok(idx);
       }
     }
     Ok(self.load_fallback(c)?.unwrap_or(styled))
+  }
+
+  /// Resolve the configured fallback families to faces once, in order. A
+  /// family that fontconfig cannot resolve is logged and skipped so one bad
+  /// entry does not disable the rest of the chain.
+  fn ensure_fallback_chain(&mut self) {
+    if self.fallback_ready {
+      return;
+    }
+    self.fallback_ready = true;
+    for i in 0..self.fallback_families.len() {
+      let family = self.fallback_families[i].clone();
+      match resolve_face(
+        &self.library,
+        &self.fontconfig,
+        &family,
+        Style::default(),
+        self.size_px,
+      ) {
+        Ok(entry) => {
+          self.faces.push(entry);
+          self.fallback_chain.push(self.faces.len() - 1);
+        },
+        Err(err) => tracing::warn!("fallback font {family:?}: {err}"),
+      }
+    }
   }
 
   /// Lazily load the face for `style`, caching regular's index if the variant
@@ -387,10 +475,13 @@ impl Fonts {
       return Ok(idx);
     }
     let regular = self.styled[0].ok_or(FontError::CacheInvariant)?;
+    let family = self.style_family[style.index()]
+      .as_deref()
+      .unwrap_or(&self.family);
     let idx = match resolve_face(
       &self.library,
       &self.fontconfig,
-      &self.family,
+      family,
       style,
       self.size_px,
     ) {
@@ -809,7 +900,7 @@ mod tests {
   use super::*;
 
   fn fonts() -> Fonts {
-    Fonts::new("monospace", 16, Subpixel::None)
+    Fonts::new(&FontOptions::new("monospace", 16, Subpixel::None))
       .expect("system has a monospace font")
   }
 
@@ -881,6 +972,24 @@ mod tests {
       assert!(!shaped.glyphs.is_empty());
       assert!(shaped.glyphs.iter().all(|g| g.gid != 0));
     }
+  }
+
+  #[test]
+  fn unresolved_style_and_fallback_families_are_tolerated() {
+    // An override family and a fallback family that fontconfig cannot resolve
+    // must not break rendering: the style falls back to the primary family and
+    // the bad fallback entry is skipped.
+    let fallback = vec!["definitely-not-a-real-font".to_string()];
+    let mut opts = FontOptions::new("monospace", 16, Subpixel::None);
+    opts.bold_family = Some("definitely-not-a-real-font");
+    opts.fallback = &fallback;
+    let mut f = Fonts::new(&opts).expect("primary family still resolves");
+    let bold = Style {
+      bold:   true,
+      italic: false,
+    };
+    let glyph = f.glyph('a', bold).expect("bold 'a' still renders");
+    assert!(glyph.width > 0 && glyph.height > 0);
   }
 
   #[test]

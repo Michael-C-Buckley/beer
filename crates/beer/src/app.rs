@@ -40,8 +40,8 @@ use beer_window::{
 
 use crate::{
   bindings::{Action, Bindings, MouseButton},
-  config::Config,
-  font::{CellMetrics, Fonts},
+  config::{Config, Main},
+  font::{CellMetrics, FontOptions, Fonts},
   grid::{Cell, CursorShape, Flags, Grid, MouseProtocol, UrlHit},
   ipc,
   pty::Pty,
@@ -293,12 +293,8 @@ impl App {
     // Validate the font up front by building the scale-1.0 renderer; other
     // output scales get their own renderer lazily (never re-rasterized on a
     // window switch).
-    let fonts = Fonts::new(
-      &config.main.font,
-      config.main.font_size,
-      config.main.subpixel,
-    )
-    .context("load font")?;
+    let fonts = Fonts::new(&font_options(&config.main, config.main.font_size))
+      .context("load font")?;
     let mut renderer = Renderer::new(fonts);
     renderer.set_padding(config.main.pad_x, config.main.pad_y);
     renderer.set_alpha_blending(config.colors.alpha_blending);
@@ -404,6 +400,17 @@ impl App {
 )]
 fn phys_at(v: u32, scale120: u32) -> u32 {
   ((u64::from(v) * u64::from(scale120) + 60) / 120) as u32
+}
+
+/// Build [`FontOptions`] from configuration for a font size of `px` physical
+/// pixels.
+fn font_options(main: &Main, px: u32) -> FontOptions<'_> {
+  let mut options = FontOptions::new(&main.font, px, main.subpixel);
+  options.bold_family = main.font_bold.as_deref();
+  options.italic_family = main.font_italic.as_deref();
+  options.bold_italic_family = main.font_bold_italic.as_deref();
+  options.fallback = &main.font_fallback;
+  options
 }
 
 /// Columns/rows for a physical size, metrics, and padding.
@@ -1845,8 +1852,7 @@ impl App {
     use anyhow::Context as _;
     let px = phys_at(self.font_size, scale120).max(1);
     let fonts =
-      Fonts::new(&self.config.main.font, px, self.config.main.subpixel)
-        .context("load font")?;
+      Fonts::new(&font_options(&self.config.main, px)).context("load font")?;
     let mut renderer = Renderer::new(fonts);
     renderer.set_padding(
       phys_at(self.config.main.pad_x, scale120),
