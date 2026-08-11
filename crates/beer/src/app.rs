@@ -42,7 +42,15 @@ use crate::{
   bindings::{Action, Bindings, MouseButton},
   config::{Config, Main},
   font::{CellMetrics, FontOptions, Fonts},
-  grid::{Cell, CursorShape, Flags, Grid, MouseProtocol, UrlHit},
+  grid::{
+    Cell,
+    CursorShape,
+    Flags,
+    Grid,
+    MouseEncoding,
+    MouseProtocol,
+    UrlHit,
+  },
   ipc,
   pty::Pty,
   render::Renderer,
@@ -1553,6 +1561,40 @@ impl App {
     Some((col, row))
   }
 
+  /// The pointer position in physical pixels relative to the grid origin, for
+  /// SGR-pixel (1016) mouse reports.
+  #[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the pointer offset is non-negative and bounded by the surface"
+  )]
+  fn report_screen_pixel(&self, idx: usize) -> Option<(usize, usize)> {
+    let w = &self.windows[idx];
+    w.session.as_ref()?;
+    let (pad_x, pad_y) = (
+      f64::from(self.to_phys(w, self.config.main.pad_x)),
+      f64::from(self.to_phys(w, self.config.main.pad_y)),
+    );
+    let x = (self.to_phys_f(w, w.pointer_pos.0) - pad_x).max(0.0) as usize;
+    let y = (self.to_phys_f(w, w.pointer_pos.1) - pad_y).max(0.0) as usize;
+    Some((x, y))
+  }
+
+  /// The coordinate a mouse report carries: pixels for the SGR-pixel encoding,
+  /// otherwise the `cell` already resolved for deduplication.
+  fn report_coord(
+    &self,
+    idx: usize,
+    enc: MouseEncoding,
+    cell: (usize, usize),
+  ) -> (usize, usize) {
+    if enc == MouseEncoding::SgrPixel {
+      self.report_screen_pixel(idx).unwrap_or(cell)
+    } else {
+      cell
+    }
+  }
+
   fn try_report_button(&mut self, idx: usize, code: u8, pressed: bool) -> bool {
     let Some((proto, enc)) = self.windows[idx].session.as_ref().map(|s| {
       (
@@ -1568,15 +1610,9 @@ impl App {
     if (pressed || proto != MouseProtocol::X10)
       && let Some((col, row)) = self.report_screen_cell(idx)
     {
-      let bytes = mouse::encode_mouse(
-        enc,
-        code,
-        col,
-        row,
-        pressed,
-        false,
-        self.modifiers,
-      );
+      let (x, y) = self.report_coord(idx, enc, (col, row));
+      let bytes =
+        mouse::encode_mouse(enc, code, x, y, pressed, false, self.modifiers);
       self.write_to_pty(idx, &bytes);
       self.windows[idx].last_report_cell = Some((col, row));
     }
@@ -1605,8 +1641,9 @@ impl App {
       && self.windows[idx].last_report_cell != Some((col, row))
     {
       let code = self.windows[idx].pressed_button.unwrap_or(3);
+      let (x, y) = self.report_coord(idx, enc, (col, row));
       let bytes =
-        mouse::encode_mouse(enc, code, col, row, true, true, self.modifiers);
+        mouse::encode_mouse(enc, code, x, y, true, true, self.modifiers);
       self.write_to_pty(idx, &bytes);
       self.windows[idx].last_report_cell = Some((col, row));
     }

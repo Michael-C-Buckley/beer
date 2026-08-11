@@ -605,6 +605,14 @@ impl Term {
         (true, 1006) => {
           self.grid.set_mouse_encoding(enc(on, MouseEncoding::Sgr));
         },
+        (true, 1015) => {
+          self.grid.set_mouse_encoding(enc(on, MouseEncoding::Urxvt));
+        },
+        (true, 1016) => {
+          self
+            .grid
+            .set_mouse_encoding(enc(on, MouseEncoding::SgrPixel));
+        },
         (true, 2004) => self.grid.set_bracketed_paste(on),
         (true, 2026) => self.grid.set_sync(on),
         (true, 69) => self.grid.set_lr_margins_mode(on),
@@ -873,6 +881,12 @@ impl Term {
       },
       (true, 1006) => {
         set_reset(self.grid.mouse_encoding() == MouseEncoding::Sgr)
+      },
+      (true, 1015) => {
+        set_reset(self.grid.mouse_encoding() == MouseEncoding::Urxvt)
+      },
+      (true, 1016) => {
+        set_reset(self.grid.mouse_encoding() == MouseEncoding::SgrPixel)
       },
       (true, 2004) => set_reset(self.grid.bracketed_paste()),
       (true, 2026) => set_reset(self.grid.sync_active()),
@@ -1238,6 +1252,19 @@ mod tests {
     assert_eq!(t.grid().mouse_protocol(), MouseProtocol::Off);
     feed(&mut t, b"\x1b[?1004h");
     assert!(t.grid().focus_events());
+  }
+
+  #[test]
+  fn mouse_pixel_and_urxvt_encodings() {
+    let mut t = Term::new(20, 4);
+    feed(&mut t, b"\x1b[?1016h"); // SGR-pixel
+    assert_eq!(t.grid().mouse_encoding(), MouseEncoding::SgrPixel);
+    feed(&mut t, b"\x1b[?1016$p");
+    assert_eq!(t.take_response(), b"\x1b[?1016;1$y");
+    feed(&mut t, b"\x1b[?1015h"); // urxvt supersedes
+    assert_eq!(t.grid().mouse_encoding(), MouseEncoding::Urxvt);
+    feed(&mut t, b"\x1b[?1015l"); // reset to the default byte form
+    assert_eq!(t.grid().mouse_encoding(), MouseEncoding::X10);
   }
 
   #[test]

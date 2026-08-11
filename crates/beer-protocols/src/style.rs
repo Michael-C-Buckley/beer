@@ -71,6 +71,10 @@ pub enum MouseEncoding {
   Utf8,
   /// `CSI < Cb ; Cx ; Cy M/m`, decimal and unbounded (DECSET 1006).
   Sgr,
+  /// urxvt decimal form `CSI Cb ; Cx ; Cy M` (DECSET 1015).
+  Urxvt,
+  /// SGR framing with pixel coordinates instead of cells (DECSET 1016).
+  SgrPixel,
 }
 
 /// Shell-integration prompt mark on a line (OSC 133): the start of a prompt,
