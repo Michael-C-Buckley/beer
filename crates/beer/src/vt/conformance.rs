@@ -1,11 +1,11 @@
 //! Golden escape-sequence tests: feed bytes, assert the resulting grid state.
 //!
 //! These cover the ground `vttest` and `esctest` exercise interactively
-//! (cursor movement, erase/edit, scroll regions, origin mode, tab stops, SGR,
-//! autowrap, alt screen, line drawing) at the model level, since the project
-//! tests the grid rather than pixels. A live `vttest`/`esctest` run against a
-//! real window is still the acceptance check for rendering; the procedure and
-//! the known gaps are documented in `doc/conformance.md`.
+//! (cursor movement, erase/edit, scroll regions, left/right margins,
+//! rectangular ops, origin mode, tab stops, SGR, character sets, autowrap, alt
+//! screen, line drawing) at the model level, since the project tests the grid
+//! rather than pixels. A live `vttest`/`esctest` run against a real window is
+//! still the acceptance check for rendering.
 
 use super::*;
 

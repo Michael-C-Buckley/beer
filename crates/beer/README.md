@@ -4,9 +4,9 @@
 and stay there.
 
 It is written in Rust, rendered on the CPU, and intentionally small in scope:
-there is no GPU renderer, tab system, ligature shaping, or async runtime. The
-project is pre-1.0, but it is already comfortable as a standalone terminal or as
-a resident daemon hosting multiple Wayland windows.
+there is no GPU renderer, tab system, or async runtime. The project is pre-1.0,
+but it is already comfortable as a standalone terminal or as a resident daemon
+hosting multiple Wayland windows.
 
 ## Features
 
@@ -16,9 +16,10 @@ a resident daemon hosting multiple Wayland windows.
 - A PTY-backed login shell with `TIOCSWINSZ` resize propagation, inherited or
   forwarded environment, configurable `TERM`, and child exit-status propagation.
 - VT parsing through `vte`: cursor movement, erase and insert operations, scroll
-  regions, alternate screen, autowrap, SGR attributes, truecolor, 256-colour,
-  dynamic palette and theme changes, title stacks, device reports, XTGETTCAP,
-  synchronized output, bracketed paste, and focus reporting.
+  regions, left/right margins, rectangular-area editing, alternate screen,
+  autowrap, SGR attributes, truecolor, 256-colour, dynamic palette and theme
+  changes, title stacks, device reports, XTGETTCAP, DECRQSS, synchronized
+  output, bracketed paste, and focus reporting.
 - Kitty protocol support for keyboard progressive enhancement, graphics,
   Unicode-aware text sizing, and desktop notifications, alongside legacy
   xterm/VT keyboard and mouse encodings.

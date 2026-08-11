@@ -21,7 +21,7 @@ Notation: `ESC` is `0x1b`, `CSI` is `ESC [`, `OSC` is `ESC ]`, `DCS` is `ESC P`,
 | ----------- | ------------------------------------------------------------------------------ |
 | `codec`     | base64 (OSC 52), hex (XTGETTCAP names), `file://` URI percent-decoding (OSC 7) |
 | `caps`      | terminfo capabilities answered over XTGETTCAP                                  |
-| `charset`   | G0/G1 designation and DEC special-graphics line drawing                        |
+| `charset`   | G0-G3 designation, DEC special-graphics line drawing, and the UK set           |
 | `graphics`  | kitty graphics APC control-data parsing                                        |
 | `sgr`       | the multi-parameter SGR colour and underline forms                             |
 | `key`       | legacy xterm/VT and kitty keyboard-protocol key encoding                       |
@@ -51,29 +51,48 @@ Notation: `ESC` is `0x1b`, `CSI` is `ESC [`, `OSC` is `ESC ]`, `DCS` is `ESC P`,
 
 <!--markdownlint-disable MD013-->
 
-| Sequence                 | Name        | Effect                                     |
-| ------------------------ | ----------- | ------------------------------------------ |
-| `CSI Ps A`               | CUU         | cursor up                                  |
-| `CSI Ps B` / `CSI Ps e`  | CUD         | cursor down                                |
-| `CSI Ps C` / `CSI Ps a`  | CUF         | cursor forward                             |
-| `CSI Ps D`               | CUB         | cursor back                                |
-| `CSI Ps E`               | CNL         | cursor down, to column 1                   |
-| `CSI Ps F`               | CPL         | cursor up, to column 1                     |
-| `CSI Ps G` / `CSI Ps \`` | CHA         | move to column                             |
-| `CSI Ps d`               | VPA         | move to row                                |
-| `CSI Ps ; Ps H` / `f`    | CUP/HVP     | move to row;col                            |
-| `CSI Ps J`               | ED          | erase in display (0 below, 1 above, 2 all) |
-| `CSI Ps K`               | EL          | erase in line (0 right, 1 left, 2 all)     |
-| `CSI Ps @`               | ICH         | insert blank characters                    |
-| `CSI Ps P`               | DCH         | delete characters                          |
-| `CSI Ps L`               | IL          | insert lines                               |
-| `CSI Ps M`               | DL          | delete lines                               |
-| `CSI Ps X`               | ECH         | erase characters                           |
-| `CSI Ps S`               | SU          | scroll up                                  |
-| `CSI Ps T`               | SD          | scroll down                                |
-| `CSI Ps ; Ps r`          | DECSTBM     | set scroll region (top;bottom)             |
-| `CSI Ps g`               | TBC         | clear tab stop (0) or all tabs (3)         |
-| `CSI s` / `CSI u`        | SCOSC/SCORC | save / restore cursor                      |
+| Sequence                 | Name    | Effect                                     |
+| ------------------------ | ------- | ------------------------------------------ |
+| `CSI Ps A`               | CUU     | cursor up                                  |
+| `CSI Ps B` / `CSI Ps e`  | CUD     | cursor down                                |
+| `CSI Ps C` / `CSI Ps a`  | CUF     | cursor forward                             |
+| `CSI Ps D`               | CUB     | cursor back                                |
+| `CSI Ps E`               | CNL     | cursor down, to column 1                   |
+| `CSI Ps F`               | CPL     | cursor up, to column 1                     |
+| `CSI Ps G` / `CSI Ps \`` | CHA     | move to column                             |
+| `CSI Ps d`               | VPA     | move to row                                |
+| `CSI Ps ; Ps H` / `f`    | CUP/HVP | move to row;col                            |
+| `CSI Ps J`               | ED      | erase in display (0 below, 1 above, 2 all) |
+| `CSI Ps K`               | EL      | erase in line (0 right, 1 left, 2 all)     |
+| `CSI Ps @`               | ICH     | insert blank characters                    |
+| `CSI Ps P`               | DCH     | delete characters                          |
+| `CSI Ps L`               | IL      | insert lines                               |
+| `CSI Ps M`               | DL      | delete lines                               |
+| `CSI Ps X`               | ECH     | erase characters                           |
+| `CSI Ps b`               | REP     | repeat the preceding character             |
+| `CSI Ps S`               | SU      | scroll up                                  |
+| `CSI Ps T`               | SD      | scroll down                                |
+| `CSI Ps ; Ps r`          | DECSTBM | set scroll region (top;bottom)             |
+| `CSI Ps g`               | TBC     | clear tab stop (0) or all tabs (3)         |
+| `CSI u`                  | SCORC   | restore cursor                             |
+| `CSI s`                  | SCOSC   | save cursor, or DECSLRM when `?69` is set  |
+| `CSI Pl ; Pr s`          | DECSLRM | set left/right margins (with `?69`)        |
+
+<!--markdownlint-enable MD013-->
+
+### Rectangular area operations
+
+<!--markdownlint-disable MD013-->
+
+| Sequence                                  | Name    | Effect                             |
+| ----------------------------------------- | ------- | ---------------------------------- |
+| `CSI Pch ; Pt ; Pl ; Pb ; Pr $ x`         | DECFRA  | fill a rectangle with a character  |
+| `CSI Pt ; Pl ; Pb ; Pr $ z`               | DECERA  | erase a rectangle                  |
+| `CSI Pt ; Pl ; Pb ; Pr ; Ps... $ r`       | DECCARA | change attributes over a rectangle |
+| `CSI Pts;Pls;Pbs;Prs;Pps;Ptd;Pld;Ppd $ v` | DECCRA  | copy a rectangle to a destination  |
+
+Coordinates are inclusive and honour origin mode (DECOM) and the left/right
+margins.
 
 <!--markdownlint-enable MD013-->
 
@@ -81,15 +100,19 @@ Notation: `ESC` is `0x1b`, `CSI` is `ESC [`, `OSC` is `ESC ]`, `DCS` is `ESC P`,
 
 <!--markdownlint-disable MD013-->
 
-| Sequence              | Name        | Effect                                                              |
-| --------------------- | ----------- | ------------------------------------------------------------------- |
-| `ESC D`               | IND         | line feed                                                           |
-| `ESC M`               | RI          | reverse index                                                       |
-| `ESC E`               | NEL         | next line                                                           |
-| `ESC 7` / `ESC 8`     | DECSC/DECRC | save / restore cursor                                               |
-| `ESC H`               | HTS         | set tab stop                                                        |
-| `ESC c`               | RIS         | full reset                                                          |
-| `ESC ( c` / `ESC ) c` | SCS         | designate G0 / G1 charset (`0` = DEC special graphics, `B` = ASCII) |
+| Sequence               | Name            | Effect                                                              |
+| ---------------------- | --------------- | ------------------------------------------------------------------- |
+| `ESC D`                | IND             | line feed                                                           |
+| `ESC M`                | RI              | reverse index                                                       |
+| `ESC E`                | NEL             | next line                                                           |
+| `ESC 7` / `ESC 8`      | DECSC/DECRC     | save / restore cursor                                               |
+| `ESC H`                | HTS             | set tab stop                                                        |
+| `ESC c`                | RIS             | full reset                                                          |
+| `ESC # 8`              | DECALN          | fill the screen with `E` for alignment                              |
+| `ESC =` / `ESC >`      | DECKPAM/DECKPNM | application / numeric keypad                                        |
+| `ESC N` / `ESC O`      | SS2 / SS3       | single-shift the next character into G2 / G3                        |
+| `ESC n` / `ESC o`      | LS2 / LS3       | lock GL to G2 / G3                                                  |
+| `ESC ( c` .. `ESC + c` | SCS             | designate G0-G3 (`0` = DEC special graphics, `A` = UK, `B` = ASCII) |
 
 <!--markdownlint-enable MD013-->
 
@@ -113,6 +136,7 @@ ignored colour-space id). 256-colour and 24-bit truecolor are fully supported.
 | `?1`            | DECCKM  | application cursor keys                |
 | `?6`            | DECOM   | origin mode                            |
 | `?7`            | DECAWM  | autowrap                               |
+| `?69`           | DECLRMM | enable left/right margins (DECSLRM)    |
 | `?25`           | DECTCEM | cursor visibility                      |
 | `?9`            | -       | X10 mouse reporting                    |
 | `?1000`         | -       | normal mouse (press/release)           |
@@ -148,8 +172,12 @@ until an application overrides it.
 | `CSI 6 n`            | CPR       | `CSI row;col R` (cursor position)                          |
 | `CSI > q`            | XTVERSION | `DCS >\|beer(version) ST`                                  |
 | `DCS + q <names> ST` | XTGETTCAP | per name, `DCS 1 + r name=value ST` or `DCS 0 + r name ST` |
+| `DCS $ q <req> ST`   | DECRQSS   | `DCS 1 $ r <setting> ST` (valid) or `DCS 0 $ r ST`         |
 
 <!--markdownlint-enable MD013-->
+
+DECRQSS answers the cursor style (DECSCUSR), the scroll region (DECSTBM), and
+the current SGR attributes.
 
 XTGETTCAP answers `TN` (terminal name `beer`), `Co`/`colors` (256), and `RGB`
 (`8/8/8`, i.e. truecolor).
@@ -170,7 +198,7 @@ XTGETTCAP answers `TN` (terminal name `beer`), `Co`/`colors` (256), and `RGB`
 | `OSC 104 [; idx ...]`             | reset palette (all, or listed entries)           |
 | `OSC 10` / `OSC 11`               | set / query default foreground / background      |
 | `OSC 110` / `OSC 111`             | reset foreground / background                    |
-| `OSC 12` / `OSC 112`              | set / reset cursor colour                        |
+| `OSC 12` / `OSC 112`              | set / query (`?`) / reset cursor colour          |
 | `OSC 17` / `OSC 19`               | set / query selection background / foreground    |
 | `OSC 7 ; file://host/path`        | report working directory (used for new windows)  |
 | `OSC 8 ; params ; URI`            | hyperlink (empty URI ends it)                    |
@@ -201,9 +229,9 @@ tracks the working directory so a new window opens in the same place.
 ## Keyboard
 
 The legacy xterm/VT encoding covers cursor keys (with DECCKM application mode),
-the editing keypad (Insert/Delete/PageUp/PageDown), F1-F12, and the xterm
-modifier parameter (`CSI 1 ; m <letter>`), with Alt sending an ESC (meta)
-prefix.
+the editing keypad (Insert/Delete/PageUp/PageDown), the numeric keypad (SS3
+sequences under DECKPAM application-keypad mode), F1-F12, and the xterm modifier
+parameter (`CSI 1 ; m <letter>`), with Alt sending an ESC (meta) prefix.
 
 The **kitty keyboard protocol** (`CSI > flags u` push, `CSI < flags u` pop,
 `CSI = flags ; mode u` set, `CSI ? u` query) is implemented with the
@@ -226,8 +254,9 @@ and scrollback.
 ## POSIX / terminal behaviour
 
 - A real PTY pair (`rustix` `openpt`/`grantpt`/`unlockpt`), with the child's
-  `TERM` set to the configured value (default `beer`) and the window size kept
-  in sync via `TIOCSWINSZ` (`SIGWINCH` reaches the child).
+  `TERM` set to the configured value (default `beer`), `COLORTERM=truecolor`,
+  and the window size kept in sync via `TIOCSWINSZ` (`SIGWINCH` reaches the
+  child).
 - The child's exit status is propagated as beer's own exit code.
 - Alternate screen, scroll regions, autowrap and reflow on resize, and a
   scrollback buffer.
