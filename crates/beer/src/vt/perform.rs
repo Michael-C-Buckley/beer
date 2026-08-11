@@ -116,7 +116,20 @@ impl Perform for Term {
       },
       'p' if intermediates.contains(&b'$') => self.report_mode(params, private),
       'n' => self.device_status(params),
-      's' => self.grid.save_cursor(),
+      // `CSI s` is DECSLRM when left/right margins are enabled, else DECSC.
+      's' => {
+        if self.grid.lr_margins_enabled() {
+          let left = n(params, 0, 1) - 1;
+          let right =
+            match params.iter().nth(1).and_then(|p| p.first().copied()) {
+              Some(0) | None => self.grid.cols() - 1,
+              Some(v) => (v as usize).saturating_sub(1),
+            };
+          self.grid.set_lr_margins(left, right);
+        } else {
+          self.grid.save_cursor();
+        }
+      },
       // `CSI u` is SCORC, but the kitty keyboard protocol overloads it with
       // private prefixes: `?` query, `>` push, `<` pop, `=` set flags.
       'u' => {

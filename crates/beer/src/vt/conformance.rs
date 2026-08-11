@@ -327,6 +327,39 @@ fn decrqss_reports_settings() {
 }
 
 #[test]
+fn csi_s_saves_cursor_without_margins() {
+  // With DECLRMM off, `CSI s` is DECSC (save) and `CSI u` restores.
+  let mut t = Term::new(10, 5);
+  feed(&mut t, b"\x1b[3;4H\x1b[s\x1b[1;1H\x1b[u");
+  assert_eq!(t.grid().cursor(), (3, 2));
+}
+
+#[test]
+fn lr_margins_confine_scroll() {
+  let mut t = Term::new(6, 3);
+  feed(&mut t, b"ABCDEF\r\nGHIJKL\r\nMNOPQR");
+  // Enable left/right margins and set columns 2..5 (1-based): left=1, right=4.
+  feed(&mut t, b"\x1b[?69h\x1b[2;5s");
+  // Scroll the region up one line; only the [1,4] span moves.
+  feed(&mut t, b"\x1b[S");
+  assert_eq!(t.grid().row_text(0), "AHIJKF");
+  assert_eq!(t.grid().row_text(1), "GNOPQL");
+  assert_eq!(t.grid().row_text(2), "M    R");
+}
+
+#[test]
+fn lr_margin_autowraps_at_right() {
+  let mut t = Term::new(6, 3);
+  // Margins left=1, right=3, in origin mode so the cursor homes inside them.
+  feed(&mut t, b"\x1b[?69h\x1b[?6h\x1b[2;4s");
+  feed(&mut t, b"XYZW");
+  assert_eq!(t.grid().cell(1, 0).c, 'X');
+  assert_eq!(t.grid().cell(3, 0).c, 'Z');
+  // The next glyph wraps to the left margin on the following row.
+  assert_eq!(t.grid().cell(1, 1).c, 'W');
+}
+
+#[test]
 fn deckpam_sets_application_keypad() {
   let mut t = Term::new(10, 2);
   assert!(!t.grid().app_keypad());

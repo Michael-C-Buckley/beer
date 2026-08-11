@@ -606,6 +606,7 @@ impl Term {
         },
         (true, 2004) => self.grid.set_bracketed_paste(on),
         (true, 2026) => self.grid.set_sync(on),
+        (true, 69) => self.grid.set_lr_margins_mode(on),
         _ => tracing::trace!("unhandled mode {code} private={private} on={on}"),
       }
     }
@@ -794,6 +795,7 @@ impl Term {
       },
       (true, 2004) => set_reset(self.grid.bracketed_paste()),
       (true, 2026) => set_reset(self.grid.sync_active()),
+      (true, 69) => set_reset(self.grid.lr_margins_enabled()),
       (false, 4) => set_reset(self.grid.insert()),
       _ => 0,
     };

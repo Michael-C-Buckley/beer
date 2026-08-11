@@ -199,6 +199,12 @@ pub struct Grid {
   /// Inclusive top/bottom rows of the scroll region.
   top:             usize,
   bottom:          usize,
+  /// Left/right scroll margins (DECSLRM). They span the full width unless
+  /// `lr_margins` is set; scrolling and line edits are confined to the span.
+  left:            usize,
+  right:           usize,
+  /// Whether left/right margins are enabled (DECLRMM, DECSET `?69`).
+  lr_margins:      bool,
   /// Template cell carrying the current SGR colours/flags.
   pen:             Cell,
   autowrap:        bool,
@@ -313,6 +319,9 @@ impl Grid {
       saved: Cursor::default(),
       top: 0,
       bottom: rows - 1,
+      left: 0,
+      right: cols - 1,
+      lr_margins: false,
       pen: Cell::default(),
       autowrap: true,
       origin: false,
@@ -417,6 +426,8 @@ impl Grid {
     self.rows = rows;
     self.top = 0;
     self.bottom = rows - 1;
+    self.left = 0;
+    self.right = cols - 1;
     self.tabs = default_tabs(cols);
     self.cursor.x = self.cursor.x.min(cols - 1);
     self.cursor.y = self.cursor.y.min(rows - 1);
@@ -658,16 +669,17 @@ impl Grid {
       self.add_combining(c);
       return;
     }
+    let (lm, re) = (self.left_edge(), self.right_edge());
     if self.wrap_pending {
-      self.cursor.x = 0;
+      self.cursor.x = lm;
       self.lines[self.cursor.y].wrapped = true;
       self.line_feed();
       self.wrap_pending = false;
     }
-    if width == 2 && self.cursor.x + 1 >= self.cols {
-      // A double-width glyph cannot straddle the right edge: wrap first.
+    if width == 2 && self.cursor.x + 1 >= re {
+      // A double-width glyph cannot straddle the right margin: wrap first.
       if self.autowrap {
-        self.cursor.x = 0;
+        self.cursor.x = lm;
         self.lines[self.cursor.y].wrapped = true;
         self.line_feed();
       } else {
@@ -703,13 +715,9 @@ impl Grid {
     }
 
     let advance = width;
-    if self.cursor.x + advance >= self.cols {
-      if self.autowrap {
-        self.cursor.x = self.cols - 1;
-        self.wrap_pending = true;
-      } else {
-        self.cursor.x = self.cols - 1;
-      }
+    if self.cursor.x + advance >= re {
+      self.cursor.x = re - 1;
+      self.wrap_pending = self.autowrap;
     } else {
       self.cursor.x += advance;
     }
@@ -990,7 +998,7 @@ impl Grid {
 
   fn shift_right(&mut self, n: usize) {
     let (x, y) = (self.cursor.x, self.cursor.y);
-    let end = self.cols;
+    let end = self.right_edge();
     // Shifting cells sideways would scramble a scaled block's back-references.
     self.dissolve_sized(y, x, end);
     let blank = self.pen_blank();
@@ -1019,9 +1027,66 @@ impl Grid {
     }
   }
 
+  /// The column region the cursor addresses within: the left/right margins in
+  /// origin mode when they are enabled, else the full width.
+  const fn hregion(&self) -> (usize, usize) {
+    if self.origin && self.lr_margins {
+      (self.left, self.right)
+    } else {
+      (0, self.cols - 1)
+    }
+  }
+
+  /// The column a wrap returns to: the left margin when the cursor is inside an
+  /// enabled left/right region, else column 0.
+  const fn left_edge(&self) -> usize {
+    if self.lr_margins
+      && self.cursor.x >= self.left
+      && self.cursor.x <= self.right
+    {
+      self.left
+    } else {
+      0
+    }
+  }
+
+  /// The exclusive column bound for wrapping and in-line edits: one past the
+  /// right margin when the cursor is inside an enabled region, else the width.
+  const fn right_edge(&self) -> usize {
+    if self.lr_margins
+      && self.cursor.x >= self.left
+      && self.cursor.x <= self.right
+    {
+      self.right + 1
+    } else {
+      self.cols
+    }
+  }
+
+  /// Copy the `[left..=right]` span of row `src` into row `dst`, for a scroll
+  /// confined by the left/right margins.
+  fn copy_span(&mut self, dst: usize, src: usize) {
+    let (l, r) = (self.left, self.right);
+    self.dissolve_sized(dst, l, r + 1);
+    self.dissolve_sized(src, l, r + 1);
+    let span: Vec<Cell> = self.lines[src].cells[l..=r].to_vec();
+    self.lines[dst].cells[l..=r].clone_from_slice(&span);
+  }
+
+  /// Blank the `[left..=right]` span of row `y` with the pen background.
+  fn blank_span(&mut self, y: usize) {
+    let (l, r) = (self.left, self.right);
+    self.dissolve_sized(y, l, r + 1);
+    let blank = self.pen_blank();
+    for cell in &mut self.lines[y].cells[l..=r] {
+      *cell = blank.clone();
+    }
+  }
+
   pub fn move_to(&mut self, x: usize, y: usize) {
     let (rt, rb) = self.region();
-    self.cursor.x = x.min(self.cols - 1);
+    let (cl, cr) = self.hregion();
+    self.cursor.x = (x + cl).min(cr).max(cl);
     self.cursor.y = (y + rt).min(rb).max(rt);
     self.wrap_pending = false;
   }
@@ -1142,11 +1207,44 @@ impl Grid {
     self.move_to(0, 0);
   }
 
+  /// Whether left/right margins are enabled (DECLRMM, DECSET `?69`).
+  pub const fn lr_margins_enabled(&self) -> bool {
+    self.lr_margins
+  }
+
+  /// DECLRMM (DECSET `?69`): enable or disable left/right margins. Disabling
+  /// resets the margins to the full width.
+  pub const fn set_lr_margins_mode(&mut self, on: bool) {
+    self.lr_margins = on;
+    if !on {
+      self.left = 0;
+      self.right = self.cols - 1;
+    }
+  }
+
+  /// DECSLRM (`CSI Pl ; Pr s`): set the left/right margins when DECLRMM is on,
+  /// then home the cursor. Out-of-order or out-of-range values reset to full.
+  pub fn set_lr_margins(&mut self, left: usize, right: usize) {
+    if !self.lr_margins {
+      return;
+    }
+    if left < right && right < self.cols {
+      self.left = left;
+      self.right = right;
+    } else {
+      self.left = 0;
+      self.right = self.cols - 1;
+    }
+    self.move_to(0, 0);
+  }
+
   pub fn scroll_up(&mut self, n: usize) {
     let n = n.min(self.bottom - self.top + 1);
-    // Lines leaving the top of the *whole* main screen become scrollback;
-    // a DECSTBM region scroll (top > 0) or the alt screen does not.
-    if self.top == 0 && self.alt_saved.is_none() {
+    let full_width = self.left == 0 && self.right == self.cols - 1;
+    // Lines leaving the top of the *whole* main screen become scrollback; a
+    // DECSTBM region scroll (top > 0), a margin-confined scroll, or the alt
+    // screen does not.
+    if self.top == 0 && full_width && self.alt_saved.is_none() {
       for y in 0..n {
         let line =
           std::mem::replace(&mut self.lines[y], Line::blank(self.cols));
@@ -1166,25 +1264,41 @@ impl Grid {
         self.view_offset = (self.view_offset + n).min(self.scrollback.len());
       }
     }
-    for y in self.top..=self.bottom {
-      if y + n <= self.bottom {
-        self.lines.swap(y, y + n);
+    if full_width {
+      for y in self.top..=self.bottom {
+        if y + n <= self.bottom {
+          self.lines.swap(y, y + n);
+        }
       }
-    }
-    for y in (self.bottom + 1 - n)..=self.bottom {
-      self.blank_row(y);
+      for y in (self.bottom + 1 - n)..=self.bottom {
+        self.blank_row(y);
+      }
+    } else {
+      for y in self.top..=self.bottom {
+        if y + n <= self.bottom {
+          self.copy_span(y, y + n);
+        } else {
+          self.blank_span(y);
+        }
+      }
     }
   }
 
   pub fn scroll_down(&mut self, n: usize) {
     let n = n.min(self.bottom - self.top + 1);
+    let full_width = self.left == 0 && self.right == self.cols - 1;
     for y in (self.top..=self.bottom).rev() {
       if y >= self.top + n {
-        self.lines.swap(y, y - n);
+        if full_width {
+          self.lines.swap(y, y - n);
+        } else {
+          self.copy_span(y, y - n);
+        }
+      } else if full_width {
+        self.blank_row(y);
+      } else {
+        self.blank_span(y);
       }
-    }
-    for y in self.top..(self.top + n) {
-      self.blank_row(y);
     }
   }
 
@@ -1282,13 +1396,14 @@ impl Grid {
   /// DCH: delete n characters at the cursor, shifting the rest left.
   pub fn delete_chars(&mut self, n: usize) {
     let (x, y) = (self.cursor.x, self.cursor.y);
-    let n = n.min(self.cols - x);
+    let end = self.right_edge();
+    let n = n.min(end - x);
     // Shifting cells sideways would scramble a scaled block's back-references.
-    self.dissolve_sized(y, x, self.cols);
+    self.dissolve_sized(y, x, end);
     let blank = self.pen_blank();
     let row = &mut self.lines[y].cells;
-    for i in x..self.cols {
-      row[i] = if i + n < self.cols {
+    for i in x..end {
+      row[i] = if i + n < end {
         row[i + n].clone()
       } else {
         blank.clone()
@@ -1296,35 +1411,67 @@ impl Grid {
     }
   }
 
-  /// IL: insert n blank lines at the cursor row, within the scroll region.
+  /// IL: insert n blank lines at the cursor row, within the scroll region and
+  /// (when set) the left/right margins.
   pub fn insert_lines(&mut self, n: usize) {
     if self.cursor.y < self.top || self.cursor.y > self.bottom {
       return;
     }
-    let n = n.min(self.bottom - self.cursor.y + 1);
-    for y in (self.cursor.y..=self.bottom).rev() {
-      if y >= self.cursor.y + n {
-        self.lines.swap(y, y - n);
-      }
+    if self.lr_margins
+      && (self.cursor.x < self.left || self.cursor.x > self.right)
+    {
+      return;
     }
-    for y in self.cursor.y..(self.cursor.y + n) {
-      self.blank_row(y);
+    let n = n.min(self.bottom - self.cursor.y + 1);
+    if self.left == 0 && self.right == self.cols - 1 {
+      for y in (self.cursor.y..=self.bottom).rev() {
+        if y >= self.cursor.y + n {
+          self.lines.swap(y, y - n);
+        }
+      }
+      for y in self.cursor.y..(self.cursor.y + n) {
+        self.blank_row(y);
+      }
+    } else {
+      for y in (self.cursor.y..=self.bottom).rev() {
+        if y >= self.cursor.y + n {
+          self.copy_span(y, y - n);
+        } else {
+          self.blank_span(y);
+        }
+      }
     }
   }
 
-  /// DL: delete n lines at the cursor row, within the scroll region.
+  /// DL: delete n lines at the cursor row, within the scroll region and (when
+  /// set) the left/right margins.
   pub fn delete_lines(&mut self, n: usize) {
     if self.cursor.y < self.top || self.cursor.y > self.bottom {
       return;
     }
-    let n = n.min(self.bottom - self.cursor.y + 1);
-    for y in self.cursor.y..=self.bottom {
-      if y + n <= self.bottom {
-        self.lines.swap(y, y + n);
-      }
+    if self.lr_margins
+      && (self.cursor.x < self.left || self.cursor.x > self.right)
+    {
+      return;
     }
-    for y in (self.bottom + 1 - n)..=self.bottom {
-      self.blank_row(y);
+    let n = n.min(self.bottom - self.cursor.y + 1);
+    if self.left == 0 && self.right == self.cols - 1 {
+      for y in self.cursor.y..=self.bottom {
+        if y + n <= self.bottom {
+          self.lines.swap(y, y + n);
+        }
+      }
+      for y in (self.bottom + 1 - n)..=self.bottom {
+        self.blank_row(y);
+      }
+    } else {
+      for y in self.cursor.y..=self.bottom {
+        if y + n <= self.bottom {
+          self.copy_span(y, y + n);
+        } else {
+          self.blank_span(y);
+        }
+      }
     }
   }
 
@@ -1350,6 +1497,9 @@ impl Grid {
     self.reset_pen();
     self.top = 0;
     self.bottom = self.rows - 1;
+    self.left = 0;
+    self.right = self.cols - 1;
+    self.lr_margins = false;
     self.autowrap = true;
     self.origin = false;
     self.insert = false;
