@@ -164,6 +164,8 @@ struct WinState {
   sync_token:          Option<u64>,
   // Input / mode state.
   selecting:           bool,
+  /// Whether the pointer is currently hidden because the user is typing.
+  pointer_hidden:      bool,
   hovered_link:        Option<NonZeroU16>,
   press_cell:          Option<(usize, usize)>,
   pressed_button:      Option<u8>,
@@ -219,6 +221,7 @@ impl WinState {
       flash_token: None,
       sync_token: None,
       selecting: false,
+      pointer_hidden: false,
       hovered_link: None,
       press_cell: None,
       pressed_button: None,
@@ -978,6 +981,7 @@ impl App {
     } else {
       KeyKind::Repeat
     };
+    self.hide_pointer(ctx, idx);
     if self.windows[idx].unicode_input.is_some() {
       self.unicode_key(idx, event);
       return;
@@ -1359,12 +1363,14 @@ impl App {
     match event {
       PointerEvent::Enter { x, y, .. } => {
         self.windows[idx].pointer_pos = (x, y);
+        self.windows[idx].pointer_hidden = false;
         self.update_hover(ctx, idx);
         self.pointer_drag(ctx, idx);
       },
       PointerEvent::Leave => {},
       PointerEvent::Motion { x, y } => {
         self.windows[idx].pointer_pos = (x, y);
+        self.reveal_pointer(ctx, idx);
         if self.try_report_motion(idx) {
           return;
         }
@@ -1691,6 +1697,23 @@ impl App {
       .term
       .grid()
       .link_at(row, col)
+  }
+
+  /// Hide the pointer while the user types, like `foot`. Restored on the next
+  /// pointer motion by [`Self::reveal_pointer`].
+  fn hide_pointer(&mut self, ctx: &mut dyn WindowCtx, idx: usize) {
+    if !self.windows[idx].pointer_hidden {
+      self.windows[idx].pointer_hidden = true;
+      ctx.set_cursor(self.windows[idx].id, CursorIcon::Hidden);
+    }
+  }
+
+  /// Reveal a pointer hidden by typing, restoring the hover-appropriate cursor.
+  fn reveal_pointer(&mut self, ctx: &mut dyn WindowCtx, idx: usize) {
+    if self.windows[idx].pointer_hidden {
+      self.windows[idx].pointer_hidden = false;
+      self.update_hover(ctx, idx);
+    }
   }
 
   fn update_hover(&mut self, ctx: &mut dyn WindowCtx, idx: usize) {

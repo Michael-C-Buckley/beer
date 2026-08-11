@@ -51,6 +51,8 @@ pub enum CursorIcon {
   Text,
   /// A pointer used for hyperlinks.
   Pointer,
+  /// No pointer at all, hidden while the user types.
+  Hidden,
 }
 
 /// A scroll step in surface-logical pixels. `discrete` marks a wheel notch (as

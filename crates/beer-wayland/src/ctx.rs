@@ -105,14 +105,22 @@ impl WindowCtx for Platform {
     let serial = self
       .window_index(id)
       .map_or(0, |i| self.windows[i].pointer_enter_serial);
+    let Some(seat) = self.seats.get(self.active_seat) else {
+      return;
+    };
     let shape = match icon {
       CursorIcon::Default => Shape::Default,
       CursorIcon::Text => Shape::Text,
       CursorIcon::Pointer => Shape::Pointer,
+      // Hiding attaches no cursor surface to the pointer.
+      CursorIcon::Hidden => {
+        if let Some(pointer) = seat.pointer.as_ref() {
+          pointer.set_cursor(serial, None, 0, 0);
+        }
+        return;
+      },
     };
-    if let Some(seat) = self.seats.get(self.active_seat)
-      && let Some(dev) = seat.cursor_shape_device.as_ref()
-    {
+    if let Some(dev) = seat.cursor_shape_device.as_ref() {
       dev.set_shape(serial, shape);
     }
   }
