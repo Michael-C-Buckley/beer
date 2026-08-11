@@ -310,9 +310,9 @@ impl SeatHandler for WaylandState {
         &seat,
         None,
         loop_handle,
-        Box::new(|state: &mut Self, _kbd, event| {
+        Box::new(|state: &mut Self, kbd, event| {
           if let Some(id) = state.plat.focused_id() {
-            let mods = state.plat.modifiers;
+            let mods = state.plat.modifiers_for(kbd);
             state.app.on_key(&mut state.plat, id, &event, mods);
           }
         }),
@@ -451,7 +451,7 @@ impl KeyboardHandler for WaylandState {
     self.plat.activate_keyboard(keyboard);
     self.plat.serial = serial;
     if let Some(id) = self.plat.focused_id() {
-      let mods = self.plat.modifiers;
+      let mods = self.plat.modifiers_for(keyboard);
       self.app.on_key(&mut self.plat, id, &event, mods);
     }
   }
@@ -471,12 +471,12 @@ impl KeyboardHandler for WaylandState {
     &mut self,
     _: &Connection,
     _: &QueueHandle<Self>,
-    _: &WlKeyboard,
+    keyboard: &WlKeyboard,
     _: u32,
     event: KeyEvent,
   ) {
     if let Some(id) = self.plat.focused_id() {
-      let mods = self.plat.modifiers;
+      let mods = self.plat.modifiers_for(keyboard);
       self.app.on_key_release(&mut self.plat, id, &event, mods);
     }
   }
@@ -485,13 +485,13 @@ impl KeyboardHandler for WaylandState {
     &mut self,
     _: &Connection,
     _: &QueueHandle<Self>,
-    _: &WlKeyboard,
+    keyboard: &WlKeyboard,
     _: u32,
     modifiers: Modifiers,
     _: RawModifiers,
     _: u32,
   ) {
-    self.plat.modifiers = modifiers;
+    self.plat.set_modifiers_for(keyboard, modifiers);
   }
 
   fn update_repeat_info(
@@ -586,7 +586,7 @@ impl PointerHandler for WaylandState {
           }
         },
       };
-      let mods = self.plat.modifiers;
+      let mods = self.plat.modifiers();
       self.app.on_pointer(&mut self.plat, id, neutral, mods);
     }
   }

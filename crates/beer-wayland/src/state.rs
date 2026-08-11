@@ -84,6 +84,9 @@ pub struct FrameBuf {
 pub struct SeatData {
   pub seat:                WlSeat,
   pub keyboard:            Option<WlKeyboard>,
+  /// Modifier state of this seat's keyboard, kept per-seat so two keyboards do
+  /// not clobber one another's shift/ctrl/alt state.
+  pub modifiers:           Modifiers,
   pub pointer:             Option<WlPointer>,
   pub cursor_shape_device: Option<WpCursorShapeDeviceV1>,
   pub data_device:         Option<DataDevice>,
@@ -160,7 +163,6 @@ pub struct Platform {
   pub primary_clip:         String,
   /// Most recent input serial, used to claim selections.
   pub serial:               u32,
-  pub modifiers:            Modifiers,
   pub windows:              Vec<PlatformWindow>,
   pub focused_window:       usize,
   /// Window a touch point is latched to, keyed by touch id, so a gesture stays
@@ -223,6 +225,7 @@ impl Platform {
     self.seats.push(SeatData {
       seat:                seat.clone(),
       keyboard:            None,
+      modifiers:           Modifiers::default(),
       pointer:             None,
       cursor_shape_device: None,
       data_device:         None,
@@ -259,6 +262,40 @@ impl Platform {
       .position(|s| s.keyboard.as_ref() == Some(keyboard))
     {
       self.active_seat = i;
+    }
+  }
+
+  /// Modifier state of the active seat.
+  pub fn modifiers(&self) -> Modifiers {
+    self
+      .seats
+      .get(self.active_seat)
+      .map(|s| s.modifiers)
+      .unwrap_or_default()
+  }
+
+  /// Modifier state of the seat owning `keyboard`.
+  pub fn modifiers_for(&self, keyboard: &WlKeyboard) -> Modifiers {
+    self
+      .seats
+      .iter()
+      .find(|s| s.keyboard.as_ref() == Some(keyboard))
+      .map(|s| s.modifiers)
+      .unwrap_or_default()
+  }
+
+  /// Record the modifier state for the seat owning `keyboard`.
+  pub fn set_modifiers_for(
+    &mut self,
+    keyboard: &WlKeyboard,
+    modifiers: Modifiers,
+  ) {
+    if let Some(s) = self
+      .seats
+      .iter_mut()
+      .find(|s| s.keyboard.as_ref() == Some(keyboard))
+    {
+      s.modifiers = modifiers;
     }
   }
 

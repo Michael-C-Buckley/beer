@@ -18,11 +18,7 @@ use smithay_client_toolkit::{
   output::OutputState,
   primary_selection::PrimarySelectionManagerState,
   registry::RegistryState,
-  seat::{
-    SeatState,
-    keyboard::Modifiers,
-    pointer::cursor_shape::CursorShapeManager,
-  },
+  seat::{SeatState, pointer::cursor_shape::CursorShapeManager},
   shell::xdg::XdgShell,
   shm::Shm,
 };
@@ -126,7 +122,6 @@ pub fn run(app: Box<dyn App>) -> anyhow::Result<u8> {
     clipboard: String::new(),
     primary_clip: String::new(),
     serial: 0,
-    modifiers: Modifiers::default(),
     windows: Vec::new(),
     focused_window: 0,
     touch_focus: HashMap::new(),
