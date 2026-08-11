@@ -32,6 +32,13 @@ search, mouse selection, and clipboard integration.
 	*ENVIRONMENT*). Without any *--config* flags, the default location is
 	used (see *FILES*).
 
+*--title* _TITLE_
+	Title for the window opened via a running server. Ignored in *--server*
+	mode; the server applies its own configured default otherwise.
+
+*--app-id* _APP_ID_
+	Wayland _app_id_ for the window opened via a running server.
+
 *-h*, *--help*
 	Print usage and exit.
 

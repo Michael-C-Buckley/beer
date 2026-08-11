@@ -24,9 +24,13 @@ const MAX_REQUEST: usize = 1 << 20;
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct OpenRequest {
   /// Directory the child shell starts in (the client's cwd); `None` inherits.
-  pub cwd: Option<String>,
+  pub cwd:    Option<String>,
   /// Environment for the child shell (the client's environment).
-  pub env: Vec<(String, String)>,
+  pub env:    Vec<(String, String)>,
+  /// Window title override; `None` uses the server's configured title.
+  pub title:  Option<String>,
+  /// Window `app_id` override; `None` uses the server's configured app-id.
+  pub app_id: Option<String>,
 }
 
 /// The daemon socket on `$XDG_RUNTIME_DIR/beer-$WAYLAND_DISPLAY.sock`.
@@ -129,8 +133,10 @@ fn restrict_socket_permissions(path: &Path) -> io::Result<()> {
 
 impl OpenRequest {
   /// Encode as a length-prefixed frame: a big-endian `u32` body length, then
-  /// the body. Body layout: `[u32 cwd_len][cwd utf8] [u32 env_count]` followed
-  /// by `env_count` pairs of `[u32 klen][k][u32 vlen][v]`.
+  /// the body. Body layout: `[u32 cwd_len][cwd utf8] [u32 env_count]` then
+  /// `env_count` pairs of `[u32 klen][k][u32 vlen][v]`, then the optional
+  /// `title` and `app_id` fields. The trailing fields are appended so an older
+  /// server that stops after the env pairs simply ignores them.
   #[expect(
     clippy::cast_possible_truncation,
     reason = "the IPC wire format deliberately uses u32 length fields"
@@ -144,6 +150,8 @@ impl OpenRequest {
       put_bytes(&mut body, k.as_bytes());
       put_bytes(&mut body, v.as_bytes());
     }
+    put_bytes(&mut body, self.title.as_deref().unwrap_or("").as_bytes());
+    put_bytes(&mut body, self.app_id.as_deref().unwrap_or("").as_bytes());
     let mut frame = Vec::with_capacity(body.len() + 4);
     put_u32(&mut frame, body.len() as u32);
     frame.extend_from_slice(&body);
@@ -173,7 +181,15 @@ impl OpenRequest {
       let v = String::from_utf8(take_bytes(&mut rest)?.to_vec()).ok()?;
       env.push((k, v));
     }
-    Some(Self { cwd, env })
+    // Older clients stop here; the title/app-id fields are optional trailers.
+    let title = take_optional_str(&mut rest);
+    let app_id = take_optional_str(&mut rest);
+    Some(Self {
+      cwd,
+      env,
+      title,
+      app_id,
+    })
   }
 }
 
@@ -285,6 +301,19 @@ fn take_u32(buf: &mut &[u8]) -> Option<u32> {
   Some(u32::from_be_bytes([head[0], head[1], head[2], head[3]]))
 }
 
+/// Read an optional trailing string field: `None` when the buffer is exhausted
+/// (an older client omitted it) or the field is empty or invalid UTF-8.
+fn take_optional_str(buf: &mut &[u8]) -> Option<String> {
+  if buf.is_empty() {
+    return None;
+  }
+  let bytes = take_bytes(buf)?;
+  if bytes.is_empty() {
+    return None;
+  }
+  String::from_utf8(bytes.to_vec()).ok()
+}
+
 /// Read a length-prefixed byte slice off the front of `buf`, advancing it.
 fn take_bytes<'a>(buf: &mut &'a [u8]) -> Option<&'a [u8]> {
   let n = take_u32(buf)? as usize;
@@ -343,6 +372,7 @@ mod tests {
     round_trip(&OpenRequest {
       cwd: Some("/home/user/project".into()),
       env: Vec::new(),
+      ..Default::default()
     });
   }
 
@@ -354,6 +384,7 @@ mod tests {
         ("TERM".into(), "beer".into()),
         ("PATH".into(), "/bin".into()),
       ],
+      ..Default::default()
     });
   }
 
@@ -362,7 +393,31 @@ mod tests {
     round_trip(&OpenRequest {
       cwd: Some("/tmp".into()),
       env: vec![("KEY".into(), "value with spaces".into())],
+      ..Default::default()
     });
+  }
+
+  #[test]
+  fn title_and_app_id_round_trip() {
+    round_trip(&OpenRequest {
+      cwd:    None,
+      env:    Vec::new(),
+      title:  Some("build".into()),
+      app_id: Some("dev.notashelf.beer.build".into()),
+    });
+  }
+
+  #[test]
+  fn old_frame_without_trailers_decodes() {
+    // A frame carrying only cwd + env (an older client) decodes with no
+    // title/app-id override rather than failing.
+    let mut body = Vec::new();
+    put_bytes(&mut body, b"/tmp");
+    put_u32(&mut body, 0);
+    let decoded = OpenRequest::decode(&body).unwrap();
+    assert_eq!(decoded.cwd.as_deref(), Some("/tmp"));
+    assert_eq!(decoded.title, None);
+    assert_eq!(decoded.app_id, None);
   }
 
   #[test]
@@ -370,10 +425,13 @@ mod tests {
     let frame = OpenRequest {
       cwd: Some("/tmp".into()),
       env: vec![("A".into(), "B".into())],
+      ..Default::default()
     }
     .encode();
-    // Chop the body short; decode must reject rather than panic.
-    assert_eq!(OpenRequest::decode(&frame[4..frame.len() - 3]), None);
+    // Chop into the required cwd/env region; decode must reject rather than
+    // panic. (Truncating only the optional trailer instead degrades to None
+    // overrides, covered by `old_frame_without_trailers_decodes`.)
+    assert_eq!(OpenRequest::decode(&frame[4..frame.len() - 12]), None);
     assert_eq!(OpenRequest::decode(&[0, 0, 0]), None);
   }
 
@@ -382,6 +440,7 @@ mod tests {
     let request = OpenRequest {
       cwd: Some("/tmp".into()),
       env: vec![("TERM".into(), "beer".into())],
+      ..Default::default()
     };
     let frame = request.encode();
     let mut stream = NonblockingReader::default();

@@ -32,6 +32,12 @@ struct Cli {
   /// Repeatable; later files take priority over earlier ones.
   #[pound(long)]
   config:    Vec<PathBuf>,
+  /// Title for the window opened via a running server.
+  #[pound(long)]
+  title:     Option<String>,
+  /// Wayland `app_id` for the window opened via a running server.
+  #[pound(long)]
+  app_id:    Option<String>,
 }
 
 fn main() -> ExitCode {
@@ -60,10 +66,12 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
   // window's exit status. `--no-daemon` and `--server` opt out.
   if !cli.server && !cli.no_daemon {
     let req = ipc::OpenRequest {
-      cwd: env::current_dir()
+      cwd:    env::current_dir()
         .ok()
         .map(|p| p.to_string_lossy().into_owned()),
-      env: env::vars().collect(),
+      env:    env::vars().collect(),
+      title:  cli.title.clone(),
+      app_id: cli.app_id.clone(),
     };
     match ipc::run_client(&req) {
       Ok(code) => return Ok(ExitCode::from(code)),

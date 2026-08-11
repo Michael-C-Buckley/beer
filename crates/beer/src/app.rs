@@ -458,6 +458,14 @@ fn font_options(main: &Main, px: u32, scale120: u32) -> FontOptions<'_> {
   options
 }
 
+/// Per-window overrides a daemon client may request; each falls back to config
+/// when unset.
+#[derive(Default)]
+struct WindowOverrides {
+  title:  Option<String>,
+  app_id: Option<String>,
+}
+
 /// A child's exit status folded to a byte: its exit code, or 128 plus the
 /// terminating signal.
 #[expect(
@@ -1333,7 +1341,7 @@ impl App {
       .as_ref()
       .and_then(|s| s.term.cwd())
       .map(PathBuf::from);
-    self.open(ctx, cwd, Vec::new(), None);
+    self.open(ctx, cwd, Vec::new(), WindowOverrides::default(), None);
   }
 
   fn alternate_scroll(&mut self, idx: usize, up: bool, count: isize) {
@@ -2198,11 +2206,16 @@ impl App {
     ctx: &mut dyn WindowCtx,
     cwd: Option<PathBuf>,
     env: Vec<(String, String)>,
+    overrides: WindowOverrides,
     client: Option<UnixStream>,
   ) -> WindowId {
     let id = ctx.open_window(&WindowOptions {
-      app_id:    self.config.main.app_id.clone(),
-      title:     self.config.main.title.clone(),
+      app_id:    overrides
+        .app_id
+        .unwrap_or_else(|| self.config.main.app_id.clone()),
+      title:     overrides
+        .title
+        .unwrap_or_else(|| self.config.main.title.clone()),
       maximized: self.config.main.maximized,
     });
     let pty_token = self.alloc_token();
@@ -2254,7 +2267,11 @@ impl App {
         let client = stream.try_clone().ok();
         self.ipc_clients.remove(&token);
         ctx.unwatch(token);
-        self.open(ctx, req.cwd.map(PathBuf::from), req.env, client);
+        let overrides = WindowOverrides {
+          title:  req.title,
+          app_id: req.app_id,
+        };
+        self.open(ctx, req.cwd.map(PathBuf::from), req.env, overrides, client);
       },
       Err(err) => {
         tracing::warn!("read ipc request: {err}");
@@ -2364,7 +2381,7 @@ impl WindowApp for App {
         },
       }
     } else {
-      self.open(ctx, None, Vec::new(), None);
+      self.open(ctx, None, Vec::new(), WindowOverrides::default(), None);
     }
     self.flush_redraw(ctx);
   }
