@@ -13,7 +13,6 @@ use super::{
   Term,
   base64_decode,
   charset,
-  dec_special,
   file_uri_path,
   n,
   osc_text,
@@ -22,6 +21,7 @@ use super::{
   prompt_kind,
   raw,
   rgb_tuple,
+  translate,
 };
 
 #[expect(
@@ -32,11 +32,8 @@ use super::{
 )]
 impl Perform for Term {
   fn print(&mut self, c: char) {
-    let c = if self.active_charset() == Charset::DecSpecial {
-      dec_special(c)
-    } else {
-      c
-    };
+    let c = translate(self.active_charset(), c);
+    self.single_shift = None;
     self.grid.print(c);
   }
 
@@ -47,8 +44,8 @@ impl Perform for Term {
       0x09 => self.grid.tab(),
       0x0A..=0x0C => self.grid.line_feed(),
       0x0D => self.grid.carriage_return(),
-      0x0E => self.shift_out = true,
-      0x0F => self.shift_out = false,
+      0x0E => self.gl = 1,
+      0x0F => self.gl = 0,
       _ => {},
     }
   }
@@ -161,15 +158,25 @@ impl Perform for Term {
       (None, b'7') => self.grid.save_cursor(),
       (None, b'8') => self.grid.restore_cursor(),
       (None, b'H') => self.grid.set_tab(),
+      // SS2/SS3 shift the next character into G2/G3; LS2/LS3 lock GL there.
+      (None, b'N') => self.single_shift = Some(2),
+      (None, b'O') => self.single_shift = Some(3),
+      (None, b'n') => self.gl = 2,
+      (None, b'o') => self.gl = 3,
       (None, b'c') => {
         self.grid.hard_reset();
         self.g0 = Charset::Ascii;
         self.g1 = Charset::Ascii;
-        self.shift_out = false;
+        self.g2 = Charset::Ascii;
+        self.g3 = Charset::Ascii;
+        self.gl = 0;
+        self.single_shift = None;
       },
       (Some(b'#'), b'8') => self.grid.decaln(),
       (Some(b'('), c) => self.g0 = charset(c),
       (Some(b')'), c) => self.g1 = charset(c),
+      (Some(b'*'), c) => self.g2 = charset(c),
+      (Some(b'+'), c) => self.g3 = charset(c),
       _ => {},
     }
   }

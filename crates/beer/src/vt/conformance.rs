@@ -268,6 +268,30 @@ fn dec_special_graphics_maps_line_drawing() {
 }
 
 #[test]
+fn uk_charset_maps_pound_sign() {
+  // Designate the UK national set into G0; `#` prints as the pound sign.
+  let t = term(10, 1, b"\x1b(A#");
+  assert_eq!(t.grid().cell(0, 0).c, '£');
+}
+
+#[test]
+fn single_shift_selects_g3_for_one_char() {
+  // G3 = DEC special graphics; SS3 shifts only the next character into it.
+  let t = term(10, 1, b"\x1b+0\x1bOqq");
+  assert_eq!(t.grid().cell(0, 0).c, '\u{2500}'); // shifted
+  assert_eq!(t.grid().cell(1, 0).c, 'q'); // reverted
+}
+
+#[test]
+fn locking_shift_g2_persists() {
+  // G2 = DEC special graphics; LS2 locks GL to it until SI returns to G0.
+  let t = term(10, 1, b"\x1b*0\x1bnqq\x0fq");
+  assert_eq!(t.grid().cell(0, 0).c, '\u{2500}');
+  assert_eq!(t.grid().cell(1, 0).c, '\u{2500}');
+  assert_eq!(t.grid().cell(2, 0).c, 'q');
+}
+
+#[test]
 fn alt_screen_swaps_and_restores() {
   let mut t = Term::new(10, 2);
   feed(&mut t, b"main");

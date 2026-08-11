@@ -8,7 +8,7 @@ use std::{io::Write as _, str};
 
 use beer_protocols::{
   caps::cap_value,
-  charset::{Charset, charset, dec_special},
+  charset::{Charset, charset, translate},
   codec::{base64_decode, decode_hex, file_uri_path},
   sgr::{ext_color, underline_from},
   style::prompt_kind,
@@ -112,7 +112,12 @@ pub struct Term {
   response:      Vec<u8>,
   g0:            Charset,
   g1:            Charset,
-  shift_out:     bool,
+  g2:            Charset,
+  g3:            Charset,
+  /// Which G-set GL maps to (0-3), set by SI/SO and the locking shifts.
+  gl:            u8,
+  /// One-shot G-set for the next printed character (SS2/SS3), then cleared.
+  single_shift:  Option<u8>,
   /// Accumulated payload of an in-progress `DCS + q` (XTGETTCAP) query.
   xtgettcap:     Option<Vec<u8>>,
   /// Pending OSC 52 clipboard requests, drained by the front-end.
@@ -173,7 +178,10 @@ impl Term {
       response:      Vec::new(),
       g0:            Charset::Ascii,
       g1:            Charset::Ascii,
-      shift_out:     false,
+      g2:            Charset::Ascii,
+      g3:            Charset::Ascii,
+      gl:            0,
+      single_shift:  None,
       xtgettcap:     None,
       clipboard_ops: Vec::new(),
       theme:         Theme::default(),
@@ -444,7 +452,20 @@ impl Term {
   }
 
   const fn active_charset(&self) -> Charset {
-    if self.shift_out { self.g1 } else { self.g0 }
+    let idx = match self.single_shift {
+      Some(i) => i,
+      None => self.gl,
+    };
+    self.charset_at(idx)
+  }
+
+  const fn charset_at(&self, idx: u8) -> Charset {
+    match idx {
+      1 => self.g1,
+      2 => self.g2,
+      3 => self.g3,
+      _ => self.g0,
+    }
   }
 
   fn set_mode(&mut self, params: &Params, private: bool, on: bool) {
