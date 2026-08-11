@@ -143,6 +143,7 @@ pub fn run(app: Box<dyn App>) -> anyhow::Result<u8> {
   // loop cleanly so the app's Drop runs (e.g. unlinking the daemon socket).
   let signals = Signals::new(&[
     Signal::SIGUSR1,
+    Signal::SIGCHLD,
     Signal::SIGTERM,
     Signal::SIGINT,
     Signal::SIGHUP,
@@ -152,12 +153,11 @@ pub fn run(app: Box<dyn App>) -> anyhow::Result<u8> {
       let reg = event_loop.handle().insert_source(
         signals,
         |event, (), state: &mut WaylandState| {
+          let WaylandState { app, plat } = state;
           match event.signal() {
-            Signal::SIGUSR1 => {
-              let WaylandState { app, plat } = state;
-              app.on_reload(plat);
-            },
-            _ => state.plat.exit = true,
+            Signal::SIGUSR1 => app.on_reload(plat),
+            Signal::SIGCHLD => app.on_sigchld(plat),
+            _ => plat.exit = true,
           }
         },
       );

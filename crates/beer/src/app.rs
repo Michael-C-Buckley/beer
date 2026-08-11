@@ -19,7 +19,7 @@ use std::{
     },
   },
   path::PathBuf,
-  process::{Command, Stdio},
+  process::{Command, ExitStatus, Stdio},
   time::Instant,
 };
 
@@ -454,6 +454,19 @@ fn font_options(main: &Main, px: u32, scale120: u32) -> FontOptions<'_> {
   options
 }
 
+/// A child's exit status folded to a byte: its exit code, or 128 plus the
+/// terminating signal.
+#[expect(
+  clippy::cast_possible_truncation,
+  clippy::cast_sign_loss,
+  reason = "a process exit code or 128+signal fits a byte"
+)]
+fn status_code(status: ExitStatus) -> u8 {
+  status
+    .code()
+    .unwrap_or_else(|| 128 + status.signal().unwrap_or(0)) as u8
+}
+
 /// Filter pasted text before it reaches the shell: normalize newlines to CR
 /// (collapsing CRLF) and drop control characters (C0 except tab/newline, DEL,
 /// and C1) so a paste cannot inject an escape sequence. The bytes are decoded
@@ -678,35 +691,57 @@ impl App {
 
   /// Reap window `id`'s exited shell, mirror its status to any client, close
   /// it.
-  #[expect(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "wait status/signal are byte-ranged exit codes"
-  )]
   fn child_exited(&mut self, ctx: &mut dyn WindowCtx, id: WindowId) {
     let Some(idx) = self.win_index(id) else {
       return;
     };
-    let last = self.windows.len() == 1;
     let mut code = 0u8;
     if let Some(session) = self.windows[idx].session.as_mut() {
       match session.pty.wait() {
-        Ok(status) => {
-          code = status
-            .code()
-            .unwrap_or_else(|| 128 + status.signal().unwrap_or(0))
-            as u8;
-        },
+        Ok(status) => code = status_code(status),
         Err(err) => tracing::warn!("reap shell: {err}"),
       }
     }
-    if last {
+    self.finish_child(ctx, id, code);
+  }
+
+  /// Propagate a reaped child's exit `code` (to the daemon client and, for the
+  /// last window, the process code) and close its window.
+  fn finish_child(&mut self, ctx: &mut dyn WindowCtx, id: WindowId, code: u8) {
+    let Some(idx) = self.win_index(id) else {
+      return;
+    };
+    if self.windows.len() == 1 {
       self.exit_code = code;
     }
     if let Some(client) = self.windows[idx].client.take() {
       ipc::send_exit(client, code);
     }
     self.close(ctx, id);
+  }
+
+  /// SIGCHLD: reap any window whose child has exited, without blocking.
+  /// Prompter than waiting for the pty to reach EOF.
+  fn reap_children(&mut self, ctx: &mut dyn WindowCtx) {
+    let ids: Vec<WindowId> = self.windows.iter().map(|w| w.id).collect();
+    for id in ids {
+      let Some(idx) = self.win_index(id) else {
+        continue;
+      };
+      let code = self.windows[idx].session.as_mut().and_then(|s| {
+        match s.pty.try_wait() {
+          Ok(Some(status)) => Some(status_code(status)),
+          Ok(None) => None,
+          Err(err) => {
+            tracing::warn!("reap shell: {err}");
+            None
+          },
+        }
+      });
+      if let Some(code) = code {
+        self.finish_child(ctx, id, code);
+      }
+    }
   }
 
   /// After feeding parsed output: send replies, sync title, apply OSC 52 /
@@ -2576,6 +2611,11 @@ impl WindowApp for App {
     if idx < self.windows.len() {
       self.reload_config(idx);
     }
+    self.flush_redraw(ctx);
+  }
+
+  fn on_sigchld(&mut self, ctx: &mut dyn WindowCtx) {
+    self.reap_children(ctx);
     self.flush_redraw(ctx);
   }
 

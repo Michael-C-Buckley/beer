@@ -347,6 +347,8 @@ pub trait App {
   fn on_timer(&mut self, ctx: &mut dyn WindowCtx, token: u64);
   /// The config-reload signal (SIGUSR1) fired.
   fn on_reload(&mut self, ctx: &mut dyn WindowCtx);
+  /// A child-process signal (SIGCHLD) fired; reap any exited shells.
+  fn on_sigchld(&mut self, ctx: &mut dyn WindowCtx);
 
   /// Repaint `id` if its displayed state changed since the last present. Called
   /// after [`WindowCtx::request_redraw`] once the backend can paint.

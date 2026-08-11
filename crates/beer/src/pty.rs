@@ -136,6 +136,11 @@ impl Pty {
   pub fn wait(&mut self) -> io::Result<ExitStatus> {
     self.child.wait()
   }
+
+  /// Reap the child without blocking, returning its status if it has exited.
+  pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+    self.child.try_wait()
+  }
 }
 
 fn set_winsize(
