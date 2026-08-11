@@ -92,6 +92,7 @@ impl Pty {
       cmd.env(k, v);
     }
     cmd.env("TERM", term)
+            .env("COLORTERM", "truecolor")
             // Advertise Kitty graphics protocol compatibility. Yazi (and other
             // clients) gate `kgp` vs `kgp_old` on recognising the terminal
             // brand; KITTY_WINDOW_ID is the env check they use for Kitty.

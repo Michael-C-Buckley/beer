@@ -94,6 +94,13 @@ impl WindowCtx for Platform {
     }
   }
 
+  fn request_size(&mut self, id: WindowId, width: u32, height: u32) {
+    if let Some(win) = self.win_mut(id) {
+      win.width = width.max(1);
+      win.height = height.max(1);
+    }
+  }
+
   fn set_cursor(&mut self, id: WindowId, icon: CursorIcon) {
     let serial = self
       .window_index(id)

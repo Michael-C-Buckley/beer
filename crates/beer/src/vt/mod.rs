@@ -944,6 +944,17 @@ mod tests {
   }
 
   #[test]
+  fn osc12_queries_cursor_color() {
+    let mut t = Term::new(20, 1);
+    feed(&mut t, b"\x1b]12;#ff0000\x07");
+    feed(&mut t, b"\x1b]12;?\x07");
+    let resp = t.take_response();
+    assert!(resp.starts_with(b"\x1b]12;rgb:"), "{resp:?}");
+    // A query must report, not reset, the cursor colour.
+    assert_eq!(t.grid().cursor_color(), Some((255, 0, 0)));
+  }
+
+  #[test]
   fn decscusr_and_cursor_color() {
     use crate::grid::CursorShape;
     let mut t = Term::new(20, 1);

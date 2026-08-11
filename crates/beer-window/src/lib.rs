@@ -188,6 +188,10 @@ pub trait WindowCtx {
   fn set_title(&mut self, id: WindowId, title: &str);
   /// Toggle fullscreen state.
   fn set_fullscreen(&mut self, id: WindowId, on: bool);
+  /// Request a logical window size in pixels. Used before the first present to
+  /// apply the configured initial size when the compositor leaves sizing to
+  /// the client.
+  fn request_size(&mut self, id: WindowId, width: u32, height: u32);
   /// Set the pointer icon shown over the window.
   fn set_cursor(&mut self, id: WindowId, icon: CursorIcon);
   /// Hold an idle inhibitor while the window is focused, per user opt-in.

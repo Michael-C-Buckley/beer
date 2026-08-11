@@ -9,6 +9,7 @@ use super::{
   Notification,
   Params,
   Progress,
+  Rgb,
   Term,
   base64_decode,
   charset,
@@ -280,11 +281,25 @@ impl Perform for Term {
       Some(&n) if n == b"19" => {
         self.osc_dynamic_color(Dynamic::SelFg, params.get(1), bell);
       },
-      // OSC 12: set cursor colour; OSC 112: reset to default.
+      // OSC 12: set or query cursor colour; OSC 112: reset to default. A query
+      // reports the effective colour the renderer uses: the OSC-set colour, the
+      // configured cursor colour, then the foreground.
       Some(&n) if n == b"12" => {
-        self.grid.set_cursor_color(
-          params.get(1).and_then(|s| parse_spec(s)).map(rgb_tuple),
-        );
+        match params.get(1) {
+          Some(spec) if **spec == b"?"[..] => {
+            let rgb = self
+              .grid
+              .cursor_color()
+              .map(|(r, g, b)| Rgb(r, g, b))
+              .or(self.theme.cursor)
+              .unwrap_or(self.theme.fg);
+            self.reply_color("12", rgb, bell);
+          },
+          spec => {
+            let color = spec.and_then(|s| parse_spec(s)).map(rgb_tuple);
+            self.grid.set_cursor_color(color);
+          },
+        }
       },
       Some(&n) if n == b"112" => self.grid.set_cursor_color(None),
       // OSC 52: clipboard get/set. Pc selects the target, Pd is base64 or

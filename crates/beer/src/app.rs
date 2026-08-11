@@ -403,6 +403,17 @@ fn phys_at(v: u32, scale120: u32) -> u32 {
   ((u64::from(v) * u64::from(scale120) + 60) / 120) as u32
 }
 
+/// Inverse of [`phys_at`]: a physical value back to logical pixels at a 120ths
+/// scale.
+#[expect(
+  clippy::cast_possible_truncation,
+  reason = "the logical quotient of a bounded dimension fits u32"
+)]
+fn logical_at(v: u32, scale120: u32) -> u32 {
+  let s = u64::from(scale120.max(1));
+  ((u64::from(v) * 120 + s / 2) / s) as u32
+}
+
 /// Scale a signed pixel adjustment to the output scale, preserving its sign.
 fn phys_adj(v: i32, scale120: u32) -> i32 {
   let scaled = i32::try_from(phys_at(v.unsigned_abs(), scale120)).unwrap_or(0);
@@ -509,10 +520,35 @@ fn row_matches(
 }
 
 impl App {
+  /// Size a freshly created window to the configured `initial-cols`/
+  /// `initial-rows` when the compositor left the initial size to the client,
+  /// leaving the logical size at its 1x1 sentinel. A compositor-dictated size
+  /// is kept as-is.
+  fn apply_initial_size(&mut self, ctx: &mut dyn WindowCtx, idx: usize) {
+    let w = &self.windows[idx];
+    if w.width > 1 && w.height > 1 {
+      return;
+    }
+    let (m, scale120) = (w.metrics, w.scale120);
+    let pad = (
+      phys_at(self.config.main.pad_x, scale120),
+      phys_at(self.config.main.pad_y, scale120),
+    );
+    let phys_w = u32::from(self.config.main.initial_cols) * m.width + 2 * pad.0;
+    let phys_h =
+      u32::from(self.config.main.initial_rows) * m.height + 2 * pad.1;
+    let width = logical_at(phys_w, scale120).max(1);
+    let height = logical_at(phys_h, scale120).max(1);
+    self.windows[idx].width = width;
+    self.windows[idx].height = height;
+    ctx.request_size(self.windows[idx].id, width, height);
+  }
+
   /// Spawn the shell for window `idx` at its current size and watch its master.
   #[expect(clippy::cast_possible_truncation, reason = "cell metrics fit u16")]
   fn spawn_session(&mut self, ctx: &mut dyn WindowCtx, idx: usize) {
     self.ensure_renderer(idx);
+    self.apply_initial_size(ctx, idx);
     let (cols, rows) = self.grid_dims(&self.windows[idx]);
     let m = self.windows[idx].metrics;
     let cell = (m.width as u16, m.height as u16);
