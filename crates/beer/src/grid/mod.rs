@@ -110,6 +110,16 @@ pub struct ImageRef {
   pub dy:        u16,
 }
 
+/// An inclusive rectangle of cells for the rectangular-area operations, in
+/// origin-relative 0-based coordinates until [`Grid::clamp_rect`] resolves it.
+#[derive(Clone, Copy, Debug)]
+pub struct Rect {
+  pub top:    usize,
+  pub left:   usize,
+  pub bottom: usize,
+  pub right:  usize,
+}
+
 /// One grid cell: a character plus its rendering style.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Cell {
@@ -1470,6 +1480,93 @@ impl Grid {
           self.copy_span(y, y + n);
         } else {
           self.blank_span(y);
+        }
+      }
+    }
+  }
+
+  /// Resolve `rect` (origin-relative, 0-based, inclusive) to absolute grid
+  /// coordinates clamped to the addressable region.
+  fn clamp_rect(&self, rect: Rect) -> Rect {
+    let (rt, rb) = self.region();
+    let (cl, cr) = self.hregion();
+    let top = (rect.top + rt).min(rb);
+    let left = (rect.left + cl).min(cr);
+    Rect {
+      top,
+      left,
+      bottom: (rect.bottom + rt).min(rb).max(top),
+      right: (rect.right + cl).min(cr).max(left),
+    }
+  }
+
+  /// DECFRA: fill an inclusive rectangle with `c` in the current pen.
+  pub fn fill_rect(&mut self, c: char, rect: Rect) {
+    let a = self.clamp_rect(rect);
+    let mut cell = self.pen.clone();
+    cell.c = c;
+    cell.combining = None;
+    cell.sized = None;
+    cell.flags.remove(Flags::WIDE_CONT);
+    for y in a.top..=a.bottom {
+      self.dissolve_sized(y, a.left, a.right + 1);
+      for cell_ref in &mut self.lines[y].cells[a.left..=a.right] {
+        *cell_ref = cell.clone();
+      }
+    }
+  }
+
+  /// DECERA: erase an inclusive rectangle to the pen background.
+  pub fn erase_rect(&mut self, rect: Rect) {
+    let a = self.clamp_rect(rect);
+    for y in a.top..=a.bottom {
+      self.erase_in_row(y, a.left, a.right + 1);
+    }
+  }
+
+  /// DECCARA: set/clear flag attributes (and optionally the underline style)
+  /// over an inclusive rectangle, leaving the characters in place.
+  pub fn change_attrs_rect(
+    &mut self,
+    rect: Rect,
+    set: Flags,
+    clear: Flags,
+    underline: Option<Underline>,
+  ) {
+    let a = self.clamp_rect(rect);
+    for y in a.top..=a.bottom {
+      for cell in &mut self.lines[y].cells[a.left..=a.right] {
+        cell.flags.insert(set);
+        cell.flags.remove(clear);
+        if let Some(u) = underline {
+          cell.underline = u;
+        }
+      }
+    }
+  }
+
+  /// DECCRA: copy an inclusive source rectangle to a destination top-left,
+  /// snapshotting first so overlapping copies are well defined.
+  pub fn copy_rect(&mut self, src: Rect, dst_top: usize, dst_left: usize) {
+    let s = self.clamp_rect(src);
+    let (rt, _) = self.region();
+    let (cl, _) = self.hregion();
+    let dt = (dst_top + rt).min(self.rows - 1);
+    let dl = (dst_left + cl).min(self.cols - 1);
+    let mut buf: Vec<Vec<Cell>> = Vec::with_capacity(s.bottom - s.top + 1);
+    for y in s.top..=s.bottom {
+      buf.push(self.lines[y].cells[s.left..=s.right].to_vec());
+    }
+    for (dy, row) in buf.into_iter().enumerate() {
+      let ty = dt + dy;
+      if ty >= self.rows {
+        break;
+      }
+      self.dissolve_sized(ty, dl, (dl + row.len()).min(self.cols));
+      for (dx, cell) in row.into_iter().enumerate() {
+        let tx = dl + dx;
+        if tx < self.cols {
+          self.lines[ty].cells[tx] = cell;
         }
       }
     }

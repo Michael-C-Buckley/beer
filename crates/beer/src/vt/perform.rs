@@ -85,6 +85,11 @@ impl Perform for Term {
       'S' => self.grid.scroll_up(n(params, 0, 1)),
       'T' => self.grid.scroll_down(n(params, 0, 1)),
       'm' => self.sgr(params),
+      // Rectangular-area ops share the `$` intermediate.
+      'x' if intermediates.contains(&b'$') => self.decfra(params),
+      'z' if intermediates.contains(&b'$') => self.decera(params),
+      'v' if intermediates.contains(&b'$') => self.deccra(params),
+      'r' if intermediates.contains(&b'$') => self.deccara(params),
       'r' => {
         let top = n(params, 0, 1) - 1;
         let bottom = match params.iter().nth(1).and_then(|p| p.first().copied())

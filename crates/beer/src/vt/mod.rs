@@ -25,6 +25,7 @@ use crate::{
     Grid,
     MouseEncoding,
     MouseProtocol,
+    Rect,
     Underline,
   },
   theme::{Rgb, Theme, parse_color},
@@ -766,6 +767,86 @@ impl Term {
       },
       _ => {},
     }
+  }
+
+  /// Resolve a rectangle-op parameter block starting at `base`. Absent or zero
+  /// bottom/right default to the far edge.
+  fn rect_bounds(&self, p: &Params, base: usize) -> Rect {
+    let val = |i: usize| {
+      p.iter()
+        .nth(i)
+        .and_then(|x| x.first().copied())
+        .filter(|&v| v != 0)
+    };
+    Rect {
+      top:    val(base).map_or(0, |v| v as usize - 1),
+      left:   val(base + 1).map_or(0, |v| v as usize - 1),
+      bottom: val(base + 2)
+        .map_or_else(|| self.grid.rows() - 1, |v| v as usize - 1),
+      right:  val(base + 3)
+        .map_or_else(|| self.grid.cols() - 1, |v| v as usize - 1),
+    }
+  }
+
+  /// DECFRA (`CSI Pch ; Pt ; Pl ; Pb ; Pr $ x`): fill a rectangle with a glyph.
+  fn decfra(&mut self, p: &Params) {
+    let ch = char::from_u32(u32::from(raw(p, 0)))
+      .filter(|c| !c.is_control())
+      .unwrap_or(' ');
+    let rect = self.rect_bounds(p, 1);
+    self.grid.fill_rect(ch, rect);
+  }
+
+  /// DECERA (`CSI Pt ; Pl ; Pb ; Pr $ z`): erase a rectangle.
+  fn decera(&mut self, p: &Params) {
+    let rect = self.rect_bounds(p, 0);
+    self.grid.erase_rect(rect);
+  }
+
+  /// DECCRA (`... $ v`): copy a source rectangle to a destination top-left.
+  fn deccra(&mut self, p: &Params) {
+    let src = self.rect_bounds(p, 0);
+    let val = |i: usize| {
+      p.iter()
+        .nth(i)
+        .and_then(|x| x.first().copied())
+        .filter(|&v| v != 0)
+    };
+    let dt = val(5).map_or(0, |v| v as usize - 1);
+    let dl = val(6).map_or(0, |v| v as usize - 1);
+    self.grid.copy_rect(src, dt, dl);
+  }
+
+  /// DECCARA (`CSI Pt ; Pl ; Pb ; Pr ; Ps... $ r`): change attributes in a
+  /// rectangle, leaving the characters in place.
+  fn deccara(&mut self, p: &Params) {
+    let rect = self.rect_bounds(p, 0);
+    let (mut set, mut clear) = (Flags::empty(), Flags::empty());
+    let mut underline = None;
+    for item in p.iter().skip(4) {
+      match item.first().copied().unwrap_or(0) {
+        0 => {
+          set = Flags::empty();
+          clear = Flags::BOLD
+            .union(Flags::BLINK)
+            .union(Flags::REVERSE)
+            .union(Flags::STRIKE);
+          underline = Some(Underline::None);
+        },
+        1 => set.insert(Flags::BOLD),
+        4 => underline = Some(Underline::Single),
+        5 => set.insert(Flags::BLINK),
+        7 => set.insert(Flags::REVERSE),
+        9 => set.insert(Flags::STRIKE),
+        22 => clear.insert(Flags::BOLD),
+        24 => underline = Some(Underline::None),
+        25 => clear.insert(Flags::BLINK),
+        27 => clear.insert(Flags::REVERSE),
+        29 => clear.insert(Flags::STRIKE),
+        _ => {},
+      }
+    }
+    self.grid.change_attrs_rect(rect, set, clear, underline);
   }
 
   /// DECRQM (`CSI [?] Ps $ p`): report whether a mode is set (1), reset (2),

@@ -327,6 +327,48 @@ fn decrqss_reports_settings() {
 }
 
 #[test]
+fn decfra_fills_rectangle() {
+  // Pch=42 ('*'), rows 1..2, cols 2..3 (1-based).
+  let t = term(5, 3, b"\x1b[42;1;2;2;3$x");
+  assert_eq!(t.grid().cell(1, 0).c, '*');
+  assert_eq!(t.grid().cell(2, 1).c, '*');
+  assert_eq!(t.grid().cell(0, 0).c, ' ');
+  assert_eq!(t.grid().cell(3, 0).c, ' ');
+}
+
+#[test]
+fn decera_erases_rectangle() {
+  let mut t = Term::new(5, 2);
+  feed(&mut t, b"AAAAA\r\nAAAAA");
+  feed(&mut t, b"\x1b[1;2;2;4$z"); // rows 1..2, cols 2..4
+  assert_eq!(t.grid().row_text(0), "A   A");
+  assert_eq!(t.grid().row_text(1), "A   A");
+}
+
+#[test]
+fn deccra_copies_rectangle() {
+  let mut t = Term::new(6, 3);
+  feed(&mut t, b"ABCDEF");
+  // Copy source rows 1..1, cols 1..3 ("ABC") to dest row 3, col 4.
+  feed(&mut t, b"\x1b[1;1;1;3;1;3;4$v");
+  assert_eq!(t.grid().cell(3, 2).c, 'A');
+  assert_eq!(t.grid().cell(4, 2).c, 'B');
+  assert_eq!(t.grid().cell(5, 2).c, 'C');
+}
+
+#[test]
+fn deccara_changes_attributes() {
+  use crate::grid::Flags;
+  let mut t = Term::new(5, 2);
+  feed(&mut t, b"abcde");
+  feed(&mut t, b"\x1b[1;1;1;3;1$r"); // bold over row 1, cols 1..3
+  assert!(t.grid().cell(0, 0).flags.contains(Flags::BOLD));
+  assert!(t.grid().cell(2, 0).flags.contains(Flags::BOLD));
+  assert!(!t.grid().cell(3, 0).flags.contains(Flags::BOLD));
+  assert_eq!(t.grid().cell(0, 0).c, 'a'); // characters unchanged
+}
+
+#[test]
 fn csi_s_saves_cursor_without_margins() {
   // With DECLRMM off, `CSI s` is DECSC (save) and `CSI u` restores.
   let mut t = Term::new(10, 5);
