@@ -327,6 +327,16 @@ fn decrqss_reports_settings() {
 }
 
 #[test]
+fn deckpam_sets_application_keypad() {
+  let mut t = Term::new(10, 2);
+  assert!(!t.grid().app_keypad());
+  feed(&mut t, b"\x1b="); // DECKPAM
+  assert!(t.grid().app_keypad());
+  feed(&mut t, b"\x1b>"); // DECKPNM
+  assert!(!t.grid().app_keypad());
+}
+
+#[test]
 fn ind_ri_nel_move_between_lines() {
   let mut t = Term::new(10, 3);
   feed(&mut t, b"\x1b[2;1HX"); // row 1, col 0 -> print X, cursor at col 1

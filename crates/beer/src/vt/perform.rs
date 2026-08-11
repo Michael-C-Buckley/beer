@@ -158,6 +158,9 @@ impl Perform for Term {
       (None, b'7') => self.grid.save_cursor(),
       (None, b'8') => self.grid.restore_cursor(),
       (None, b'H') => self.grid.set_tab(),
+      // DECKPAM / DECKPNM: application vs numeric keypad.
+      (None, b'=') => self.grid.set_app_keypad(true),
+      (None, b'>') => self.grid.set_app_keypad(false),
       // SS2/SS3 shift the next character into G2/G3; LS2/LS3 lock GL there.
       (None, b'N') => self.single_shift = Some(2),
       (None, b'O') => self.single_shift = Some(3),

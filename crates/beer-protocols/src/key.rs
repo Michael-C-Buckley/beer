@@ -6,14 +6,16 @@ use smithay_client_toolkit::seat::keyboard::{KeyEvent, Keysym, Modifiers};
 
 /// Encode a key press into bytes for the PTY in the legacy xterm/VT form, or
 /// `None` if it produces no input. `app_cursor` selects the SS3 cursor-key form
-/// (DECCKM).
+/// (DECCKM); `app_keypad` selects the SS3 keypad form (DECKPAM).
 #[must_use]
 pub fn encode(
   event: &KeyEvent,
   mods: Modifiers,
   app_cursor: bool,
+  app_keypad: bool,
 ) -> Option<Vec<u8>> {
   let seq = match event.keysym {
+    Keysym::KP_Enter if app_keypad => ss3(b'M'),
     Keysym::Return | Keysym::KP_Enter => prefix_alt(b"\r", mods),
     Keysym::BackSpace => prefix_alt(b"\x7f", mods),
     Keysym::Tab if mods.shift => b"\x1b[Z".to_vec(),
@@ -45,6 +47,26 @@ pub fn encode(
     Keysym::F10 => csi_tilde(21, mods),
     Keysym::F11 => csi_tilde(23, mods),
     Keysym::F12 => csi_tilde(24, mods),
+
+    // Application keypad (DECKPAM) sends SS3 sequences for the numeric keypad;
+    // in numeric mode these fall through to their literal characters.
+    Keysym::KP_0 if app_keypad => ss3(b'p'),
+    Keysym::KP_1 if app_keypad => ss3(b'q'),
+    Keysym::KP_2 if app_keypad => ss3(b'r'),
+    Keysym::KP_3 if app_keypad => ss3(b's'),
+    Keysym::KP_4 if app_keypad => ss3(b't'),
+    Keysym::KP_5 if app_keypad => ss3(b'u'),
+    Keysym::KP_6 if app_keypad => ss3(b'v'),
+    Keysym::KP_7 if app_keypad => ss3(b'w'),
+    Keysym::KP_8 if app_keypad => ss3(b'x'),
+    Keysym::KP_9 if app_keypad => ss3(b'y'),
+    Keysym::KP_Decimal if app_keypad => ss3(b'n'),
+    Keysym::KP_Add if app_keypad => ss3(b'k'),
+    Keysym::KP_Subtract if app_keypad => ss3(b'm'),
+    Keysym::KP_Multiply if app_keypad => ss3(b'j'),
+    Keysym::KP_Divide if app_keypad => ss3(b'o'),
+    Keysym::KP_Separator if app_keypad => ss3(b'l'),
+    Keysym::KP_Equal if app_keypad => ss3(b'X'),
 
     // Everything else: the xkb-composed text (which already folds in Ctrl),
     // with Alt sending an ESC prefix (meta).
@@ -350,6 +372,11 @@ fn csi_tilde(n: u8, mods: Modifiers) -> Vec<u8> {
   }
 }
 
+/// An SS3-introduced application-keypad sequence (`ESC O c`).
+fn ss3(final_byte: u8) -> Vec<u8> {
+  vec![0x1B, b'O', final_byte]
+}
+
 fn fkey(final_byte: u8, mods: Modifiers) -> Vec<u8> {
   let m = modifier_param(mods);
   if m == 1 {
@@ -395,7 +422,7 @@ mod tests {
   #[test]
   fn plain_text_passes_through() {
     assert_eq!(
-      encode(&key(Keysym::a, Some("a")), NONE, false),
+      encode(&key(Keysym::a, Some("a")), NONE, false, false),
       Some(b"a".to_vec())
     );
   }
@@ -404,7 +431,7 @@ mod tests {
   fn alt_prefixes_escape() {
     let m = Modifiers { alt: true, ..NONE };
     assert_eq!(
-      encode(&key(Keysym::a, Some("a")), m, false),
+      encode(&key(Keysym::a, Some("a")), m, false, false),
       Some(b"\x1ba".to_vec())
     );
   }
@@ -412,12 +439,35 @@ mod tests {
   #[test]
   fn arrows_respect_application_mode() {
     assert_eq!(
-      encode(&key(Keysym::Up, None), NONE, false),
+      encode(&key(Keysym::Up, None), NONE, false, false),
       Some(b"\x1b[A".to_vec())
     );
     assert_eq!(
-      encode(&key(Keysym::Up, None), NONE, true),
+      encode(&key(Keysym::Up, None), NONE, true, false),
       Some(b"\x1bOA".to_vec())
+    );
+  }
+
+  #[test]
+  fn keypad_respects_application_mode() {
+    // Numeric mode: the keypad digit falls through to its literal character.
+    assert_eq!(
+      encode(&key(Keysym::KP_5, Some("5")), NONE, false, false),
+      Some(b"5".to_vec())
+    );
+    // Application mode: SS3-introduced sequences for digit and operator keys.
+    assert_eq!(
+      encode(&key(Keysym::KP_5, Some("5")), NONE, false, true),
+      Some(b"\x1bOu".to_vec())
+    );
+    assert_eq!(
+      encode(&key(Keysym::KP_Enter, None), NONE, false, true),
+      Some(b"\x1bOM".to_vec())
+    );
+    // KP_Enter is a plain carriage return outside application mode.
+    assert_eq!(
+      encode(&key(Keysym::KP_Enter, None), NONE, false, false),
+      Some(b"\r".to_vec())
     );
   }
 
@@ -425,7 +475,7 @@ mod tests {
   fn modified_arrow_uses_csi_param() {
     let m = Modifiers { ctrl: true, ..NONE };
     assert_eq!(
-      encode(&key(Keysym::Right, None), m, false),
+      encode(&key(Keysym::Right, None), m, false, false),
       Some(b"\x1b[1;5C".to_vec())
     );
   }
@@ -681,19 +731,19 @@ mod tests {
   #[test]
   fn special_keys() {
     assert_eq!(
-      encode(&key(Keysym::Return, None), NONE, false),
+      encode(&key(Keysym::Return, None), NONE, false, false),
       Some(b"\r".to_vec())
     );
     assert_eq!(
-      encode(&key(Keysym::BackSpace, None), NONE, false),
+      encode(&key(Keysym::BackSpace, None), NONE, false, false),
       Some(b"\x7f".to_vec())
     );
     assert_eq!(
-      encode(&key(Keysym::Delete, None), NONE, false),
+      encode(&key(Keysym::Delete, None), NONE, false, false),
       Some(b"\x1b[3~".to_vec())
     );
     assert_eq!(
-      encode(&key(Keysym::F5, None), NONE, false),
+      encode(&key(Keysym::F5, None), NONE, false, false),
       Some(b"\x1b[15~".to_vec())
     );
   }

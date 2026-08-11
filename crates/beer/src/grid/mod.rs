@@ -219,6 +219,9 @@ pub struct Grid {
   cursor_visible:  bool,
   /// Application cursor-keys mode (DECCKM): arrows send SS3 instead of CSI.
   app_cursor:      bool,
+  /// Application keypad mode (DECKPAM): the numeric keypad sends SS3
+  /// sequences.
+  app_keypad:      bool,
   /// Cursor colour from OSC 12; `None` follows the cell under the cursor.
   cursor_color:    Option<(u8, u8, u8)>,
   /// Active mouse selection as (anchor, head) in absolute coordinates.
@@ -324,6 +327,7 @@ impl Grid {
       cursor_visible: true,
       cursor_color: None,
       app_cursor: false,
+      app_keypad: false,
       selection: None,
       selection_block: false,
       bracketed_paste: false,
@@ -636,6 +640,14 @@ impl Grid {
 
   pub const fn app_cursor(&self) -> bool {
     self.app_cursor
+  }
+
+  pub const fn set_app_keypad(&mut self, on: bool) {
+    self.app_keypad = on;
+  }
+
+  pub const fn app_keypad(&self) -> bool {
+    self.app_keypad
   }
 
   /// Place a printable character at the cursor, honouring width and autowrap.
@@ -1348,6 +1360,7 @@ impl Grid {
     self.cursor_visible = true;
     self.cursor_color = None;
     self.app_cursor = false;
+    self.app_keypad = false;
     self.bracketed_paste = false;
     self.sync = false;
     self.focus_events = false;

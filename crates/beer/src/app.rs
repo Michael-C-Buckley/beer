@@ -969,14 +969,17 @@ impl App {
       self.send_to_shell(idx, &bytes);
       return;
     }
-    let (app_cursor, kitty) =
-      self.windows[idx].session.as_ref().map_or((false, 0), |s| {
-        (s.term.grid().app_cursor(), s.term.grid().kitty_flags())
+    let (app_cursor, app_keypad, kitty) = self.windows[idx]
+      .session
+      .as_ref()
+      .map_or((false, false, 0), |s| {
+        let g = s.term.grid();
+        (g.app_cursor(), g.app_keypad(), g.kitty_flags())
       });
     let bytes = if kitty != 0 {
       key::kitty_encode(event, self.modifiers, kitty, kind, app_cursor)
     } else {
-      key::encode(event, self.modifiers, app_cursor)
+      key::encode(event, self.modifiers, app_cursor, app_keypad)
     };
     if let Some(bytes) = bytes {
       self.send_to_shell(idx, &bytes);
