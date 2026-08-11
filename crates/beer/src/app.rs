@@ -448,6 +448,28 @@ fn font_options(main: &Main, px: u32, scale120: u32) -> FontOptions<'_> {
   options
 }
 
+/// Filter pasted text before it reaches the shell: normalize newlines to CR
+/// (collapsing CRLF) and drop control characters (C0 except tab/newline, DEL,
+/// and C1) so a paste cannot inject an escape sequence. The bytes are decoded
+/// as UTF-8 first, so multibyte text survives and a stray 8-bit control byte
+/// becomes a replacement character rather than reaching the parser as a C1.
+fn sanitize_paste(data: &[u8]) -> Vec<u8> {
+  let text = String::from_utf8_lossy(data);
+  let mut clean = String::with_capacity(text.len());
+  let mut prev_cr = false;
+  for c in text.chars() {
+    match c {
+      '\n' if prev_cr => {},
+      '\n' => clean.push('\r'),
+      '\t' | '\r' => clean.push(c),
+      c if c.is_control() => {},
+      c => clean.push(c),
+    }
+    prev_cr = c == '\r';
+  }
+  clean.into_bytes()
+}
+
 /// Columns/rows for a physical size, metrics, and padding.
 #[expect(
   clippy::cast_possible_truncation,
@@ -1860,20 +1882,7 @@ impl App {
     session.term.scroll_to_bottom();
     win.needs_draw = true;
     let bracketed = session.term.grid().bracketed_paste();
-    let mut clean: Vec<u8> = Vec::with_capacity(data.len());
-    let mut prev = 0u8;
-    for &b in data {
-      match b {
-        // Newlines become carriage returns, but a CRLF pair collapses to one
-        // CR (the CR was already pushed) so a Windows-style paste does not
-        // submit a blank line after every line.
-        b'\n' if prev == b'\r' => {},
-        b'\n' => clean.push(b'\r'),
-        b'\t' | b'\r' | 0x20..=0xFF => clean.push(b),
-        _ => {},
-      }
-      prev = b;
-    }
+    let clean = sanitize_paste(data);
     let fd = session.pty.master();
     if bracketed {
       let _ = write_all(fd, b"\x1b[200~");
@@ -2495,5 +2504,34 @@ impl WindowApp for App {
     if let Some(idx) = self.win_index(id) {
       self.paint(ctx, idx);
     }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::sanitize_paste;
+
+  #[test]
+  fn paste_normalizes_newlines() {
+    assert_eq!(sanitize_paste(b"a\nb"), b"a\rb");
+    // A CRLF pair collapses to a single carriage return.
+    assert_eq!(sanitize_paste(b"a\r\nb"), b"a\rb");
+    assert_eq!(sanitize_paste(b"a\tb"), b"a\tb");
+  }
+
+  #[test]
+  fn paste_strips_control_injection() {
+    // ESC, DEL, and a C1 control (U+009B, the 8-bit CSI) are all removed, so a
+    // paste cannot break out of bracketed paste or inject a control sequence.
+    assert_eq!(sanitize_paste(b"a\x1b[201~b"), b"a[201~b");
+    assert_eq!(sanitize_paste(b"a\x7fb"), b"ab");
+    assert_eq!(sanitize_paste("a\u{009b}b".as_bytes()), b"ab");
+  }
+
+  #[test]
+  fn paste_preserves_unicode() {
+    // Multibyte text whose bytes fall in 0x80-0x9f must survive intact.
+    let s = "héllo — wörld";
+    assert_eq!(sanitize_paste(s.as_bytes()), s.as_bytes());
   }
 }
