@@ -103,6 +103,11 @@ channel).
 	start the screensaver (idle-inhibit-v1). A backgrounded window stops
 	inhibiting. Default _false_.
 
+*confirm-close* = _bool_
+	Prompt for _y_/_n_ confirmation before closing a window whose terminal has
+	a foreground job running (the foreground process group is not the shell).
+	Default _false_.
+
 # [colors]
 
 *foreground* = _color_, *background* = _color_

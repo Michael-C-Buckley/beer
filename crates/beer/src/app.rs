@@ -165,6 +165,8 @@ struct WinState {
   sync_token:          Option<u64>,
   // Input / mode state.
   selecting:           bool,
+  /// Awaiting y/n confirmation to close a window with a running job.
+  confirm_close:       bool,
   /// Whether the pointer is currently hidden because the user is typing.
   pointer_hidden:      bool,
   hovered_link:        Option<NonZeroU16>,
@@ -224,6 +226,7 @@ impl WinState {
       flash_token: None,
       sync_token: None,
       selecting: false,
+      confirm_close: false,
       pointer_hidden: false,
       hovered_link: None,
       press_cell: None,
@@ -890,18 +893,19 @@ impl App {
     let flashed = win.flashing.then(|| session.term.theme().inverted());
     let theme = flashed.as_ref().unwrap_or_else(|| session.term.theme());
     let rows = grid.rows();
-    let bar_text = win.unicode_input.as_ref().map_or_else(
-      || {
-        win.searching.then(|| {
-          let (n, total) = grid.search_count();
-          format!(
-            "search: {}  [{n}/{total}]",
-            grid.search_query().unwrap_or("")
-          )
-        })
-      },
-      |hex| Some(format!("unicode: U+{}", hex.to_uppercase())),
-    );
+    let bar_text = if win.confirm_close {
+      Some("close terminal with a running job? (y/n)".to_string())
+    } else if let Some(hex) = win.unicode_input.as_ref() {
+      Some(format!("unicode: U+{}", hex.to_uppercase()))
+    } else if win.searching {
+      let (n, total) = grid.search_count();
+      Some(format!(
+        "search: {}  [{n}/{total}]",
+        grid.search_query().unwrap_or("")
+      ))
+    } else {
+      None
+    };
     let preedit = if !win.preedit.is_empty() && grid.view_at_bottom() {
       let (cx, cy) = grid.cursor();
       (cy < rows).then_some((cy, cx, win.preedit.as_str()))
@@ -1022,6 +1026,10 @@ impl App {
       KeyKind::Repeat
     };
     self.hide_pointer(ctx, idx);
+    if self.windows[idx].confirm_close {
+      self.confirm_key(ctx, idx, event);
+      return;
+    }
     if self.windows[idx].unicode_input.is_some() {
       self.unicode_key(idx, event);
       return;
@@ -1143,6 +1151,29 @@ impl App {
           self.windows[idx].needs_draw = true;
         }
       },
+    }
+  }
+
+  /// Handle a key while the close-confirmation prompt is up: `y` closes, `n`
+  /// or Escape cancels.
+  fn confirm_key(
+    &mut self,
+    ctx: &mut dyn WindowCtx,
+    idx: usize,
+    event: &KeyEvent,
+  ) {
+    use beer_window::Keysym;
+    let id = self.windows[idx].id;
+    match event.keysym {
+      Keysym::y | Keysym::Y => {
+        self.windows[idx].confirm_close = false;
+        self.close(ctx, id);
+      },
+      Keysym::n | Keysym::N | Keysym::Escape => {
+        self.windows[idx].confirm_close = false;
+        self.windows[idx].needs_draw = true;
+      },
+      _ => {},
     }
   }
 
@@ -2410,6 +2441,18 @@ impl WindowApp for App {
   }
 
   fn on_close(&mut self, ctx: &mut dyn WindowCtx, id: WindowId) {
+    if let Some(idx) = self.win_index(id)
+      && self.config.main.confirm_close
+      && self.windows[idx]
+        .session
+        .as_ref()
+        .is_some_and(|s| s.pty.has_foreground_job())
+    {
+      self.windows[idx].confirm_close = true;
+      self.windows[idx].needs_draw = true;
+      self.flush_redraw(ctx);
+      return;
+    }
     self.close(ctx, id);
     self.flush_redraw(ctx);
   }

@@ -141,6 +141,16 @@ impl Pty {
   pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
     self.child.try_wait()
   }
+
+  /// Whether a foreground process other than the login shell is running, i.e.
+  /// the terminal's foreground process group differs from the shell's own. A
+  /// failed query reports no job so a close is never blocked spuriously.
+  pub fn has_foreground_job(&self) -> bool {
+    rustix::termios::tcgetpgrp(self.master.as_fd())
+      .ok()
+      .and_then(|pgrp| u32::try_from(pgrp.as_raw_nonzero().get()).ok())
+      .is_some_and(|pgrp| pgrp != self.child.id())
+  }
 }
 
 fn set_winsize(

@@ -264,6 +264,9 @@ pub struct Main {
   /// Keep a `--server` process alive after its last window closes. Off makes
   /// the server exit with its last window, like a standalone process.
   pub server_resident:    bool,
+  /// Prompt for confirmation before closing a window that still has a
+  /// foreground job running.
+  pub confirm_close:      bool,
 }
 
 impl Default for Main {
@@ -295,6 +298,7 @@ impl Default for Main {
       word_delimiters:    None,
       idle_inhibit:       false,
       server_resident:    true,
+      confirm_close:      false,
     }
   }
 }
