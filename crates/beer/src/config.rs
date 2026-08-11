@@ -242,6 +242,13 @@ pub struct Main {
   pub subpixel:           Subpixel,
   /// `TERM` value exported to the child shell.
   pub term:               String,
+  /// Wayland `app_id` for the toplevel, used by the compositor for grouping,
+  /// icons, and rules.
+  pub app_id:             String,
+  /// Initial window title, before any OSC 0/2 title escape overrides it.
+  pub title:              String,
+  /// Open the window maximized.
+  pub maximized:          bool,
   /// Initial size in character cells.
   pub initial_cols:       u16,
   pub initial_rows:       u16,
@@ -278,6 +285,9 @@ impl Default for Main {
       thicken:            false,
       subpixel:           Subpixel::None,
       term:               "beer".to_string(),
+      app_id:             "dev.notashelf.beer".to_string(),
+      title:              "beer".to_string(),
+      maximized:          false,
       initial_cols:       80,
       initial_rows:       24,
       pad_x:              2,

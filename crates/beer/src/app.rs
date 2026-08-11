@@ -36,6 +36,7 @@ use beer_window::{
   TouchEvent,
   WindowCtx,
   WindowId,
+  WindowOptions,
 };
 
 use crate::{
@@ -2168,7 +2169,11 @@ impl App {
     env: Vec<(String, String)>,
     client: Option<UnixStream>,
   ) -> WindowId {
-    let id = ctx.open_window();
+    let id = ctx.open_window(&WindowOptions {
+      app_id:    self.config.main.app_id.clone(),
+      title:     self.config.main.title.clone(),
+      maximized: self.config.main.maximized,
+    });
     let pty_token = self.alloc_token();
     self
       .windows

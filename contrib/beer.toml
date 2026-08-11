@@ -23,6 +23,9 @@
 # adjust-baseline    = 0                      # pixels the baseline shifts down within the cell
 # thicken            = false                  # thicken every glyph by one coverage pixel
 # idle-inhibit       = false                  # hold off screen blanking while focused
+# app-id             = "dev.notashelf.beer"   # Wayland app_id for the toplevel
+# title              = "beer"                  # initial title, until OSC 0/2 sets one
+# maximized          = false                  # open the window maximized
 # initial-cols       = 80
 # initial-rows       = 24
 # pad-x              = 2                      # inner padding, pixels

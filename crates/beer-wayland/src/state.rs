@@ -114,6 +114,8 @@ pub struct PlatformWindow {
   pub fractional_scale:     Option<WpFractionalScaleV1>,
   /// Compositor's preferred scale in 120ths (120 = 1.0, 180 = 1.5).
   pub scale120:             u32,
+  /// Wayland `app_id`, kept for the activation (urgency) request.
+  pub app_id:               String,
   pub title:                Option<String>,
   pub fullscreen:           bool,
   pub width:                u32,

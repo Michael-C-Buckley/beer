@@ -74,8 +74,20 @@ channel).
 *term* = _string_
 	The _TERM_ value exported to the child shell. Default _beer_.
 
+*app-id* = _string_
+	Wayland _app_id_ for the toplevel, used by the compositor for grouping,
+	icons, and window rules. Default _dev.notashelf.beer_.
+
+*title* = _string_
+	Initial window title, until an application sets one via OSC 0/2. Default
+	_beer_.
+
+*maximized* = _bool_
+	Open the window maximized. Default _false_.
+
 *initial-cols* = _integer_, *initial-rows* = _integer_
-	Initial window size in character cells. Default _80_ by _24_.
+	Initial window size in character cells. Default _80_ by _24_. A tiling
+	compositor may override the requested size.
 
 *pad-x* = _integer_, *pad-y* = _integer_
 	Inner padding in pixels between the window edge and the cell grid.

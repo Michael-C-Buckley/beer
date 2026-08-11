@@ -10,7 +10,7 @@ use std::{
   time::Duration,
 };
 
-use beer_window::{CursorIcon, Frame, WindowCtx, WindowId};
+use beer_window::{CursorIcon, Frame, WindowCtx, WindowId, WindowOptions};
 use calloop::{
   Interest,
   Mode,
@@ -150,7 +150,7 @@ impl WindowCtx for Platform {
       && let Some(win) = self.win(id)
     {
       let data = RequestData {
-        app_id:          Some("dev.notashelf.beer".to_owned()),
+        app_id:          Some(win.app_id.clone()),
         seat_and_serial: None,
         surface:         Some(win.window.wl_surface().clone()),
         udata:           (),
@@ -251,7 +251,7 @@ impl WindowCtx for Platform {
     }
   }
 
-  fn open_window(&mut self) -> WindowId {
+  fn open_window(&mut self, opts: &WindowOptions) -> WindowId {
     let id = self.alloc_window_id();
     let surface = self.compositor.create_surface(&self.qh);
     let window = self.xdg_shell.create_window(
@@ -259,9 +259,12 @@ impl WindowCtx for Platform {
       WindowDecorations::RequestServer,
       &self.qh,
     );
-    window.set_title("beer");
-    window.set_app_id("dev.notashelf.beer");
+    window.set_title(&opts.title);
+    window.set_app_id(&opts.app_id);
     window.set_min_size(Some((1, 1)));
+    if opts.maximized {
+      window.set_maximized();
+    }
 
     let viewport = self
       .viewporter
@@ -300,6 +303,7 @@ impl WindowCtx for Platform {
       viewport,
       fractional_scale,
       scale120: 120,
+      app_id: opts.app_id.clone(),
       title: None,
       fullscreen: false,
       width: 1,

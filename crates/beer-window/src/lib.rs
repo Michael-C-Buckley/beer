@@ -27,6 +27,17 @@ pub use smithay_client_toolkit::seat::keyboard::{KeyEvent, Keysym, Modifiers};
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct WindowId(pub u64);
 
+/// Initial presentation for a new toplevel, chosen by the app from config.
+#[derive(Clone, Debug)]
+pub struct WindowOptions {
+  /// Wayland `app_id`.
+  pub app_id:    String,
+  /// Initial title, before any title escape overrides it.
+  pub title:     String,
+  /// Whether to open maximized.
+  pub maximized: bool,
+}
+
 /// A pointer button, normalized across platforms. `Other` carries a raw code
 /// for bindings that target extra buttons.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -246,8 +257,9 @@ pub trait WindowCtx {
   fn request_paste(&mut self, id: WindowId, primary: bool);
 
   /// Create a new toplevel and return its id; the app owns the session behind
-  /// it and spawns the shell on the first configure.
-  fn open_window(&mut self) -> WindowId;
+  /// it and spawns the shell on the first configure. `opts` carries the initial
+  /// app-id, title, and maximized state.
+  fn open_window(&mut self, opts: &WindowOptions) -> WindowId;
   /// Request that a window be closed.
   fn close_window(&mut self, id: WindowId);
 
