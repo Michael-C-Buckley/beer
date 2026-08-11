@@ -340,9 +340,11 @@ impl Perform for Term {
   }
 
   fn hook(&mut self, _: &Params, intermediates: &[u8], _: bool, action: char) {
-    // XTGETTCAP arrives as `DCS + q <names> ST`.
+    // XTGETTCAP arrives as `DCS + q <names> ST`, DECRQSS as `DCS $ q <req> ST`.
     if action == 'q' && intermediates == [b'+'] {
       self.xtgettcap = Some(Vec::new());
+    } else if action == 'q' && intermediates == [b'$'] {
+      self.decrqss = Some(Vec::new());
     }
   }
 
@@ -350,11 +352,17 @@ impl Perform for Term {
     if let Some(buf) = self.xtgettcap.as_mut() {
       buf.push(byte);
     }
+    if let Some(buf) = self.decrqss.as_mut() {
+      buf.push(byte);
+    }
   }
 
   fn unhook(&mut self) {
     if let Some(payload) = self.xtgettcap.take() {
       self.answer_xtgettcap(&payload);
+    }
+    if let Some(payload) = self.decrqss.take() {
+      self.answer_decrqss(&payload);
     }
   }
 }

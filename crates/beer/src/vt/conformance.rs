@@ -304,6 +304,29 @@ fn alt_screen_swaps_and_restores() {
 }
 
 #[test]
+fn decrqss_reports_settings() {
+  // DECSCUSR: set a steady underline cursor (code 4), then query `SP q`.
+  let mut t = Term::new(20, 5);
+  feed(&mut t, b"\x1b[4 q");
+  feed(&mut t, b"\x1bP$q q\x1b\\");
+  assert_eq!(t.take_response(), b"\x1bP1$r4 q\x1b\\");
+
+  // DECSTBM: a 2..4 region (1-based) reports as `2;4r`.
+  feed(&mut t, b"\x1b[2;4r");
+  feed(&mut t, b"\x1bP$qr\x1b\\");
+  assert_eq!(t.take_response(), b"\x1bP1$r2;4r\x1b\\");
+
+  // SGR: bold + indexed foreground round-trips through a `m` request.
+  feed(&mut t, b"\x1b[1;31m");
+  feed(&mut t, b"\x1bP$qm\x1b\\");
+  assert_eq!(t.take_response(), b"\x1bP1$r0;1;31m\x1b\\");
+
+  // An unknown request is rejected with an empty response.
+  feed(&mut t, b"\x1bP$qZ\x1b\\");
+  assert_eq!(t.take_response(), b"\x1bP0$r\x1b\\");
+}
+
+#[test]
 fn ind_ri_nel_move_between_lines() {
   let mut t = Term::new(10, 3);
   feed(&mut t, b"\x1b[2;1HX"); // row 1, col 0 -> print X, cursor at col 1

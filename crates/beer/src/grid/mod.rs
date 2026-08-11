@@ -545,6 +545,26 @@ impl Grid {
     &mut self.pen
   }
 
+  /// The current pen, for reporting active SGR attributes (DECRQSS).
+  pub const fn pen(&self) -> &Cell {
+    &self.pen
+  }
+
+  /// The scroll region as inclusive 0-based `(top, bottom)` rows.
+  pub const fn scroll_region(&self) -> (usize, usize) {
+    (self.top, self.bottom)
+  }
+
+  /// The DECSCUSR code (1-6) for the current cursor shape and blink state.
+  pub const fn cursor_style_code(&self) -> u16 {
+    let base = match self.cursor_shape {
+      CursorShape::Block => 1,
+      CursorShape::Underline => 3,
+      CursorShape::Beam => 5,
+    };
+    if self.cursor_blink { base } else { base + 1 }
+  }
+
   pub fn reset_pen(&mut self) {
     self.pen = Cell::default();
   }

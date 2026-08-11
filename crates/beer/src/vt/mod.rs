@@ -79,6 +79,68 @@ const fn set_reset(on: bool) -> u8 {
   if on { 1 } else { 2 }
 }
 
+/// Serialize a pen into the SGR parameter list that would recreate it, for a
+/// DECRQSS `m` reply. Begins with `0` (reset) so the set attributes follow a
+/// known baseline.
+fn sgr_report(cell: &Cell) -> String {
+  let mut p: Vec<String> = vec!["0".to_string()];
+  let f = cell.flags;
+  if f.contains(Flags::BOLD) {
+    p.push("1".into());
+  }
+  if f.contains(Flags::DIM) {
+    p.push("2".into());
+  }
+  if f.contains(Flags::ITALIC) {
+    p.push("3".into());
+  }
+  match cell.underline {
+    Underline::None => {},
+    Underline::Single => p.push("4".into()),
+    Underline::Double => p.push("21".into()),
+    Underline::Curly => p.push("4:3".into()),
+    Underline::Dotted => p.push("4:4".into()),
+    Underline::Dashed => p.push("4:5".into()),
+  }
+  if f.contains(Flags::BLINK) {
+    p.push("5".into());
+  }
+  if f.contains(Flags::REVERSE) {
+    p.push("7".into());
+  }
+  if f.contains(Flags::HIDDEN) {
+    p.push("8".into());
+  }
+  if f.contains(Flags::STRIKE) {
+    p.push("9".into());
+  }
+  if f.contains(Flags::OVERLINE) {
+    p.push("53".into());
+  }
+  push_color(&mut p, cell.fg, 30, 38);
+  push_color(&mut p, cell.bg, 40, 48);
+  if let Color::Indexed(i) = cell.underline_color {
+    p.push(format!("58;5;{i}"));
+  } else if let Color::Rgb(r, g, b) = cell.underline_color {
+    p.push(format!("58;2;{r};{g};{b}"));
+  }
+  p.join(";")
+}
+
+/// Append the SGR parameter for `color` to `p`. `base` is the 8-colour set
+/// code (30 fg / 40 bg); `ext` is the extended-colour code (38 / 48).
+fn push_color(p: &mut Vec<String>, color: Color, base: u16, ext: u16) {
+  match color {
+    Color::Default => {},
+    Color::Indexed(i) if i < 8 => p.push((base + u16::from(i)).to_string()),
+    Color::Indexed(i) if i < 16 => {
+      p.push((base + 60 + u16::from(i - 8)).to_string());
+    },
+    Color::Indexed(i) => p.push(format!("{ext};5;{i}")),
+    Color::Rgb(r, g, b) => p.push(format!("{ext};2;{r};{g};{b}")),
+  }
+}
+
 /// Parse an OSC colour spec into an [`Rgb`].
 fn parse_spec(spec: &[u8]) -> Option<Rgb> {
   str::from_utf8(spec).ok().and_then(parse_color)
@@ -120,6 +182,8 @@ pub struct Term {
   single_shift:  Option<u8>,
   /// Accumulated payload of an in-progress `DCS + q` (XTGETTCAP) query.
   xtgettcap:     Option<Vec<u8>>,
+  /// Accumulated payload of an in-progress `DCS $ q` (DECRQSS) query.
+  decrqss:       Option<Vec<u8>>,
   /// Pending OSC 52 clipboard requests, drained by the front-end.
   clipboard_ops: Vec<ClipboardOp>,
   /// The active colour scheme (seeded from config, mutated by OSC escapes).
@@ -183,6 +247,7 @@ impl Term {
       gl:            0,
       single_shift:  None,
       xtgettcap:     None,
+      decrqss:       None,
       clipboard_ops: Vec::new(),
       theme:         Theme::default(),
       bell:          false,
@@ -414,6 +479,28 @@ impl Term {
         self.response.extend_from_slice(name_hex);
         self.response.extend_from_slice(b"\x1b\\");
       }
+    }
+  }
+
+  /// DECRQSS (`DCS $ q <request> ST`): report a setting's current value. The
+  /// request names a control by its intermediate and final bytes; a valid one
+  /// is answered with `DCS 1 $ r <setting> ST`, an unknown one with `DCS 0 $
+  /// r`.
+  fn answer_decrqss(&mut self, request: &[u8]) {
+    let body = match request {
+      b" q" => Some(format!("{} q", self.grid.cursor_style_code())),
+      b"r" => {
+        let (top, bottom) = self.grid.scroll_region();
+        Some(format!("{};{}r", top + 1, bottom + 1))
+      },
+      b"m" => Some(format!("{}m", sgr_report(self.grid.pen()))),
+      _ => None,
+    };
+    match body {
+      Some(body) => {
+        let _ = write!(self.response, "\x1bP1$r{body}\x1b\\");
+      },
+      None => self.response.extend_from_slice(b"\x1bP0$r\x1b\\"),
     }
   }
 
