@@ -111,6 +111,25 @@ fn ich_dch_ech_edit_in_line() {
 }
 
 #[test]
+fn ris_resets_screen_and_modes() {
+  let mut t = Term::new(10, 3);
+  feed(&mut t, b"\x1b[?25l"); // hide cursor
+  feed(&mut t, b"\x1b[4h"); // insert mode
+  feed(&mut t, b"\x1b[3g"); // clear all tab stops
+  feed(&mut t, b"\x1b[?1049h"); // alternate screen
+  feed(&mut t, b"hello");
+  feed(&mut t, b"\x1bc"); // RIS
+  assert!(t.grid().cursor_visible());
+  assert!(!t.grid().insert());
+  assert!(!t.grid().alt_active());
+  assert_eq!(t.grid().cursor(), (0, 0));
+  assert_eq!(t.grid().row_text(0), "");
+  // Default tab stops are restored: HT from home lands on column 8.
+  feed(&mut t, b"\t");
+  assert_eq!(t.grid().cursor().0, 8);
+}
+
+#[test]
 fn decaln_fills_screen_with_e() {
   let t = term(4, 2, b"\x1b[2;3H\x1b#8");
   assert_eq!(t.grid().row_text(0), "EEEE");

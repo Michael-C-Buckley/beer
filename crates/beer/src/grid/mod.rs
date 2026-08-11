@@ -1311,6 +1311,33 @@ impl Grid {
     }
   }
 
+  /// RIS (`ESC c`): return to the main screen and reset the grid-side modes to
+  /// their power-on defaults, then clear the screen. Scrollback is kept.
+  pub fn hard_reset(&mut self) {
+    self.leave_alt_screen();
+    self.reset_pen();
+    self.top = 0;
+    self.bottom = self.rows - 1;
+    self.autowrap = true;
+    self.origin = false;
+    self.insert = false;
+    self.wrap_pending = false;
+    self.tabs = default_tabs(self.cols);
+    self.cursor = Cursor::default();
+    self.saved = Cursor::default();
+    self.cursor_visible = true;
+    self.cursor_color = None;
+    self.app_cursor = false;
+    self.bracketed_paste = false;
+    self.sync = false;
+    self.focus_events = false;
+    self.mouse_protocol = MouseProtocol::Off;
+    self.mouse_encoding = MouseEncoding::X10;
+    self.kitty_current = 0;
+    self.kitty_stack.clear();
+    self.erase_display(2);
+  }
+
   /// Scroll the viewport by `delta` lines: positive = back into history,
   /// negative = toward the live screen. No-op on the alternate screen.
   #[expect(

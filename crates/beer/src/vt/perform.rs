@@ -162,12 +162,7 @@ impl Perform for Term {
       (None, b'8') => self.grid.restore_cursor(),
       (None, b'H') => self.grid.set_tab(),
       (None, b'c') => {
-        self.grid.reset_pen();
-        self.grid.set_scroll_region(0, self.grid.rows() - 1);
-        self.grid.set_autowrap(true);
-        self.grid.set_origin(false);
-        self.grid.erase_display(2);
-        self.grid.move_to(0, 0);
+        self.grid.hard_reset();
         self.g0 = Charset::Ascii;
         self.g1 = Charset::Ascii;
         self.shift_out = false;
