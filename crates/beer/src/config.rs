@@ -20,6 +20,7 @@ pub struct Config {
   pub colors:            Colors,
   pub cursor:            Cursor,
   pub scrollback:        Scrollback,
+  pub search:            Search,
   pub bell:              Bell,
   pub mouse:             Mouse,
   pub shell_integration: ShellIntegration,
@@ -300,6 +301,14 @@ impl Default for Scrollback {
   fn default() -> Self {
     Self { lines: 10_000 }
   }
+}
+
+/// `[search]`: scrollback search behaviour.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct Search {
+  /// Interpret the query as a regular expression instead of literal text.
+  pub regex: bool,
 }
 
 impl Config {

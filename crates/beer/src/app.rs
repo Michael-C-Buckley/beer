@@ -612,6 +612,7 @@ impl App {
     let grid = term.grid_mut();
     grid.set_word_delimiters(self.config.main.word_delimiters.clone());
     grid.set_scrollback_cap(self.config.scrollback.lines);
+    grid.set_search_regex(self.config.search.regex);
     if let Some(shape) = cursor_shape_from(self.config.cursor.style.as_deref())
     {
       grid.set_cursor_shape(shape);
@@ -2198,6 +2199,7 @@ impl App {
       let grid = session.term.grid_mut();
       grid.set_word_delimiters(new.main.word_delimiters.clone());
       grid.set_scrollback_cap(new.scrollback.lines);
+      grid.set_search_regex(new.search.regex);
       if let Some(shape) = cursor_shape_from(new.cursor.style.as_deref()) {
         grid.set_cursor_shape(shape);
       }

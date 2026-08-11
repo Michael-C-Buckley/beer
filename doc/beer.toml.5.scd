@@ -138,6 +138,13 @@ channel).
 *lines* = _integer_
 	Lines of history retained for the main screen. Default _10000_.
 
+# [search]
+
+*regex* = _bool_
+	Interpret the scrollback-search query as a regular expression instead of
+	literal text. Smart case still applies: a query with an uppercase letter
+	searches case-sensitively. Default _false_.
+
 # [bell]
 
 *visual* = _bool_

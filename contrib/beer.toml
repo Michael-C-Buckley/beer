@@ -53,6 +53,9 @@
 # [scrollback]
 # lines = 10000 # history retained on the main screen
 
+# [search]
+# regex = false # interpret the search query as a regular expression
+
 # [bell]
 # command = [  ]  # e.g. ["paplay", "/usr/share/sounds/bell.oga"]
 # urgent  = false # request attention when unfocused

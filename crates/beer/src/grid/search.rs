@@ -82,6 +82,9 @@ impl Grid {
   }
 
   fn compute_matches(&self, query: &str) -> Vec<Match> {
+    if self.search_regex {
+      return self.compute_matches_regex(query);
+    }
     // Smart case: an uppercase letter in the query forces case sensitivity.
     let sensitive = query.chars().any(|c| c.is_ascii_uppercase());
     let fold = |c: char| {
@@ -107,6 +110,43 @@ impl Grid {
           i += needle.len();
         } else {
           i += 1;
+        }
+      }
+    }
+    matches
+  }
+
+  /// Regex variant of [`Self::compute_matches`]: compile the query (smart-case
+  /// via a case-insensitive flag when it has no uppercase) and record each
+  /// non-empty match per row. An invalid pattern yields no matches.
+  fn compute_matches_regex(&self, query: &str) -> Vec<Match> {
+    let sensitive = query.chars().any(|c| c.is_ascii_uppercase());
+    let Ok(re) = regex::RegexBuilder::new(query)
+      .case_insensitive(!sensitive)
+      .build()
+    else {
+      return Vec::new();
+    };
+    let total = self.scrollback.len() + self.rows;
+    let mut matches = Vec::new();
+    for row in 0..total {
+      let text: String = self.abs_row(row).iter().map(|cell| cell.c).collect();
+      // Map each character's start byte to its column, plus the end sentinel.
+      let mut col_at = vec![0usize; text.len() + 1];
+      let mut col = 0;
+      for (byte, _) in text.char_indices() {
+        col_at[byte] = col;
+        col += 1;
+      }
+      col_at[text.len()] = col;
+      for m in re.find_iter(&text) {
+        if m.end() > m.start() {
+          let (lo, hi) = (col_at[m.start()], col_at[m.end()]);
+          matches.push(Match {
+            row,
+            col: lo,
+            len: hi - lo,
+          });
         }
       }
     }

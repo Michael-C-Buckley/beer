@@ -81,6 +81,7 @@ dependencies = [
  "libc",
  "lru",
  "pound",
+ "regex",
  "rustix",
  "serde",
  "serde_ignored",

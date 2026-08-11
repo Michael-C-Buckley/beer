@@ -258,6 +258,9 @@ pub struct Grid {
   focus_events:    bool,
   /// Active incremental scrollback search, if any.
   search:          Option<SearchState>,
+  /// Interpret search queries as regular expressions (config `[search]
+  /// regex`).
+  search_regex:    bool,
   /// Characters that break a word for double-click selection.
   word_delimiters: String,
   /// History retention cap for the main screen.
@@ -355,6 +358,7 @@ impl Grid {
       mouse_encoding: MouseEncoding::X10,
       focus_events: false,
       search: None,
+      search_regex: false,
       word_delimiters: WORD_DELIMITERS.to_string(),
       scrollback_cap: SCROLLBACK_CAP,
       last_base: None,
@@ -400,6 +404,11 @@ impl Grid {
     if let Some(d) = delims {
       self.word_delimiters = d;
     }
+  }
+
+  /// Choose whether search queries are regular expressions or literal text.
+  pub const fn set_search_regex(&mut self, on: bool) {
+    self.search_regex = on;
   }
 
   /// Set the scrollback retention cap, trimming history if it shrank.
@@ -2194,6 +2203,28 @@ mod tests {
     assert_eq!(g.search_query(), Some("zzz"));
     g.clear_search();
     assert_eq!(g.search_query(), None);
+  }
+
+  #[test]
+  fn regex_search_matches_patterns() {
+    let mut g = Grid::new(16, 2);
+    g.set_search_regex(true);
+    for line in ["alpha1", "beta22", "gamma3"] {
+      for c in line.chars() {
+        g.print(c);
+      }
+      g.carriage_return();
+      g.line_feed();
+    }
+    // A digit class matches the run of digits on each line.
+    g.set_search("[0-9]+");
+    assert_eq!(g.search_count(), (3, 3));
+    // "22" on row 1 spans two columns; "alpha1" digit is a single column.
+    assert_eq!(g.search_spans_on(1), vec![(4, 5, false)]);
+    assert_eq!(g.search_spans_on(0), vec![(5, 5, false)]);
+    // An invalid pattern yields no matches rather than panicking.
+    g.set_search("[unterminated");
+    assert_eq!(g.search_count(), (0, 0));
   }
 
   #[test]
