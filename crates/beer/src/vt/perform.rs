@@ -84,6 +84,7 @@ impl Perform for Term {
       'L' => self.grid.insert_lines(n(params, 0, 1)),
       'M' => self.grid.delete_lines(n(params, 0, 1)),
       'X' => self.grid.erase_chars(n(params, 0, 1)),
+      'b' => self.grid.repeat(n(params, 0, 1)),
       'S' => self.grid.scroll_up(n(params, 0, 1)),
       'T' => self.grid.scroll_down(n(params, 0, 1)),
       'm' => self.sgr(params),

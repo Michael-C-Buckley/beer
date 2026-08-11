@@ -246,6 +246,8 @@ pub struct Grid {
   /// Position of the last printed base cell, so a following zero-width
   /// combining mark can attach to it.
   last_base:       Option<(usize, usize)>,
+  /// Last printed base character, repeated by REP (`CSI b`).
+  last_char:       Option<char>,
   /// OSC 8 hyperlink URIs; a cell's `link` is a 1-based index into this.
   links:           Vec<Box<str>>,
   /// Active kitty-keyboard progressive-enhancement flags (0 = legacy mode).
@@ -333,6 +335,7 @@ impl Grid {
       word_delimiters: WORD_DELIMITERS.to_string(),
       scrollback_cap: SCROLLBACK_CAP,
       last_base: None,
+      last_char: None,
       links: Vec::new(),
       kitty_current: 0,
       kitty_stack: Vec::new(),
@@ -657,6 +660,7 @@ impl Grid {
     cell.flags.remove(Flags::WIDE_CONT);
     self.lines[y].cells[x] = cell;
     self.last_base = Some((x, y));
+    self.last_char = Some(c);
     if width == 2 && x + 1 < self.cols {
       let mut cont = self.pen.clone();
       cont.c = ' ';
@@ -676,6 +680,15 @@ impl Grid {
       }
     } else {
       self.cursor.x += advance;
+    }
+  }
+
+  /// REP: reprint the last base character `n` times at the cursor.
+  pub fn repeat(&mut self, n: usize) {
+    if let Some(c) = self.last_char {
+      for _ in 0..n {
+        self.print(c);
+      }
     }
   }
 

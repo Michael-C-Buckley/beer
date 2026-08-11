@@ -111,6 +111,17 @@ fn ich_dch_ech_edit_in_line() {
 }
 
 #[test]
+fn rep_repeats_last_character() {
+  // REP repeats the preceding graphic character Ps times.
+  let t = term(10, 1, b"X\x1b[3b");
+  assert_eq!(t.grid().row_text(0), "XXXX");
+
+  // With no preceding graphic character REP is a no-op.
+  let t = term(10, 1, b"\x1b[3b");
+  assert_eq!(t.grid().row_text(0), "");
+}
+
+#[test]
 fn il_dl_insert_and_delete_lines() {
   let t = term(10, 4, b"one\r\ntwo\r\nthree\x1b[1;1H\x1b[1L");
   assert_eq!(t.grid().row_text(0), "");
