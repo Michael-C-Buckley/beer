@@ -1167,6 +1167,27 @@ impl Grid {
     line.wrapped = false;
   }
 
+  /// DECALN (`ESC # 8`): fill the screen with `E` in default attributes for
+  /// alignment testing, reset the scroll region, and home the cursor.
+  pub fn decaln(&mut self) {
+    self.top = 0;
+    self.bottom = self.rows - 1;
+    for y in 0..self.rows {
+      self.dissolve_sized(y, 0, self.cols);
+      let line = &mut self.lines[y];
+      for cell in &mut line.cells {
+        *cell = Cell {
+          c: 'E',
+          ..Cell::default()
+        };
+      }
+      line.wrapped = false;
+    }
+    self.cursor.x = 0;
+    self.cursor.y = 0;
+    self.wrap_pending = false;
+  }
+
   /// ED: 0=below, 1=above, 2/3=all.
   pub fn erase_display(&mut self, mode: u16) {
     let (x, y) = (self.cursor.x, self.cursor.y);

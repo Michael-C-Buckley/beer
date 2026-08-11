@@ -172,6 +172,7 @@ impl Perform for Term {
         self.g1 = Charset::Ascii;
         self.shift_out = false;
       },
+      (Some(b'#'), b'8') => self.grid.decaln(),
       (Some(b'('), c) => self.g0 = charset(c),
       (Some(b')'), c) => self.g1 = charset(c),
       _ => {},

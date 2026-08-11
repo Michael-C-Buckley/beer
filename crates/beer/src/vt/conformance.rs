@@ -111,6 +111,15 @@ fn ich_dch_ech_edit_in_line() {
 }
 
 #[test]
+fn decaln_fills_screen_with_e() {
+  let t = term(4, 2, b"\x1b[2;3H\x1b#8");
+  assert_eq!(t.grid().row_text(0), "EEEE");
+  assert_eq!(t.grid().row_text(1), "EEEE");
+  // The cursor homes.
+  assert_eq!(t.grid().cursor(), (0, 0));
+}
+
+#[test]
 fn rep_repeats_last_character() {
   // REP repeats the preceding graphic character Ps times.
   let t = term(10, 1, b"X\x1b[3b");
