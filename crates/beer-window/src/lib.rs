@@ -160,6 +160,14 @@ pub enum ImeEvent {
   Preedit(String),
   /// Committed text to send to the shell.
   Commit(String),
+  /// The IME asks to delete `before`/`after` bytes around the cursor before the
+  /// commit is applied (part of the current transaction).
+  DeleteSurrounding {
+    /// Bytes to delete before the cursor.
+    before: u32,
+    /// Bytes to delete after the cursor.
+    after:  u32,
+  },
   /// End of one text-input transaction; the app applies the batched preedit/
   /// commit and reports its cursor rectangle.
   Done,

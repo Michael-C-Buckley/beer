@@ -184,6 +184,8 @@ struct WinState {
   preedit:             String,
   ime_preedit_pending: String,
   ime_commit_pending:  String,
+  /// Bytes the IME asked to delete before/after the cursor, applied on Done.
+  ime_delete_pending:  (u32, u32),
   flashing:            bool,
   /// Cell geometry of this window's renderer (physical px), refreshed whenever
   /// its scale's renderer is (re)built. Read by the pointer/grid geometry so
@@ -240,6 +242,7 @@ impl WinState {
       preedit: String::new(),
       ime_preedit_pending: String::new(),
       ime_commit_pending: String::new(),
+      ime_delete_pending: (0, 0),
       flashing: false,
       // Non-zero placeholder until the window's renderer is ensured (before any
       // geometry read); avoids a divide-by-zero if ever read early.
@@ -1822,17 +1825,40 @@ impl App {
   }
 
   fn ime_done(&mut self, ctx: &mut dyn WindowCtx, idx: usize) {
-    let commit = {
+    let (commit, delete) = {
       let win = &mut self.windows[idx];
       let commit = mem::take(&mut win.ime_commit_pending);
+      let delete = mem::take(&mut win.ime_delete_pending);
       win.preedit = mem::take(&mut win.ime_preedit_pending);
-      commit
+      (commit, delete)
     };
+    // The protocol applies the surrounding-text deletion before the commit.
+    self.ime_delete_surrounding(idx, delete);
     if !commit.is_empty() {
       self.send_to_shell(idx, commit.as_bytes());
     }
     self.windows[idx].needs_draw = true;
     self.ime_set_cursor(ctx, idx);
+  }
+
+  /// Honor an IME delete-surrounding request by deleting from the shell:
+  /// `before` backspaces then `after` forward-deletes. The protocol counts
+  /// bytes; without the shell's line buffer this is a best-effort deletion that
+  /// is exact for single-byte text, and bounded so a stray request cannot flood
+  /// the shell.
+  fn ime_delete_surrounding(
+    &mut self,
+    idx: usize,
+    (before, after): (u32, u32),
+  ) {
+    if before == 0 && after == 0 {
+      return;
+    }
+    let mut bytes = vec![0x7F; before.min(4096) as usize];
+    for _ in 0..after.min(4096) {
+      bytes.extend_from_slice(b"\x1b[3~");
+    }
+    self.send_to_shell(idx, &bytes);
   }
 
   fn selection_text(&self, idx: usize) -> Option<String> {
@@ -2361,11 +2387,15 @@ impl WindowApp for App {
         win.preedit.clear();
         win.ime_preedit_pending.clear();
         win.ime_commit_pending.clear();
+        win.ime_delete_pending = (0, 0);
         win.needs_draw = true;
       },
       ImeEvent::Preedit(text) => self.windows[idx].ime_preedit_pending = text,
       ImeEvent::Commit(text) => {
         self.windows[idx].ime_commit_pending.push_str(&text);
+      },
+      ImeEvent::DeleteSurrounding { before, after } => {
+        self.windows[idx].ime_delete_pending = (before, after);
       },
       ImeEvent::Done => self.ime_done(ctx, idx),
     }

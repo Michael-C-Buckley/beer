@@ -949,10 +949,6 @@ impl ActivationHandler for WaylandState {
 // text-input-v3 batches preedit/commit between `enter` and `done`; translate
 // each event to a neutral `ImeEvent` for the app to apply.
 impl Dispatch<ZwpTextInputV3, ()> for WaylandState {
-  #[expect(
-    clippy::match_same_arms,
-    reason = "unsupported text-input deletion events stay no-ops"
-  )]
   fn event(
     state: &mut Self,
     ti: &ZwpTextInputV3,
@@ -994,7 +990,17 @@ impl Dispatch<ZwpTextInputV3, ()> for WaylandState {
       Event::Done { .. } => {
         state.app.on_ime(&mut state.plat, id, ImeEvent::Done);
       },
-      Event::DeleteSurroundingText { .. } => {},
+      Event::DeleteSurroundingText {
+        before_length,
+        after_length,
+      } => {
+        state
+          .app
+          .on_ime(&mut state.plat, id, ImeEvent::DeleteSurrounding {
+            before: before_length,
+            after:  after_length,
+          });
+      },
       _ => {},
     }
   }
