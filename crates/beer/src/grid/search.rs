@@ -1,11 +1,11 @@
-use super::Grid;
+use super::{Flags, Grid, Point};
 
-/// One scrollback-search hit: a run of `len` cells at absolute `(row, col)`.
+/// One scrollback-search hit, inclusive at both ends. A hit may cross any
+/// number of soft-wrapped physical rows.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct Match {
-  row: usize,
-  col: usize,
-  len: usize,
+  start: Point,
+  end:   Point,
 }
 
 /// Incremental scrollback search: the query, every hit, and the focused one.
@@ -76,15 +76,20 @@ impl Grid {
     s.matches
       .iter()
       .enumerate()
-      .filter(|(_, m)| m.row == row && m.len > 0)
-      .map(|(i, m)| (m.col, m.col + m.len - 1, i == s.current))
+      .filter(|(_, m)| row >= m.start.row && row <= m.end.row)
+      .map(|(i, m)| {
+        let lo = if row == m.start.row { m.start.col } else { 0 };
+        let hi = if row == m.end.row {
+          m.end.col
+        } else {
+          self.abs_row(row).len().saturating_sub(1)
+        };
+        (lo, hi, i == s.current)
+      })
       .collect()
   }
 
   fn compute_matches(&self, query: &str) -> Vec<Match> {
-    if self.search_regex {
-      return self.compute_matches_regex(query);
-    }
     // Smart case: an uppercase letter in the query forces case sensitivity.
     let sensitive = query.chars().any(|c| c.is_ascii_uppercase());
     let fold = |c: char| {
@@ -94,62 +99,26 @@ impl Grid {
     if needle.is_empty() {
       return Vec::new();
     }
-    let total = self.scrollback.len() + self.rows;
     let mut matches = Vec::new();
+    let mut chars = Vec::new();
+    let mut points = Vec::new();
+    let total = self.scrollback.len() + self.rows;
     for row in 0..total {
-      let hay: Vec<char> =
-        self.abs_row(row).iter().map(|cell| fold(cell.c)).collect();
-      let mut i = 0;
-      while i + needle.len() <= hay.len() {
-        if hay[i..i + needle.len()] == needle[..] {
-          matches.push(Match {
-            row,
-            col: i,
-            len: needle.len(),
-          });
-          i += needle.len();
-        } else {
-          i += 1;
+      for (col, cell) in self.abs_row(row).iter().enumerate() {
+        if !cell.flags.contains(Flags::WIDE_CONT)
+          && !cell.flags.contains(Flags::SIZED_CONT)
+        {
+          chars.push(fold(cell.c));
+          points.push(Point { row, col });
         }
       }
-    }
-    matches
-  }
-
-  /// Regex variant of [`Self::compute_matches`]: compile the query (smart-case
-  /// via a case-insensitive flag when it has no uppercase) and record each
-  /// non-empty match per row. An invalid pattern yields no matches.
-  fn compute_matches_regex(&self, query: &str) -> Vec<Match> {
-    let sensitive = query.chars().any(|c| c.is_ascii_uppercase());
-    let Ok(re) = regex::RegexBuilder::new(query)
-      .case_insensitive(!sensitive)
-      .build()
-    else {
-      return Vec::new();
-    };
-    let total = self.scrollback.len() + self.rows;
-    let mut matches = Vec::new();
-    for row in 0..total {
-      let text: String = self.abs_row(row).iter().map(|cell| cell.c).collect();
-      // Map each character's start byte to its column, plus the end sentinel.
-      let mut col_at = vec![0usize; text.len() + 1];
-      let mut col = 0;
-      for (byte, _) in text.char_indices() {
-        col_at[byte] = col;
-        col += 1;
-      }
-      col_at[text.len()] = col;
-      for m in re.find_iter(&text) {
-        if m.end() > m.start() {
-          let (lo, hi) = (col_at[m.start()], col_at[m.end()]);
-          matches.push(Match {
-            row,
-            col: lo,
-            len: hi - lo,
-          });
-        }
+      if !self.line_at_abs(row).wrapped {
+        find_matches(&chars, &points, &needle, &mut matches);
+        chars.clear();
+        points.clear();
       }
     }
+    find_matches(&chars, &points, &needle, &mut matches);
     matches
   }
 
@@ -166,7 +135,7 @@ impl Grid {
       .search
       .as_ref()
       .and_then(|s| s.matches.get(s.current))
-      .map(|m| m.row)
+      .map(|m| m.start.row)
     else {
       return;
     };
@@ -183,11 +152,32 @@ impl Grid {
   /// that scrolled off the top.
   pub(super) fn shift_search(&mut self, n: usize) {
     if let Some(s) = self.search.as_mut() {
-      s.matches.retain(|m| m.row >= n);
+      s.matches.retain(|m| m.start.row >= n);
       for m in &mut s.matches {
-        m.row -= n;
+        m.start.row -= n;
+        m.end.row -= n;
       }
       s.current = s.current.min(s.matches.len().saturating_sub(1));
+    }
+  }
+}
+
+fn find_matches(
+  chars: &[char],
+  points: &[Point],
+  needle: &[char],
+  matches: &mut Vec<Match>,
+) {
+  let mut index = 0;
+  while index + needle.len() <= chars.len() {
+    if chars[index..index + needle.len()] == needle[..] {
+      matches.push(Match {
+        start: points[index],
+        end:   points[index + needle.len() - 1],
+      });
+      index += needle.len();
+    } else {
+      index += 1;
     }
   }
 }

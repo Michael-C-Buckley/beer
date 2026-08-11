@@ -161,8 +161,13 @@ impl Grid {
       } else {
         line.len()
       };
-      out.push_str(self.row_slice_text(row, lo, hi).trim_end());
-      if row != end.row {
+      let text = self.row_slice_text(row, lo, hi);
+      if row != end.row && self.line_at_abs(row).wrapped {
+        out.push_str(&text);
+      } else {
+        out.push_str(text.trim_end());
+      }
+      if row != end.row && !self.line_at_abs(row).wrapped {
         out.push('\n');
       }
     }
