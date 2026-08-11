@@ -278,6 +278,29 @@ pub struct Grid {
   kitty_stack:     Vec<u8>,
 }
 
+/// Format a row of cells as text, skipping continuation cells and trimming
+/// trailing blanks.
+fn cells_text(cells: &[Cell]) -> String {
+  cells
+    .iter()
+    .filter(|c| {
+      !c.flags.contains(Flags::WIDE_CONT)
+        && !c.flags.contains(Flags::SIZED_CONT)
+    })
+    .map(|c| c.c)
+    .collect::<String>()
+    .trim_end()
+    .to_string()
+}
+
+/// Join lines with newlines after dropping trailing empty lines.
+fn join_trimmed(mut lines: Vec<String>) -> String {
+  while lines.last().is_some_and(String::is_empty) {
+    lines.pop();
+  }
+  lines.join("\n")
+}
+
 fn default_tabs(cols: usize) -> Vec<bool> {
   (0..cols).map(|i| i % 8 == 0 && i != 0).collect()
 }
@@ -1842,17 +1865,24 @@ impl Grid {
   /// The visible text of one row, trailing blanks trimmed.
   #[cfg(test)]
   pub fn row_text(&self, y: usize) -> String {
-    self.lines[y]
-      .cells
-      .iter()
-      .filter(|c| {
-        !c.flags.contains(Flags::WIDE_CONT)
-          && !c.flags.contains(Flags::SIZED_CONT)
-      })
-      .map(|c| c.c)
-      .collect::<String>()
-      .trim_end()
-      .to_string()
+    cells_text(&self.lines[y].cells)
+  }
+
+  /// The visible viewport as text, one line per row with trailing blank rows
+  /// and blank cells trimmed. Used to pipe the on-screen contents.
+  pub fn visible_text(&self) -> String {
+    join_trimmed(
+      (0..self.rows)
+        .map(|y| cells_text(self.view_row(y)))
+        .collect(),
+    )
+  }
+
+  /// The full scrollback plus the live screen as text. Used to pipe or dump
+  /// the whole history.
+  pub fn scrollback_text(&self) -> String {
+    let total = self.scrollback.len() + self.rows;
+    join_trimmed((0..total).map(|r| cells_text(self.abs_row(r))).collect())
   }
 
   pub fn cell(&self, x: usize, y: usize) -> &Cell {
@@ -2203,6 +2233,22 @@ mod tests {
     assert_eq!(g.search_query(), Some("zzz"));
     g.clear_search();
     assert_eq!(g.search_query(), None);
+  }
+
+  #[test]
+  fn text_dump_joins_rows() {
+    let mut g = Grid::new(8, 2);
+    for line in ["one", "two", "three"] {
+      for c in line.chars() {
+        g.print(c);
+      }
+      g.carriage_return();
+      g.line_feed();
+    }
+    // Scrollback dump spans history plus the live screen; trailing blank rows
+    // are trimmed. The visible dump is just what is on screen.
+    assert_eq!(g.scrollback_text(), "one\ntwo\nthree");
+    assert_eq!(g.visible_text(), "three");
   }
 
   #[test]

@@ -24,6 +24,8 @@ pub enum Action {
   JumpPromptUp,
   JumpPromptDown,
   PipeCommandOutput,
+  PipeVisible,
+  PipeScrollback,
   UrlMode,
   UnicodeInput,
 }
@@ -47,6 +49,8 @@ impl Action {
       "jump-prompt-up" => Self::JumpPromptUp,
       "jump-prompt-down" => Self::JumpPromptDown,
       "pipe-command-output" => Self::PipeCommandOutput,
+      "pipe-visible" => Self::PipeVisible,
+      "pipe-scrollback" => Self::PipeScrollback,
       "url-mode" => Self::UrlMode,
       "unicode-input" => Self::UnicodeInput,
       _ => return None,

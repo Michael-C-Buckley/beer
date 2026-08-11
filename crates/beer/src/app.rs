@@ -1184,6 +1184,8 @@ impl App {
       Action::JumpPromptUp => self.jump_prompt(idx, true),
       Action::JumpPromptDown => self.jump_prompt(idx, false),
       Action::PipeCommandOutput => self.pipe_command_output(idx),
+      Action::PipeVisible => self.pipe_visible(idx),
+      Action::PipeScrollback => self.pipe_scrollback(idx),
       Action::UrlMode => self.enter_url_mode(idx),
       Action::UnicodeInput => {
         self.windows[idx].unicode_input = Some(String::new());
@@ -1301,20 +1303,42 @@ impl App {
       .inspect_err(|err| tracing::warn!("open url {url:?}: {err}"));
   }
 
+  fn pipe_command_output(&self, idx: usize) {
+    let text = self.windows[idx]
+      .session
+      .as_ref()
+      .and_then(|s| s.term.grid().last_command_output());
+    if let Some(text) = text {
+      self.pipe_text(idx, &text);
+    }
+  }
+
+  fn pipe_visible(&self, idx: usize) {
+    if let Some(s) = self.windows[idx].session.as_ref() {
+      let text = s.term.grid().visible_text();
+      self.pipe_text(idx, &text);
+    }
+  }
+
+  fn pipe_scrollback(&self, idx: usize) {
+    if let Some(s) = self.windows[idx].session.as_ref() {
+      let text = s.term.grid().scrollback_text();
+      self.pipe_text(idx, &text);
+    }
+  }
+
+  /// Spawn the configured pipe command, feeding `text` to its stdin. Shared by
+  /// the pipe-command-output, pipe-visible, and pipe-scrollback actions.
   #[expect(
     clippy::disallowed_methods,
     reason = "configured pipe command is a user feature"
   )]
-  fn pipe_command_output(&self, idx: usize) {
+  fn pipe_text(&self, idx: usize, text: &str) {
     let argv = &self.config.shell_integration.pipe_command;
     let Some((program, args)) = argv.split_first() else {
       return;
     };
     let session = self.windows[idx].session.as_ref();
-    let Some(text) = session.and_then(|s| s.term.grid().last_command_output())
-    else {
-      return;
-    };
     let mut cmd = Command::new(program);
     cmd
       .args(args)
