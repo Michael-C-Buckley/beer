@@ -19,48 +19,87 @@ fn is_url_char(c: char) -> bool {
     && !matches!(c, '<' | '>' | '"' | '`' | '{' | '}' | '|' | '\\' | '^')
 }
 
-/// Find `scheme://…` URLs in `chars`, returning `(start, end)` index ranges.
+/// Find common URL forms in `chars`, returning `(start, end)` index ranges.
 /// The scheme is a run of `[A-Za-z][A-Za-z0-9+.-]*` before `://`; the body runs
 /// to the first non-URL character, with trailing sentence punctuation trimmed.
 fn find_urls(chars: &[char]) -> Vec<(usize, usize)> {
   let mut out = Vec::new();
   let mut i = 0;
-  while i + 2 < chars.len() {
-    if chars[i] == ':' && chars[i + 1] == '/' && chars[i + 2] == '/' {
-      // Backtrack over the scheme.
-      let mut start = i;
-      while start > 0 {
-        let c = chars[start - 1];
-        if c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.') {
-          start -= 1;
-        } else {
-          break;
-        }
-      }
-      if start < i && chars[start].is_ascii_alphabetic() {
-        let mut end = i + 3;
-        while end < chars.len() && is_url_char(chars[end]) {
-          end += 1;
-        }
-        // Trim trailing punctuation that is usually sentence-level.
-        while end > i + 3
-          && matches!(
-            chars[end - 1],
-            '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '\'' | '"'
-          )
-        {
-          end -= 1;
-        }
-        if end > i + 3 {
-          out.push((start, end));
-          i = end;
-          continue;
-        }
-      }
+  while i < chars.len() {
+    if let Some(range) = www_at(chars, i)
+      .or_else(|| scheme_url_at(chars, i))
+      .or_else(|| short_scheme_at(chars, i))
+    {
+      i = range.1;
+      out.push(range);
+    } else {
+      i += 1;
     }
-    i += 1;
   }
   out
+}
+
+fn www_at(chars: &[char], start: usize) -> Option<(usize, usize)> {
+  chars[start..]
+    .starts_with(&['w', 'w', 'w', '.'])
+    .then(|| {
+      let end = url_end(chars, start + 4);
+      (start, end)
+    })
+    .filter(|(_, end)| *end > start + 4)
+}
+
+fn scheme_url_at(chars: &[char], colon: usize) -> Option<(usize, usize)> {
+  if chars.get(colon..colon + 3) != Some(&[':', '/', '/']) {
+    return None;
+  }
+  let start = scheme_start(chars, colon, false);
+  let end = url_end(chars, colon + 3);
+  (start < colon && chars[start].is_ascii_alphabetic() && end > colon + 3)
+    .then_some((start, end))
+}
+
+fn short_scheme_at(chars: &[char], colon: usize) -> Option<(usize, usize)> {
+  if chars.get(colon) != Some(&':') {
+    return None;
+  }
+  let start = scheme_start(chars, colon, true);
+  let scheme: String = chars[start..colon].iter().collect();
+  let end = url_end(chars, colon + 1);
+  (matches!(scheme.as_str(), "mailto" | "tel" | "magnet" | "news")
+    && end > colon + 1)
+    .then_some((start, end))
+}
+
+fn scheme_start(chars: &[char], end: usize, letters_only: bool) -> usize {
+  let mut start = end;
+  while start > 0 {
+    let c = chars[start - 1];
+    if c.is_ascii_alphabetic()
+      || (!letters_only && (c.is_ascii_digit() || matches!(c, '+' | '-' | '.')))
+    {
+      start -= 1;
+    } else {
+      break;
+    }
+  }
+  start
+}
+
+fn url_end(chars: &[char], minimum: usize) -> usize {
+  let mut end = minimum;
+  while end < chars.len() && is_url_char(chars[end]) {
+    end += 1;
+  }
+  while end > minimum
+    && matches!(
+      chars[end - 1],
+      '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '\'' | '"'
+    )
+  {
+    end -= 1;
+  }
+  end
 }
 
 impl Grid {
@@ -126,7 +165,14 @@ impl Grid {
       .map(|(s, e)| {
         let (row, col) = pos[s];
         UrlHit {
-          url: chars[s..e].iter().collect(),
+          url: {
+            let raw: String = chars[s..e].iter().collect();
+            if raw.starts_with("www.") {
+              format!("https://{raw}")
+            } else {
+              raw
+            }
+          },
           row,
           col,
         }
