@@ -452,7 +452,27 @@ impl Fonts {
     cluster: &str,
     style: Style,
   ) -> Option<ShapedCluster> {
-    let face_idx = self.face_for(base, style).ok()?;
+    let mut candidates = vec![self.face_for(base, style).ok()?];
+    for character in cluster.chars().filter(|&c| !is_join_control(c)) {
+      if let Ok(face_idx) = self.face_for(character, style)
+        && !candidates.contains(&face_idx)
+      {
+        candidates.push(face_idx);
+      }
+    }
+    for face_idx in candidates {
+      if let Some(shaped) = self.shape_cluster_with_face(face_idx, cluster) {
+        return Some(shaped);
+      }
+    }
+    None
+  }
+
+  fn shape_cluster_with_face(
+    &mut self,
+    face_idx: usize,
+    cluster: &str,
+  ) -> Option<ShapedCluster> {
     let features = self.features.clone();
     let font = self.hb_font(face_idx)?;
     let buffer = harfbuzz::UnicodeBuffer::new().add_str(cluster);
@@ -675,6 +695,10 @@ impl Fonts {
     self.fallbacks.insert(path, idx);
     Ok(Some(idx))
   }
+}
+
+const fn is_join_control(c: char) -> bool {
+  matches!(c as u32, 0x200C | 0x200D | 0xFE0E | 0xFE0F)
 }
 
 fn face_has_glyph(face: &Face, c: char) -> bool {
