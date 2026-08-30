@@ -45,6 +45,8 @@ impl Flags {
   /// A cell of a text-sizing (`OSC 66`) block that is not the block's leading
   /// cell; it holds no character of its own and is drawn by the leading cell.
   pub const SIZED_CONT: Self = Self(1 << 10);
+  /// SGR 6: blink at the rapid cadence rather than the normal SGR 5 cadence.
+  pub const RAPID_BLINK: Self = Self(1 << 11);
 
   pub const fn empty() -> Self {
     Self(0)
@@ -669,6 +671,27 @@ impl Grid {
 
   pub const fn cursor_blink(&self) -> bool {
     self.cursor_blink
+  }
+
+  /// Whether a blink timer can change anything currently displayed.
+  pub fn needs_blink(&self) -> bool {
+    (self.cursor_visible && self.cursor_blink && self.view_at_bottom())
+      || (0..self.rows).any(|row| {
+        self
+          .view_row(row)
+          .iter()
+          .any(|cell| cell.flags.contains(Flags::BLINK))
+      })
+  }
+
+  /// Whether a rapid-blink timer can change a currently visible cell.
+  pub fn needs_rapid_blink(&self) -> bool {
+    (0..self.rows).any(|row| {
+      self
+        .view_row(row)
+        .iter()
+        .any(|cell| cell.flags.contains(Flags::RAPID_BLINK))
+    })
   }
 
   pub const fn set_cursor_visible(&mut self, visible: bool) {
