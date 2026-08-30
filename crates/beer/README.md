@@ -11,10 +11,11 @@ hosting multiple Wayland windows.
 ## Features
 
 - A software-rendered Wayland window using `wl_shm`, frame callbacks, buffer
-  reuse, server-side decoration negotiation, fullscreen, and fractional
+  reuse, selectable server/client/no decorations, fullscreen, and fractional
   compositor scaling.
-- A PTY-backed login shell with `TIOCSWINSZ` resize propagation, inherited or
-  forwarded environment, configurable `TERM`, and child exit-status propagation.
+- A PTY-backed login shell or arbitrary command with working-directory and hold
+  controls, automatic Bash/Zsh/Fish integration, `TIOCSWINSZ` resize
+  propagation, and child exit-status propagation.
 - VT parsing through `vte`: cursor movement, erase and insert operations, scroll
   regions, left/right margins, rectangular-area editing, alternate screen,
   autowrap, SGR attributes, truecolor, 256-colour, dynamic palette and theme
@@ -27,18 +28,21 @@ hosting multiple Wayland windows.
   fallback, HarfBuzz shaping, bounded glyph caching, subpixel rendering, and
   colour emoji.
 - Scrollback with wheel and key scrolling, resize reflow, prompt-aware jumps,
-  last-command-output piping, and incremental search with match highlighting.
-- Word, line, rectangular, and URL-aware selection with clipboard and primary
-  selection support, OSC 52 set/query, OSC 8 hyperlinks, URL hint mode, and
-  configurable URL launch commands.
+  last-command-output piping, and literal smart-case search across soft wraps.
+- Word, line, rectangular, touch, and URL-aware selection with clipboard and
+  primary selection support, policy-controlled OSC 52, OSC 8 hyperlinks, URL
+  open/copy hint modes, and configurable URL launch commands.
 - Configurable keyboard, text, and mouse bindings, runtime font-size controls,
   cursor shape and blink settings, visual bells, bell commands, compositor
   urgency, desktop notification commands, idle inhibition, and theme alpha
   blending.
-- TOML configuration with unknown-key warnings and live reload on `SIGUSR1`.
+- TOML configuration with decoration and scroll-position controls, unknown-key
+  warnings, and live reload across every window on `SIGUSR1`.
 - Standalone and daemon modes: a resident server can host multiple windows,
-  while clients forward their working directory and environment over a private
-  Unix socket.
+  while clients forward launch state over a private or socket-activated Unix
+  listener.
+- Demand-driven blink, animation, and IPC timers: an idle terminal does not
+  keep periodic event-loop wakeups armed.
 
 ## Build
 
@@ -82,6 +86,9 @@ Useful flags:
 # Pass a config file to Beer.
 $ beer --config /path/to/beer.toml
 
+# Run a command in a chosen directory and keep its final screen visible.
+$ beer --working-directory /tmp --hold -- sh -c 'make test'
+
 # Check the version with -V or --version.
 $ beer --version
 
@@ -122,6 +129,9 @@ alpha = 1.0
 
 [url]
 launch = ["xdg-open"]
+
+[security]
+osc52 = "copy"
 ```
 
 See `doc/beer.toml.5.scd` for the full configuration reference.
@@ -153,7 +163,7 @@ $ nix build
 The application crate has internal modules for the PTY, VT model, grid, font
 pipeline, renderer, configuration, and graphics; platform integration lives in
 `beer-wayland`, while reusable protocol codecs and key/mouse encoders live in
-`beer-protocols`. The platform-neutral seam is defined by `beer-window`, and
+`beer-protocols`. The application/backend seam is defined by `beer-window`, and
 daemon framing is kept in `beer-ipc`.
 
 ## License

@@ -28,14 +28,14 @@ struct Cli {
   /// Always run a private window, never connect to a running server.
   #[pound(long)]
   no_daemon:         bool,
-  /// Path to a config file (default: $`XDG_CONFIG_HOME/beer/beer.toml`).
+  /// Path to a config file (default: $XDG_CONFIG_HOME/beer/beer.toml).
   /// Repeatable; later files take priority over earlier ones.
   #[pound(long)]
   config:            Vec<PathBuf>,
-  /// Title for the window opened via a running server.
+  /// Initial title for the new window.
   #[pound(long)]
   title:             Option<String>,
-  /// Wayland `app_id` for the window opened via a running server.
+  /// Wayland app_id for the new window.
   #[pound(long)]
   app_id:            Option<String>,
   /// Start in this directory instead of the current directory.

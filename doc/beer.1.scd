@@ -6,14 +6,14 @@ beer - a fast, software-rendered, Wayland-native terminal emulator
 
 # SYNOPSIS
 
-*beer* [_options_]
+*beer* [_options_] [--] [_command_ [_argument_ ...]]
 
 # DESCRIPTION
 
 *beer* is a lightweight, CPU-rendered terminal emulator for Wayland. It spawns
 the user's login shell in a pseudo-terminal and renders its output into a
-server-decorated window, with truecolor, styled text, scrollback, incremental
-search, mouse selection, and clipboard integration.
+Wayland window, with truecolor, styled text, scrollback, incremental search,
+mouse and touch selection, and clipboard integration.
 
 # OPTIONS
 
@@ -33,11 +33,22 @@ search, mouse selection, and clipboard integration.
 	used (see *FILES*).
 
 *--title* _TITLE_
-	Title for the window opened via a running server. Ignored in *--server*
-	mode; the server applies its own configured default otherwise.
+	Initial title for the new window.
 
 *--app-id* _APP_ID_
-	Wayland _app_id_ for the window opened via a running server.
+	Wayland _app_id_ for the new window.
+
+*--working-directory* _PATH_
+	Start the shell or command in _PATH_. The default is the caller's current
+	directory, including when a daemon hosts the window.
+
+*--hold*
+	Keep the final terminal contents visible after the child exits. Closing the
+	held window returns the child's exit status.
+
+_command_ [_argument_ ...]
+	Run _command_ instead of the login shell. Use *--* before a command whose
+	name or arguments could be parsed as *beer* options.
 
 *-h*, *--help*
 	Print usage and exit.
@@ -74,6 +85,8 @@ table of _beer.toml_(5).
 :  Jump to the previous / next shell prompt (OSC 133)
 |  Ctrl+Shift+O
 :  Enter URL hint mode
+|  Ctrl+Shift+Y
+:  Enter URL hint mode and copy the chosen URL
 |  Ctrl+Shift+U
 :  Enter a Unicode codepoint by hex value
 
@@ -81,10 +94,14 @@ The *pipe-command-output* action (unbound by default) feeds the last command's
 output to the configured command; see *shell-integration* in _beer.toml_(5).
 
 In incremental search, type to refine the query, *Up*/*Return* jumps to the
-previous match, *Down* to the next, and *Escape* exits.
+previous match, *Down* to the next, and *Escape* exits. Search is literal,
+crosses soft-wrapped rows, and becomes case-sensitive when the query contains
+an uppercase letter.
 
 In URL hint mode each visible URL is tagged with a label; type the label to open
-the URL in the configured launcher, or press *Escape* to cancel.
+it in the configured launcher, or press *Escape* to cancel. The copy variant
+writes the chosen URL to the clipboard. Detection covers _scheme://_ URLs,
+_www._ addresses, and _mailto:_, _tel:_, _magnet:_, and _news:_ links.
 
 In Unicode codepoint-input mode, type the hexadecimal value of a codepoint (e.g.
 _2603_ for a snowman) and press *Return* or *Space* to insert it; *Escape*
@@ -103,12 +120,16 @@ history. Holding *Shift* forces local selection even while an application has
 requested mouse reporting. Clicking an *OSC 8* hyperlink opens it; hovering one
 underlines it.
 
+Touch-drag scrolls history. Holding one touch point selects text; dragging then
+extends the selection and lifting copies it to the primary selection.
+
 # SHELL INTEGRATION
 
-With a shell configured to emit them, *beer* tracks the working directory
-(*OSC 7*, used by new windows) and prompt marks (*OSC 133*) for prompt jumping
-and piping the last command's output. Applications may raise desktop
-notifications via *OSC 9*, *OSC 777*, and *OSC 99*.
+By default *beer* installs a small Bash, Zsh, or Fish hook. It tracks the
+working directory (*OSC 7*, used by new windows) and prompt marks (*OSC 133*)
+for prompt jumping and piping the last command's output. Arbitrary commands are
+not modified. Applications may raise desktop notifications via *OSC 9*,
+*OSC 777*, and *OSC 99*.
 
 # DAEMON MODE
 
@@ -117,12 +138,16 @@ Wayland connection and glyph cache. It listens on a Unix socket at
 _$XDG_RUNTIME_DIR/beer-$WAYLAND_DISPLAY.sock_. The runtime directory must be
 private to the current user; the server refuses to use a shared temporary
 directory for this IPC channel.
+With systemd-style socket activation (_LISTEN_PID_ matching this process and
+_LISTEN_FDS=1_), the server accepts the listener on file descriptor 3 instead
+of binding its own path.
 
 A plain *beer* (without *--server* or *--no-daemon*) is the client: it forwards
-its working directory and environment to a running server, which opens a window
-there, and it mirrors that window's exit status. If no server is running it
-falls back to a standalone window, so the same command works with or without a
-daemon. *--no-daemon* forces the standalone path.
+the working directory, environment, command, hold flag, title, and app-id to a
+running server, which opens the requested window, and mirrors that window's exit
+status. If no server is running it falls back to a standalone window, so the
+same command works with or without a daemon. *--no-daemon* forces the
+standalone path.
 
 Whether the server keeps running after its last window closes is set by
 *server-resident* in _beer.toml_(5); by default it stays resident.
@@ -137,10 +162,14 @@ of cells. It does not implement sixel.
 # ENVIRONMENT
 
 *SHELL*
-	The shell to spawn; defaults to _/bin/sh_.
+	The login shell to spawn when no command is supplied. If unset, *beer* uses
+	the account's configured login shell, then falls back to _/bin/sh_.
 
 *TERM*
-	Set to the configured terminal name (default _beer_) for the child.
+	Set to the configured terminal name (default _xterm-256color_) for the child.
+
+*TERM_PROGRAM*, *TERM_PROGRAM_VERSION*
+	Set to _beer_ and the running beer version.
 
 *KITTY_WINDOW_ID*
 	Set for the child process to the window's numeric id, so programs that key
@@ -157,7 +186,8 @@ of cells. It does not implement sixel.
 # SIGNALS
 
 *SIGUSR1*
-	Reload the configuration file and re-apply it without restarting.
+	Reload the configuration file and re-apply it to every open window without
+	restarting.
 
 # FILES
 
