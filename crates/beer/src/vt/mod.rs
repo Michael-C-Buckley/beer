@@ -376,27 +376,81 @@ impl Term {
         cols,
         rows,
         keep_cursor,
+        parent,
+        replace_old,
       } => {
-        self
-          .grid
-          .place_image(image, placement, cols, rows, keep_cursor);
+        if replace_old {
+          self.grid.clear_images(|reference| reference.image == image);
+        }
+        if let Some(parent) = parent {
+          self
+            .grid
+            .place_image_relative(image, placement, cols, rows, parent);
+        } else {
+          self
+            .grid
+            .place_image(image, placement, cols, rows, keep_cursor);
+        }
       },
-      GridOp::Clear(spec) => {
-        match spec {
+      GridOp::Clear { spec, free } => {
+        let removed = match spec {
           ClearSpec::All => self.grid.clear_images(|_| true),
           ClearSpec::Image(id) => self.grid.clear_images(|r| r.image == id),
           ClearSpec::Placement(id, p) => {
             self
               .grid
-              .clear_images(|r| r.image == id && r.placement == p);
+              .clear_images(|r| r.image == id && r.placement == p)
           },
           ClearSpec::AtCursor => {
             let targets = self.grid.images_at_cursor();
             self
               .grid
-              .clear_images(|r| targets.contains(&(r.image, r.placement)));
+              .clear_images(|r| targets.contains(&(r.image, r.placement)))
           },
-        }
+          ClearSpec::Cell { x, y, z } => {
+            self.grid.clear_screen_images(|col, row, reference| {
+              col + 1 == x as usize
+                && row + 1 == y as usize
+                && z.is_none_or(|wanted| {
+                  self
+                    .graphics
+                    .placement(reference.image, reference.placement)
+                    .is_some_and(|placement| placement.z == wanted)
+                })
+            })
+          },
+          ClearSpec::Column(x) => {
+            self
+              .grid
+              .clear_screen_images(|col, _, _| col + 1 == x as usize)
+          },
+          ClearSpec::Row(y) => {
+            self
+              .grid
+              .clear_screen_images(|_, row, _| row + 1 == y as usize)
+          },
+          ClearSpec::Z(z) => {
+            self.grid.clear_images(|reference| {
+              self
+                .graphics
+                .placement(reference.image, reference.placement)
+                .is_some_and(|placement| placement.z == z)
+            })
+          },
+          ClearSpec::ImageRange(lo, hi) => {
+            self.grid.clear_images(|reference| {
+              reference.image >= lo && reference.image <= hi
+            })
+          },
+        };
+        let targets = self.graphics.delete_targets(spec, &removed);
+        self.grid.clear_images(|reference| {
+          targets.contains(&(reference.image, reference.placement))
+        });
+        let grid = &self.grid;
+        self
+          .graphics
+          .finish_delete(&targets, free, |image| grid.image_referenced(image));
       },
     }
   }
