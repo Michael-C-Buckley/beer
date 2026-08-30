@@ -31,11 +31,11 @@ Pour one, get to work.
 ## Project status
 
 `beer` is pre-1.0 but already comfortable as a daily driver on Wayland. It
-renders truecolor text with styled attributes and colour emoji, scrolls back
-with incremental search, handles mouse selection and clipboard, follows the
+renders truecolor text with styled attributes and colour emoji, searches
+logical wrapped lines, handles mouse and touch selection, follows the
 compositor's fractional scale, and speaks the kitty keyboard, graphics, and
-text-sizing protocols. It runs standalone or as a daemon that hosts many windows
-from one process.
+text-sizing protocols. It runs a shell or command standalone, or as a daemon
+that hosts many windows from one process.
 
 Feature requests are welcome, but not everything will be implemented.
 
@@ -57,8 +57,8 @@ crate:
   reference for the escape sequences and protocols `beer` speaks.
 - **[`crates/beer-ipc`](crates/beer-ipc/README.md)** - the Unix-socket protocol
   used by daemon and client processes.
-- **[`crates/beer-window`](crates/beer-window/README.md)** - the
-  platform-neutral application/windowing contract.
+- **[`crates/beer-window`](crates/beer-window/README.md)** - the compact
+  application/backend contract used by the Wayland implementation.
 - **[`crates/beer-wayland`](crates/beer-wayland/README.md)** - the Wayland
   backend that drives the application contract.
 
