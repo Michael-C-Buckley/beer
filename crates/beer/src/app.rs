@@ -27,6 +27,7 @@ use beer_protocols::{codec, key, mouse};
 use beer_window::{
   App as WindowApp,
   CursorIcon,
+  DecorationMode,
   ImeEvent,
   KeyEvent,
   KeyKind,
@@ -41,7 +42,7 @@ use beer_window::{
 
 use crate::{
   bindings::{Action, Bindings, MouseButton},
-  config::{Config, Main},
+  config::{Config, Decorations, Main},
   font::{CellMetrics, FontOptions, Fonts},
   grid::{
     Cell,
@@ -53,7 +54,7 @@ use crate::{
     UrlHit,
   },
   ipc,
-  pty::Pty,
+  pty::{Pty, SpawnOptions},
   render::Renderer,
   theme::Theme,
   vt::{ClipboardOp, Notification, Progress, Term},
@@ -63,15 +64,17 @@ use crate::{
 const MULTI_CLICK_MS: u32 = 400;
 /// Blink half-period.
 const BLINK_MS: u64 = 500;
+/// SGR 6 rapid-blink half-period.
+const RAPID_BLINK_MS: u64 = 250;
 /// Visual-bell flash duration.
 const FLASH_MS: u64 = 60;
 /// Autoscroll step period while dragging past an edge.
 const AUTOSCROLL_MS: u64 = 40;
 /// Pause before reflowing after a live resize configure.
 const RESIZE_REFLOW_MS: u64 = 150;
-/// Graphics-animation beat while animating / idle.
-const ANIM_MS: u64 = 100;
-const ANIM_IDLE_MS: u64 = 500;
+const TOUCH_HOLD_MS: u64 = 500;
+/// Graphics-animation beat while animating.
+const ANIM_MS: u32 = 100;
 /// Force synchronized output (DECSET 2026) open after this long.
 const SYNC_TIMEOUT_MS: u64 = 150;
 /// Bound on accepted IPC connections per wake and pending clients.
@@ -84,6 +87,7 @@ const BLINK_TOKEN: u64 = 1;
 const ANIM_TOKEN: u64 = 2;
 const IPC_SWEEP_TOKEN: u64 = 3;
 const IPC_LISTEN_TOKEN: u64 = 4;
+const RAPID_BLINK_TOKEN: u64 = 5;
 const TOKEN_BASE: u64 = 16;
 
 /// MIME types offered/accepted for clipboard text (used by the OSC 52 reply).
@@ -123,6 +127,24 @@ struct Session {
   term:   Term,
 }
 
+struct TouchState {
+  id:        i32,
+  x:         f64,
+  start_y:   f64,
+  last_y:    f64,
+  acc:       f64,
+  selecting: bool,
+}
+
+#[derive(Clone, Copy)]
+enum WindowTimer {
+  Flash,
+  Sync,
+  Resize,
+  Touch,
+  Autoscroll,
+}
+
 /// What determines one rendered row's pixels; equal snapshots render alike, so
 /// a buffer holding an equal snapshot needs no repaint.
 #[derive(Clone, PartialEq)]
@@ -133,7 +155,7 @@ struct RowSnap {
   search:  Vec<(usize, usize, bool)>,
   overlay: Option<String>,
   preedit: Option<(usize, String)>,
-  blink:   bool,
+  blink:   u8,
 }
 
 /// Per-window terminal state (everything not owned by the platform backend).
@@ -146,6 +168,10 @@ struct WinState {
   session:             Option<Session>,
   pending_cwd:         Option<PathBuf>,
   pending_env:         Vec<(String, String)>,
+  pending_command:     Vec<String>,
+  window_number:       u64,
+  hold:                bool,
+  held_exit:           Option<u8>,
   client:              Option<UnixStream>,
   /// Logical surface size and scale, mirrored from configure/scale so pointer
   /// mapping and the present size are computable app-side.
@@ -178,12 +204,14 @@ struct WinState {
   last_click:          Option<(Instant, usize, usize, u32)>,
   searching:           bool,
   url_mode:            bool,
+  url_copy:            bool,
   url_hits:            Vec<UrlHit>,
   url_labels:          Vec<String>,
   url_input:           String,
   unicode_input:       Option<String>,
   keys_down:           HashSet<u32>,
-  touch_scroll:        Option<(i32, f64, f64)>,
+  touch:               Option<TouchState>,
+  touch_token:         Option<u64>,
   preedit:             String,
   ime_preedit_pending: String,
   ime_commit_pending:  String,
@@ -202,17 +230,20 @@ struct WinState {
 impl WinState {
   fn new(
     id: WindowId,
-    cwd: Option<PathBuf>,
-    env: Vec<(String, String)>,
-    client: Option<UnixStream>,
+    launch: WindowLaunch,
+    window_number: u64,
     pty_token: u64,
   ) -> Self {
     Self {
       id,
       session: None,
-      pending_cwd: cwd,
-      pending_env: env,
-      client,
+      pending_cwd: launch.cwd,
+      pending_env: launch.env,
+      pending_command: launch.command,
+      window_number,
+      hold: launch.hold,
+      held_exit: None,
+      client: launch.client,
       width: 1,
       height: 1,
       scale120: 120,
@@ -237,12 +268,14 @@ impl WinState {
       last_click: None,
       searching: false,
       url_mode: false,
+      url_copy: false,
       url_hits: Vec::new(),
       url_labels: Vec::new(),
       url_input: String::new(),
       unicode_input: None,
       keys_down: HashSet::new(),
-      touch_scroll: None,
+      touch: None,
+      touch_token: None,
       preedit: String::new(),
       ime_preedit_pending: String::new(),
       ime_commit_pending: String::new(),
@@ -262,34 +295,44 @@ impl WinState {
 }
 
 /// The terminal application state shared across all its windows.
+#[expect(
+  clippy::struct_excessive_bools,
+  reason = "independent event-loop lifecycle flags"
+)]
 pub struct App {
   /// One renderer per output scale (120ths). Windows share the renderer for
   /// their scale, so moving between differently-scaled outputs never
   /// re-rasterizes the font.
-  renderers:    HashMap<u32, Renderer>,
-  config:       Config,
-  config_paths: Vec<PathBuf>,
-  bindings:     Bindings,
-  font_size:    u32,
-  blink_on:     bool,
-  modifiers:    Modifiers,
-  windows:      Vec<WinState>,
-  focused:      usize,
-  clipboard:    String,
-  primary_clip: String,
-  exit_code:    u8,
-  server:       bool,
-  resident:     bool,
+  renderers:       HashMap<u32, Renderer>,
+  config:          Config,
+  config_paths:    Vec<PathBuf>,
+  bindings:        Bindings,
+  font_size:       u32,
+  blink_on:        bool,
+  rapid_on:        bool,
+  blink_armed:     bool,
+  rapid_armed:     bool,
+  anim_armed:      bool,
+  ipc_sweep_armed: bool,
+  modifiers:       Modifiers,
+  windows:         Vec<WinState>,
+  focused:         usize,
+  clipboard:       String,
+  primary_clip:    String,
+  exit_code:       u8,
+  server:          bool,
+  resident:        bool,
   /// Monotonic token allocator for per-window/per-client sources.
-  next_token:   u64,
-  next_window:  u64,
+  next_token:      u64,
+  next_window:     u64,
+  initial:         ipc::OpenRequest,
   /// Daemon: the listening socket and per-client incremental readers, keyed by
   /// the source token the client is watched under.
-  ipc_clients:  HashMap<u64, (UnixStream, ipc::RequestReader, Instant)>,
-  ipc_listener: Option<UnixListener>,
+  ipc_clients:     HashMap<u64, (UnixStream, ipc::RequestReader, Instant)>,
+  ipc_listener:    Option<UnixListener>,
   /// Path of the bound daemon socket, unlinked on shutdown so a later server
   /// can bind the same path.
-  ipc_socket:   Option<PathBuf>,
+  ipc_socket:      Option<PathBuf>,
 }
 
 impl Drop for App {
@@ -306,6 +349,7 @@ impl App {
     config: Config,
     config_paths: Vec<PathBuf>,
     server: bool,
+    initial: ipc::OpenRequest,
   ) -> anyhow::Result<Self> {
     use anyhow::Context as _;
     // Validate the font up front by building the scale-1.0 renderer; other
@@ -333,6 +377,11 @@ impl App {
       bindings,
       font_size,
       blink_on: true,
+      rapid_on: true,
+      blink_armed: false,
+      rapid_armed: false,
+      anim_armed: false,
+      ipc_sweep_armed: false,
       modifiers: Modifiers::default(),
       windows: Vec::new(),
       focused: 0,
@@ -343,6 +392,7 @@ impl App {
       resident,
       next_token: TOKEN_BASE,
       next_window: 1,
+      initial,
       ipc_clients: HashMap::new(),
       ipc_listener: None,
       ipc_socket: None,
@@ -466,6 +516,15 @@ struct WindowOverrides {
   app_id: Option<String>,
 }
 
+struct WindowLaunch {
+  cwd:       Option<PathBuf>,
+  env:       Vec<(String, String)>,
+  command:   Vec<String>,
+  hold:      bool,
+  overrides: WindowOverrides,
+  client:    Option<UnixStream>,
+}
+
 /// A child's exit status folded to a byte: its exit code, or 128 plus the
 /// terminating signal.
 #[expect(
@@ -534,12 +593,13 @@ fn row_snap(
   y: usize,
   focused: bool,
   blink_on: bool,
+  rapid_on: bool,
   overlay: Option<&str>,
   preedit: Option<(usize, &str)>,
 ) -> RowSnap {
   let abs = grid.view_to_abs(y);
   let cells = grid.view_row(y).to_vec();
-  let has_blink = cells.iter().any(|c| c.flags.contains(Flags::BLINK));
+  let blink = row_blink_state(&cells, blink_on, rapid_on);
   RowSnap {
     cells,
     cursor: row_cursor(grid, y, focused, blink_on),
@@ -547,7 +607,7 @@ fn row_snap(
     search: grid.search_spans_on(abs),
     overlay: overlay.map(str::to_owned),
     preedit: preedit.map(|(c, t)| (c, t.to_owned())),
-    blink: if has_blink { blink_on } else { true },
+    blink,
   }
 }
 
@@ -556,21 +616,14 @@ fn row_matches(
   grid: &Grid,
   y: usize,
   focused: bool,
-  blink_on: bool,
+  phases: (bool, bool),
   overlay: Option<&str>,
   preedit: Option<(usize, &str)>,
 ) -> bool {
   let Some(snap) = snap else { return false };
   let abs = grid.view_to_abs(y);
-  let blink = if grid
-    .view_row(y)
-    .iter()
-    .any(|c| c.flags.contains(Flags::BLINK))
-  {
-    blink_on
-  } else {
-    true
-  };
+  let (blink_on, rapid_on) = phases;
+  let blink = row_blink_state(grid.view_row(y), blink_on, rapid_on);
   snap.cells == grid.view_row(y)
     && snap.cursor == row_cursor(grid, y, focused, blink_on)
     && snap.sel == grid.selection_span_on(abs)
@@ -578,6 +631,58 @@ fn row_matches(
     && snap.overlay.as_deref() == overlay
     && snap.preedit.as_ref().map(|(c, t)| (*c, t.as_str())) == preedit
     && snap.blink == blink
+}
+
+fn row_blink_state(cells: &[Cell], blink_on: bool, rapid_on: bool) -> u8 {
+  let mut state = 0;
+  if blink_on && cells.iter().any(|c| c.flags.contains(Flags::BLINK)) {
+    state |= 1;
+  }
+  if rapid_on && cells.iter().any(|c| c.flags.contains(Flags::RAPID_BLINK)) {
+    state |= 2;
+  }
+  state
+}
+
+fn sync_timer(
+  ctx: &mut dyn WindowCtx,
+  armed: &mut bool,
+  needed: bool,
+  token: u64,
+  delay_ms: u64,
+) {
+  if needed == *armed {
+    return;
+  }
+  *armed = needed;
+  if needed {
+    ctx.arm_timer(token, delay_ms);
+  } else {
+    ctx.cancel_timer(token);
+  }
+}
+
+fn status_bar_text(
+  win: &WinState,
+  grid: &Grid,
+  indicator: bool,
+) -> Option<String> {
+  if win.confirm_close {
+    Some("close terminal with a running job? (y/n)".to_string())
+  } else if let Some(hex) = win.unicode_input.as_ref() {
+    Some(format!("unicode: U+{}", hex.to_uppercase()))
+  } else if win.searching {
+    let (n, total) = grid.search_count();
+    Some(format!(
+      "search: {}  [{n}/{total}]",
+      grid.search_query().unwrap_or("")
+    ))
+  } else if indicator && !grid.view_at_bottom() {
+    let (position, total) = grid.scroll_position();
+    Some(format!("scrollback: {position}/{total}"))
+  } else {
+    None
+  }
 }
 
 impl App {
@@ -616,14 +721,19 @@ impl App {
     let id = self.windows[idx].id;
     let cwd = self.windows[idx].pending_cwd.clone();
     let env = mem::take(&mut self.windows[idx].pending_env);
-    let pty = match Pty::spawn(
+    let command = mem::take(&mut self.windows[idx].pending_command);
+    let window_number = self.windows[idx].window_number;
+    let pty = match Pty::spawn(SpawnOptions {
       cols,
       rows,
       cell,
-      &self.config.main.term,
-      cwd.as_deref(),
-      &env,
-    ) {
+      term: &self.config.main.term,
+      cwd: cwd.as_deref(),
+      env: &env,
+      command: &command,
+      window_id: window_number,
+      shell_integration: self.config.shell_integration.enabled,
+    }) {
       Ok(pty) => pty,
       Err(err) => {
         tracing::error!("spawn shell: {err:#}");
@@ -637,7 +747,6 @@ impl App {
     let grid = term.grid_mut();
     grid.set_word_delimiters(self.config.main.word_delimiters.clone());
     grid.set_scrollback_cap(self.config.scrollback.lines);
-    grid.set_search_regex(self.config.search.regex);
     if let Some(shape) = cursor_shape_from(self.config.cursor.style.as_deref())
     {
       grid.set_cursor_shape(shape);
@@ -648,6 +757,7 @@ impl App {
       parser: vte::Parser::new(),
       term,
     });
+    self.update_activity_timers(ctx);
   }
 
   /// Read available bytes from window `idx`'s pty, feed the parser,
@@ -723,6 +833,12 @@ impl App {
     let Some(idx) = self.win_index(id) else {
       return;
     };
+    if self.windows[idx].hold {
+      ctx.unwatch(self.windows[idx].pty_token);
+      self.windows[idx].held_exit = Some(code);
+      self.windows[idx].needs_draw = true;
+      return;
+    }
     if self.windows.len() == 1 {
       self.exit_code = code;
     }
@@ -740,6 +856,9 @@ impl App {
       let Some(idx) = self.win_index(id) else {
         continue;
       };
+      if self.windows[idx].held_exit.is_some() {
+        continue;
+      }
       let code = self.windows[idx].session.as_mut().and_then(|s| {
         match s.pty.try_wait() {
           Ok(Some(status)) => Some(status_code(status)),
@@ -795,14 +914,15 @@ impl App {
       )
     };
     if !ops.is_empty() {
-      self.handle_clipboard_ops(ctx, ops);
+      self.handle_clipboard_ops(ctx, idx, ops);
     }
     for note in notes {
-      self.send_notification(&note);
+      self.send_notification(idx, &note);
     }
     if rang {
       self.ring_bell(ctx, idx);
     }
+    self.update_activity_timers(ctx);
     ctx.request_redraw(id);
   }
 
@@ -818,6 +938,7 @@ impl App {
       self.windows[idx].resize_token,
       self.windows[idx].flash_token,
       self.windows[idx].sync_token,
+      self.windows[idx].touch_token,
     ]
     .into_iter()
     .flatten()
@@ -825,10 +946,15 @@ impl App {
       ctx.unwatch(tok);
       ctx.cancel_timer(tok);
     }
+    let code = self.windows[idx].held_exit.unwrap_or(0);
+    if self.windows.len() == 1 && self.windows[idx].held_exit.is_some() {
+      self.exit_code = code;
+    }
     if let Some(client) = self.windows[idx].client.take() {
-      ipc::send_exit(client, 0);
+      ipc::send_exit(client, code);
     }
     self.windows.remove(idx);
+    self.update_activity_timers(ctx);
     ctx.close_window(id);
     if self.windows.is_empty() {
       if !self.resident {
@@ -877,6 +1003,7 @@ impl App {
     let pad_y = self.to_phys(&self.windows[idx], self.config.main.pad_y);
     let focused = self.windows[idx].focused;
     let blink_on = self.blink_on;
+    let rapid_on = self.rapid_on;
     // URL labels overlay the grid but are not in the row snapshot, so force a
     // full redraw while labels show by clearing the snapshot cache.
     if self.windows[idx].url_mode {
@@ -901,19 +1028,7 @@ impl App {
     let flashed = win.flashing.then(|| session.term.theme().inverted());
     let theme = flashed.as_ref().unwrap_or_else(|| session.term.theme());
     let rows = grid.rows();
-    let bar_text = if win.confirm_close {
-      Some("close terminal with a running job? (y/n)".to_string())
-    } else if let Some(hex) = win.unicode_input.as_ref() {
-      Some(format!("unicode: U+{}", hex.to_uppercase()))
-    } else if win.searching {
-      let (n, total) = grid.search_count();
-      Some(format!(
-        "search: {}  [{n}/{total}]",
-        grid.search_query().unwrap_or("")
-      ))
-    } else {
-      None
-    };
+    let bar_text = status_bar_text(win, grid, self.config.scrollback.indicator);
     let preedit = if !win.preedit.is_empty() && grid.view_at_bottom() {
       let (cx, cy) = grid.cursor();
       (cy < rows).then_some((cy, cx, win.preedit.as_str()))
@@ -929,7 +1044,15 @@ impl App {
         let overlay = (y + 1 == rows).then_some(bar_text.as_deref()).flatten();
         let pe = preedit.filter(|&(r, ..)| r == y).map(|(_, c, t)| (c, t));
         fresh
-          || !row_matches(prev.get(y), grid, y, focused, blink_on, overlay, pe)
+          || !row_matches(
+            prev.get(y),
+            grid,
+            y,
+            focused,
+            (blink_on, rapid_on),
+            overlay,
+            pe,
+          )
       })
       .collect();
     if dirty.is_empty() {
@@ -940,6 +1063,7 @@ impl App {
       theme,
       focused,
       blink_on,
+      rapid_on,
       hovered_link: win.hovered_link,
       images: session.term.graphics(),
     };
@@ -989,7 +1113,7 @@ impl App {
         .as_ref()
         .filter(|(r, ..)| *r == y)
         .map(|(_, c, t)| (*c, t.as_str()));
-      let s = row_snap(grid, y, focused, blink_on, overlay, pe);
+      let s = row_snap(grid, y, focused, blink_on, rapid_on, overlay, pe);
       if y < snaps.len() {
         snaps[y] = s;
       } else {
@@ -1043,7 +1167,7 @@ impl App {
       return;
     }
     if self.windows[idx].url_mode {
-      self.url_key(idx, event);
+      self.url_key(ctx, idx, event);
       return;
     }
     if self.windows[idx].searching {
@@ -1131,7 +1255,7 @@ impl App {
     self.windows[idx].needs_draw = true;
   }
 
-  fn url_key(&mut self, idx: usize, event: &KeyEvent) {
+  fn url_key(&mut self, ctx: &mut dyn WindowCtx, idx: usize, event: &KeyEvent) {
     use beer_window::Keysym;
     match event.keysym {
       Keysym::Escape => self.exit_url_mode(idx),
@@ -1150,8 +1274,14 @@ impl App {
         if let Some(i) = win.url_labels.iter().position(|l| *l == win.url_input)
         {
           let url = win.url_hits[i].url.clone();
+          let copy = win.url_copy;
           self.exit_url_mode(idx);
-          self.open_url(&url);
+          if copy {
+            self.clipboard.clone_from(&url);
+            ctx.claim_clipboard(url);
+          } else {
+            self.open_url(&url);
+          }
         } else if !win.url_labels.iter().any(|l| l.starts_with(&win.url_input))
         {
           self.exit_url_mode(idx);
@@ -1261,7 +1391,8 @@ impl App {
       Action::PipeCommandOutput => self.pipe_command_output(idx),
       Action::PipeVisible => self.pipe_visible(idx),
       Action::PipeScrollback => self.pipe_scrollback(idx),
-      Action::UrlMode => self.enter_url_mode(idx),
+      Action::UrlMode => self.enter_url_mode(idx, false),
+      Action::UrlCopy => self.enter_url_mode(idx, true),
       Action::UnicodeInput => {
         self.windows[idx].unicode_input = Some(String::new());
         self.windows[idx].needs_draw = true;
@@ -1308,7 +1439,7 @@ impl App {
     }
   }
 
-  fn enter_url_mode(&mut self, idx: usize) {
+  fn enter_url_mode(&mut self, idx: usize, copy: bool) {
     let Some(session) = self.windows[idx].session.as_ref() else {
       return;
     };
@@ -1322,12 +1453,14 @@ impl App {
     win.url_hits = hits;
     win.url_input = String::new();
     win.url_mode = true;
+    win.url_copy = copy;
     win.needs_draw = true;
   }
 
   fn exit_url_mode(&mut self, idx: usize) {
     let win = &mut self.windows[idx];
     win.url_mode = false;
+    win.url_copy = false;
     win.url_hits.clear();
     win.url_labels.clear();
     win.url_input.clear();
@@ -1341,7 +1474,14 @@ impl App {
       .as_ref()
       .and_then(|s| s.term.cwd())
       .map(PathBuf::from);
-    self.open(ctx, cwd, Vec::new(), WindowOverrides::default(), None);
+    self.open(ctx, WindowLaunch {
+      cwd,
+      env: Vec::new(),
+      command: Vec::new(),
+      hold: false,
+      overrides: WindowOverrides::default(),
+      client: None,
+    });
   }
 
   fn alternate_scroll(&mut self, idx: usize, up: bool, count: isize) {
@@ -1860,46 +2000,119 @@ impl App {
     }
   }
 
+  fn on_touch_event(
+    &mut self,
+    ctx: &mut dyn WindowCtx,
+    idx: usize,
+    event: TouchEvent,
+  ) {
+    self.ensure_renderer(idx);
+    match event {
+      TouchEvent::Down { id, x, y } => self.touch_down(ctx, idx, id, x, y),
+      TouchEvent::Up { id } => self.touch_up(ctx, idx, id),
+      TouchEvent::Cancel => self.clear_touch(ctx, idx),
+      TouchEvent::Motion { id, x, y } => {
+        self.touch_motion(ctx, idx, id, x, y);
+      },
+    }
+  }
+
+  fn touch_down(
+    &mut self,
+    ctx: &mut dyn WindowCtx,
+    idx: usize,
+    id: i32,
+    x: f64,
+    y: f64,
+  ) {
+    if self.windows[idx].touch.is_some() {
+      return;
+    }
+    let token = self.alloc_token();
+    self.windows[idx].touch = Some(TouchState {
+      id,
+      x,
+      start_y: y,
+      last_y: y,
+      acc: 0.0,
+      selecting: false,
+    });
+    self.windows[idx].touch_token = Some(token);
+    ctx.arm_timer(token, TOUCH_HOLD_MS);
+  }
+
+  fn touch_up(&mut self, ctx: &mut dyn WindowCtx, idx: usize, id: i32) {
+    let Some(touch) = self.windows[idx].touch.as_ref() else {
+      return;
+    };
+    if touch.id != id {
+      return;
+    }
+    if touch.selecting {
+      self.set_primary(ctx, idx);
+    }
+    self.clear_touch(ctx, idx);
+  }
+
   #[expect(
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss,
     reason = "touch scroll deltas are small line counts"
   )]
-  fn on_touch_event(&mut self, idx: usize, event: TouchEvent) {
-    self.ensure_renderer(idx);
+  fn touch_motion(
+    &mut self,
+    ctx: &mut dyn WindowCtx,
+    idx: usize,
+    id: i32,
+    x: f64,
+    y: f64,
+  ) {
     let cell_h = f64::from(self.windows[idx].metrics.height);
-    match event {
-      TouchEvent::Down { id, y, .. } => {
-        if self.windows[idx].touch_scroll.is_none() {
-          self.windows[idx].touch_scroll = Some((id, y, 0.0));
-        }
-      },
-      TouchEvent::Up { id } => {
-        if self.windows[idx].touch_scroll.is_some_and(|t| t.0 == id) {
-          self.windows[idx].touch_scroll = None;
-        }
-      },
-      TouchEvent::Cancel => self.windows[idx].touch_scroll = None,
-      TouchEvent::Motion { id, y, .. } => {
-        let Some((tid, last_y, acc)) = self.windows[idx].touch_scroll.as_mut()
-        else {
-          return;
-        };
-        if *tid != id {
-          return;
-        }
-        *acc += y - *last_y;
-        *last_y = y;
-        let lines = (*acc / cell_h) as isize;
-        if lines != 0 {
-          *acc = (lines as f64).mul_add(-cell_h, *acc);
-          if let Some(session) = self.windows[idx].session.as_mut() {
-            session.term.scroll_view(lines);
-            self.windows[idx].needs_draw = true;
-          }
-        }
-      },
+    let Some(mut touch) = self.windows[idx].touch.take() else {
+      return;
+    };
+    if touch.id != id {
+      self.windows[idx].touch = Some(touch);
+      return;
     }
+    touch.x = x;
+    if touch.selecting {
+      self.extend_touch_selection(idx, x, y);
+      self.windows[idx].touch = Some(touch);
+      return;
+    }
+    if (y - touch.start_y).abs() >= cell_h / 2.0
+      && let Some(token) = self.windows[idx].touch_token.take()
+    {
+      ctx.cancel_timer(token);
+    }
+    touch.acc += y - touch.last_y;
+    touch.last_y = y;
+    let lines = (touch.acc / cell_h) as isize;
+    if lines != 0 {
+      touch.acc = (lines as f64).mul_add(-cell_h, touch.acc);
+      if let Some(session) = self.windows[idx].session.as_mut() {
+        session.term.scroll_view(lines);
+        self.windows[idx].needs_draw = true;
+      }
+    }
+    self.windows[idx].touch = Some(touch);
+  }
+
+  fn extend_touch_selection(&mut self, idx: usize, x: f64, y: f64) {
+    if let Some((row, col)) = self.cell_at(&self.windows[idx], x, y)
+      && let Some(session) = self.windows[idx].session.as_mut()
+    {
+      session.term.grid_mut().extend_selection(row, col);
+      self.windows[idx].needs_draw = true;
+    }
+  }
+
+  fn clear_touch(&mut self, ctx: &mut dyn WindowCtx, idx: usize) {
+    if let Some(token) = self.windows[idx].touch_token.take() {
+      ctx.cancel_timer(token);
+    }
+    self.windows[idx].touch = None;
   }
 
   #[expect(
@@ -1988,9 +2201,17 @@ impl App {
   fn handle_clipboard_ops(
     &mut self,
     ctx: &mut dyn WindowCtx,
+    idx: usize,
     ops: Vec<ClipboardOp>,
   ) {
     for op in ops {
+      let allowed = match &op {
+        ClipboardOp::Set { .. } => self.config.security.osc52.allows_copy(),
+        ClipboardOp::Query { .. } => self.config.security.osc52.allows_query(),
+      };
+      if !allowed {
+        continue;
+      }
       match op {
         ClipboardOp::Set {
           primary: true,
@@ -2017,7 +2238,7 @@ impl App {
             "\x1b]52;{kind};{}\x07",
             codec::base64_encode(text.as_bytes())
           );
-          self.write_to_pty(self.focused, reply.as_bytes());
+          self.write_to_pty(idx, reply.as_bytes());
         },
       }
     }
@@ -2078,14 +2299,14 @@ impl App {
     clippy::disallowed_methods,
     reason = "configured notifier is a user feature"
   )]
-  fn send_notification(&self, note: &Notification) {
+  fn send_notification(&self, idx: usize, note: &Notification) {
     let Some((program, args)) = self.config.notify.command.split_first() else {
       return;
     };
     let title = note
       .title
       .clone()
-      .or_else(|| self.windows.get(self.focused).and_then(|w| w.title.clone()))
+      .or_else(|| self.windows.get(idx).and_then(|w| w.title.clone()))
       .unwrap_or_else(|| "beer".to_string());
     let _ = Command::new(program)
       .args(args)
@@ -2204,24 +2425,31 @@ impl App {
   fn open(
     &mut self,
     ctx: &mut dyn WindowCtx,
-    cwd: Option<PathBuf>,
-    env: Vec<(String, String)>,
-    overrides: WindowOverrides,
-    client: Option<UnixStream>,
+    launch: WindowLaunch,
   ) -> WindowId {
     let id = ctx.open_window(&WindowOptions {
-      app_id:    overrides
+      app_id:      launch
+        .overrides
         .app_id
+        .clone()
         .unwrap_or_else(|| self.config.main.app_id.clone()),
-      title:     overrides
+      title:       launch
+        .overrides
         .title
+        .clone()
         .unwrap_or_else(|| self.config.main.title.clone()),
-      maximized: self.config.main.maximized,
+      maximized:   self.config.main.maximized,
+      decorations: match self.config.main.decorations {
+        Decorations::Server => DecorationMode::Server,
+        Decorations::Client => DecorationMode::Client,
+        Decorations::None => DecorationMode::None,
+      },
     });
     let pty_token = self.alloc_token();
+    let window_number = self.next_window;
     self
       .windows
-      .push(WinState::new(id, cwd, env, client, pty_token));
+      .push(WinState::new(id, launch, window_number, pty_token));
     self.next_window += 1;
     id
   }
@@ -2255,6 +2483,10 @@ impl App {
       token,
       (stream, ipc::RequestReader::default(), Instant::now()),
     );
+    if !self.ipc_sweep_armed {
+      self.ipc_sweep_armed = true;
+      ctx.arm_timer(IPC_SWEEP_TOKEN, 1000);
+    }
   }
 
   fn read_client(&mut self, ctx: &mut dyn WindowCtx, token: u64) {
@@ -2271,7 +2503,14 @@ impl App {
           title:  req.title,
           app_id: req.app_id,
         };
-        self.open(ctx, req.cwd.map(PathBuf::from), req.env, overrides, client);
+        self.open(ctx, WindowLaunch {
+          cwd: req.cwd.map(PathBuf::from),
+          env: req.env,
+          command: req.command,
+          hold: req.hold,
+          overrides,
+          client,
+        });
       },
       Err(err) => {
         tracing::warn!("read ipc request: {err}");
@@ -2292,9 +2531,185 @@ impl App {
       self.ipc_clients.remove(&tok);
       ctx.unwatch(tok);
     }
+    if !self.ipc_clients.is_empty() {
+      self.ipc_sweep_armed = true;
+      ctx.arm_timer(IPC_SWEEP_TOKEN, 1000);
+    }
   }
 
-  fn reload_config(&mut self, idx: usize) {
+  fn update_activity_timers(&mut self, ctx: &mut dyn WindowCtx) {
+    let blinking = self.windows.iter().any(|window| {
+      window
+        .session
+        .as_ref()
+        .is_some_and(|session| session.term.grid().needs_blink())
+    });
+    sync_timer(ctx, &mut self.blink_armed, blinking, BLINK_TOKEN, BLINK_MS);
+    let rapid = self.windows.iter().any(|window| {
+      window
+        .session
+        .as_ref()
+        .is_some_and(|session| session.term.grid().needs_rapid_blink())
+    });
+    sync_timer(
+      ctx,
+      &mut self.rapid_armed,
+      rapid,
+      RAPID_BLINK_TOKEN,
+      RAPID_BLINK_MS,
+    );
+    let animating = self.windows.iter().any(|window| {
+      window
+        .session
+        .as_ref()
+        .is_some_and(|session| session.term.is_animating())
+    });
+    if animating && !self.anim_armed {
+      self.anim_armed = true;
+      ctx.arm_timer(ANIM_TOKEN, u64::from(ANIM_MS));
+    } else if !animating && self.anim_armed {
+      self.anim_armed = false;
+      ctx.cancel_timer(ANIM_TOKEN);
+    }
+  }
+
+  fn handle_global_timer(
+    &mut self,
+    ctx: &mut dyn WindowCtx,
+    token: u64,
+  ) -> bool {
+    match token {
+      BLINK_TOKEN => {
+        self.normal_blink_tick();
+        self.update_activity_timers(ctx);
+      },
+      RAPID_BLINK_TOKEN => {
+        self.rapid_blink_tick();
+        self.update_activity_timers(ctx);
+      },
+      ANIM_TOKEN => {
+        self.anim_armed = false;
+        for window in &mut self.windows {
+          if window
+            .session
+            .as_mut()
+            .is_some_and(|session| session.term.animation_tick(ANIM_MS))
+          {
+            window.snaps.clear();
+            window.needs_draw = true;
+          }
+        }
+        self.update_activity_timers(ctx);
+      },
+      IPC_SWEEP_TOKEN => {
+        self.ipc_sweep_armed = false;
+        self.expire_clients(ctx);
+      },
+      _ => return false,
+    }
+    true
+  }
+
+  fn normal_blink_tick(&mut self) {
+    self.blink_armed = false;
+    self.blink_on = !self.blink_on;
+    for window in &mut self.windows {
+      if window
+        .session
+        .as_ref()
+        .is_some_and(|session| session.term.grid().needs_blink())
+      {
+        window.needs_draw = true;
+      }
+    }
+  }
+
+  fn rapid_blink_tick(&mut self) {
+    self.rapid_armed = false;
+    self.rapid_on = !self.rapid_on;
+    for window in &mut self.windows {
+      if window
+        .session
+        .as_ref()
+        .is_some_and(|session| session.term.grid().needs_rapid_blink())
+      {
+        window.needs_draw = true;
+      }
+    }
+  }
+
+  fn window_timer(&self, token: u64) -> Option<(usize, WindowTimer)> {
+    for (idx, window) in self.windows.iter().enumerate() {
+      let kind = if window.flash_token == Some(token) {
+        WindowTimer::Flash
+      } else if window.sync_token == Some(token) {
+        WindowTimer::Sync
+      } else if window.resize_token == Some(token) {
+        WindowTimer::Resize
+      } else if window.touch_token == Some(token) {
+        WindowTimer::Touch
+      } else if window.autoscroll_token == Some(token) {
+        WindowTimer::Autoscroll
+      } else {
+        continue;
+      };
+      return Some((idx, kind));
+    }
+    None
+  }
+
+  fn handle_window_timer(
+    &mut self,
+    ctx: &mut dyn WindowCtx,
+    token: u64,
+    idx: usize,
+    kind: WindowTimer,
+  ) {
+    match kind {
+      WindowTimer::Flash => {
+        let window = &mut self.windows[idx];
+        window.flashing = false;
+        window.snaps.clear();
+        window.needs_draw = true;
+        window.flash_token = None;
+        ctx.cancel_timer(token);
+      },
+      WindowTimer::Sync => {
+        if let Some(session) = self.windows[idx].session.as_mut() {
+          session.term.grid_mut().set_sync(false);
+        }
+        self.windows[idx].sync_token = None;
+        self.windows[idx].needs_draw = true;
+        ctx.cancel_timer(token);
+      },
+      WindowTimer::Resize => {
+        self.windows[idx].resize_token = None;
+        self.resize_grid(idx);
+        self.windows[idx].needs_draw = true;
+        ctx.cancel_timer(token);
+      },
+      WindowTimer::Touch => self.start_touch_selection(idx),
+      WindowTimer::Autoscroll => self.autoscroll_step(ctx, idx),
+    }
+  }
+
+  fn start_touch_selection(&mut self, idx: usize) {
+    self.windows[idx].touch_token = None;
+    let point = self.windows[idx].touch.as_ref().and_then(|touch| {
+      self.cell_at(&self.windows[idx], touch.x, touch.last_y)
+    });
+    if let Some((row, col)) = point
+      && let Some(session) = self.windows[idx].session.as_mut()
+    {
+      session.term.grid_mut().start_selection(row, col);
+      if let Some(touch) = self.windows[idx].touch.as_mut() {
+        touch.selecting = true;
+      }
+      self.windows[idx].needs_draw = true;
+    }
+  }
+
+  fn reload_config(&mut self, ctx: &mut dyn WindowCtx) {
     let new = Config::load(&self.config_paths);
     self.bindings = Bindings::from_config(
       &new.key_bindings,
@@ -2306,24 +2721,28 @@ impl App {
     {
       self.font_size = new.main.font_size;
     }
-    if let Some(session) = self.windows[idx].session.as_mut() {
-      session.term.set_theme(Theme::from_config(&new.colors));
-      let grid = session.term.grid_mut();
-      grid.set_word_delimiters(new.main.word_delimiters.clone());
-      grid.set_scrollback_cap(new.scrollback.lines);
-      grid.set_search_regex(new.search.regex);
-      if let Some(shape) = cursor_shape_from(new.cursor.style.as_deref()) {
-        grid.set_cursor_shape(shape);
+    for window in &mut self.windows {
+      if let Some(session) = window.session.as_mut() {
+        session.term.set_theme(Theme::from_config(&new.colors));
+        let grid = session.term.grid_mut();
+        grid.set_word_delimiters(new.main.word_delimiters.clone());
+        grid.set_scrollback_cap(new.scrollback.lines);
+        if let Some(shape) = cursor_shape_from(new.cursor.style.as_deref()) {
+          grid.set_cursor_shape(shape);
+        }
+        grid.set_cursor_blink(new.cursor.blink);
       }
-      grid.set_cursor_blink(new.cursor.blink);
     }
     self.config = new;
     // Font, padding, and blending may all have changed; drop every cached
     // renderer so each rebuilds from the new config.
     self.renderers.clear();
-    self.windows[idx].snaps.clear();
-    self.resize_grid(idx);
-    self.windows[idx].needs_draw = true;
+    for idx in 0..self.windows.len() {
+      self.windows[idx].snaps.clear();
+      self.resize_grid(idx);
+      self.windows[idx].needs_draw = true;
+    }
+    self.update_activity_timers(ctx);
   }
 
   /// Request a repaint for every window whose displayed state changed since the
@@ -2364,16 +2783,13 @@ fn hint_labels(n: usize) -> Vec<String> {
 
 impl WindowApp for App {
   fn start(&mut self, ctx: &mut dyn WindowCtx) {
-    ctx.arm_timer(BLINK_TOKEN, BLINK_MS);
-    ctx.arm_timer(ANIM_TOKEN, ANIM_IDLE_MS);
     if self.server {
       match ipc::bind_listener() {
         Ok((listener, path)) => {
           let _ = listener.set_nonblocking(true);
           ctx.watch_readable(listener.as_raw_fd(), IPC_LISTEN_TOKEN);
           self.ipc_listener = Some(listener);
-          self.ipc_socket = Some(path);
-          ctx.arm_timer(IPC_SWEEP_TOKEN, 1000);
+          self.ipc_socket = path;
         },
         Err(err) => {
           tracing::error!("bind daemon socket: {err}");
@@ -2381,7 +2797,19 @@ impl WindowApp for App {
         },
       }
     } else {
-      self.open(ctx, None, Vec::new(), WindowOverrides::default(), None);
+      let req = mem::take(&mut self.initial);
+      let overrides = WindowOverrides {
+        title:  req.title,
+        app_id: req.app_id,
+      };
+      self.open(ctx, WindowLaunch {
+        cwd: req.cwd.map(PathBuf::from),
+        env: req.env,
+        command: req.command,
+        hold: req.hold,
+        overrides,
+        client: None,
+      });
     }
     self.flush_redraw(ctx);
   }
@@ -2549,7 +2977,7 @@ impl WindowApp for App {
     event: TouchEvent,
   ) {
     if let Some(idx) = self.win_index(id) {
-      self.on_touch_event(idx, event);
+      self.on_touch_event(ctx, idx, event);
     }
     self.flush_redraw(ctx);
   }
@@ -2589,93 +3017,17 @@ impl WindowApp for App {
     self.flush_redraw(ctx);
   }
 
-  #[expect(
-    clippy::cast_possible_truncation,
-    reason = "the animation beat is a small millisecond constant"
-  )]
   fn on_timer(&mut self, ctx: &mut dyn WindowCtx, token: u64) {
-    match token {
-      BLINK_TOKEN => {
-        self.blink_on = !self.blink_on;
-        for w in &mut self.windows {
-          w.needs_draw = true;
-        }
-        ctx.arm_timer(BLINK_TOKEN, BLINK_MS);
-      },
-      ANIM_TOKEN => {
-        let mut animating = false;
-        for w in &mut self.windows {
-          let (changed, anim) = match w.session.as_mut() {
-            Some(s) => {
-              (s.term.animation_tick(ANIM_MS as u32), s.term.is_animating())
-            },
-            None => (false, false),
-          };
-          if changed {
-            w.snaps.clear();
-            w.needs_draw = true;
-          }
-          animating |= anim;
-        }
-        ctx.arm_timer(
-          ANIM_TOKEN,
-          if animating { ANIM_MS } else { ANIM_IDLE_MS },
-        );
-      },
-      IPC_SWEEP_TOKEN => {
-        self.expire_clients(ctx);
-        ctx.arm_timer(IPC_SWEEP_TOKEN, 1000);
-      },
-      _ => {
-        if let Some(idx) = self
-          .windows
-          .iter()
-          .position(|w| w.flash_token == Some(token))
-        {
-          let win = &mut self.windows[idx];
-          win.flashing = false;
-          win.snaps.clear();
-          win.needs_draw = true;
-          win.flash_token = None;
-          // The one-shot timer already fired; drop its source-map entry.
-          ctx.cancel_timer(token);
-        } else if let Some(idx) = self
-          .windows
-          .iter()
-          .position(|w| w.sync_token == Some(token))
-        {
-          if let Some(s) = self.windows[idx].session.as_mut() {
-            s.term.grid_mut().set_sync(false);
-          }
-          self.windows[idx].sync_token = None;
-          self.windows[idx].needs_draw = true;
-          ctx.cancel_timer(token);
-        } else if let Some(idx) = self
-          .windows
-          .iter()
-          .position(|w| w.resize_token == Some(token))
-        {
-          self.windows[idx].resize_token = None;
-          self.resize_grid(idx);
-          self.windows[idx].needs_draw = true;
-          ctx.cancel_timer(token);
-        } else if let Some(idx) = self
-          .windows
-          .iter()
-          .position(|w| w.autoscroll_token == Some(token))
-        {
-          self.autoscroll_step(ctx, idx);
-        }
-      },
+    if !self.handle_global_timer(ctx, token)
+      && let Some((idx, kind)) = self.window_timer(token)
+    {
+      self.handle_window_timer(ctx, token, idx, kind);
     }
     self.flush_redraw(ctx);
   }
 
   fn on_reload(&mut self, ctx: &mut dyn WindowCtx) {
-    let idx = self.focused;
-    if idx < self.windows.len() {
-      self.reload_config(idx);
-    }
+    self.reload_config(ctx);
     self.flush_redraw(ctx);
   }
 
