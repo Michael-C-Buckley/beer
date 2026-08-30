@@ -4,7 +4,7 @@ mod perform;
 
 #[cfg(test)] mod conformance;
 
-use std::{io::Write as _, str};
+use std::{collections::HashMap, io::Write as _, str};
 
 use beer_protocols::{
   caps::cap_value,
@@ -55,6 +55,12 @@ pub enum ClipboardOp {
 pub struct Notification {
   pub title: Option<String>,
   pub body:  String,
+}
+
+#[derive(Debug, Default)]
+struct PendingNotification {
+  title: String,
+  body:  String,
 }
 
 /// A terminal progress state reported through `OSC 9;4`.
@@ -169,43 +175,44 @@ const fn enc(on: bool, encoding: MouseEncoding) -> MouseEncoding {
 /// The terminal model: a grid plus the escape-sequence state around it.
 #[derive(Debug)]
 pub struct Term {
-  grid:          Grid,
-  title:         Option<String>,
-  title_stack:   Vec<Option<String>>,
-  response:      Vec<u8>,
-  g0:            Charset,
-  g1:            Charset,
-  g2:            Charset,
-  g3:            Charset,
+  grid:                  Grid,
+  title:                 Option<String>,
+  title_stack:           Vec<Option<String>>,
+  response:              Vec<u8>,
+  g0:                    Charset,
+  g1:                    Charset,
+  g2:                    Charset,
+  g3:                    Charset,
   /// Which G-set GL maps to (0-3), set by SI/SO and the locking shifts.
-  gl:            u8,
+  gl:                    u8,
   /// One-shot G-set for the next printed character (SS2/SS3), then cleared.
-  single_shift:  Option<u8>,
+  single_shift:          Option<u8>,
   /// Accumulated payload of an in-progress `DCS + q` (XTGETTCAP) query.
-  xtgettcap:     Option<Vec<u8>>,
+  xtgettcap:             Option<Vec<u8>>,
   /// Accumulated payload of an in-progress `DCS $ q` (DECRQSS) query.
-  decrqss:       Option<Vec<u8>>,
+  decrqss:               Option<Vec<u8>>,
   /// Pending OSC 52 clipboard requests, drained by the front-end.
-  clipboard_ops: Vec<ClipboardOp>,
+  clipboard_ops:         Vec<ClipboardOp>,
   /// The active colour scheme (seeded from config, mutated by OSC escapes).
-  theme:         Theme,
+  theme:                 Theme,
   /// Set when the child rings the bell (`BEL`); cleared by the front-end.
-  bell:          bool,
+  bell:                  bool,
   /// Working directory reported by the shell via OSC 7, for new windows.
-  cwd:           Option<String>,
+  cwd:                   Option<String>,
   /// Desktop notifications requested via OSC 9/777/99, drained by the
   /// front-end.
-  notifications: Vec<Notification>,
+  notifications:         Vec<Notification>,
+  pending_notifications: HashMap<String, PendingNotification>,
   /// Progress reported through OSC 9;4, shown by the front-end in the title.
-  progress:      Option<Progress>,
+  progress:              Option<Progress>,
   /// Kitty graphics protocol state (images, placements, transmissions).
-  graphics:      Graphics,
+  graphics:              Graphics,
   /// APC capture state, since `vte` does not surface APC sequences.
-  apc:           ApcScan,
+  apc:                   ApcScan,
   /// Payload of an APC being captured, between `ESC _` and its terminator.
-  apc_buf:       Vec<u8>,
+  apc_buf:               Vec<u8>,
   /// Current cell size in pixels, for translating image sizes into cells.
-  cell_px:       (u32, u32),
+  cell_px:               (u32, u32),
 }
 
 /// Where the APC capture splitter is in the byte stream. `vte` consumes APC
@@ -237,28 +244,29 @@ const APC_MAX: usize = 1 << 20;
 impl Term {
   pub fn new(cols: usize, rows: usize) -> Self {
     Self {
-      grid:          Grid::new(cols, rows),
-      title:         None,
-      title_stack:   Vec::new(),
-      response:      Vec::new(),
-      g0:            Charset::Ascii,
-      g1:            Charset::Ascii,
-      g2:            Charset::Ascii,
-      g3:            Charset::Ascii,
-      gl:            0,
-      single_shift:  None,
-      xtgettcap:     None,
-      decrqss:       None,
-      clipboard_ops: Vec::new(),
-      theme:         Theme::default(),
-      bell:          false,
-      cwd:           None,
-      notifications: Vec::new(),
-      progress:      None,
-      graphics:      Graphics::new(),
-      apc:           ApcScan::default(),
-      apc_buf:       Vec::new(),
-      cell_px:       (1, 1),
+      grid:                  Grid::new(cols, rows),
+      title:                 None,
+      title_stack:           Vec::new(),
+      response:              Vec::new(),
+      g0:                    Charset::Ascii,
+      g1:                    Charset::Ascii,
+      g2:                    Charset::Ascii,
+      g3:                    Charset::Ascii,
+      gl:                    0,
+      single_shift:          None,
+      xtgettcap:             None,
+      decrqss:               None,
+      clipboard_ops:         Vec::new(),
+      theme:                 Theme::default(),
+      bell:                  false,
+      cwd:                   None,
+      notifications:         Vec::new(),
+      pending_notifications: HashMap::new(),
+      progress:              None,
+      graphics:              Graphics::new(),
+      apc:                   ApcScan::default(),
+      apc_buf:               Vec::new(),
+      cell_px:               (1, 1),
     }
   }
 
@@ -1339,6 +1347,19 @@ mod tests {
       },
     ]);
     assert!(t.take_notifications().is_empty());
+  }
+
+  #[test]
+  fn osc99_collects_chunked_title_and_body() {
+    let mut t = Term::new(20, 2);
+    feed(&mut t, b"\x1b]99;i=job:d=0:p=title;Build\x1b\\");
+    feed(&mut t, b"\x1b]99;i=job:d=0:p=body:e=1;eHl6\x1b\\");
+    assert!(t.take_notifications().is_empty());
+    feed(&mut t, b"\x1b]99;i=job:p=body:e=1;eHl6\x1b\\");
+    assert_eq!(t.take_notifications(), vec![Notification {
+      title: Some("Build".into()),
+      body:  "xyzxyz".into(),
+    }]);
   }
 
   #[test]

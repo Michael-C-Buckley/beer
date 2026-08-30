@@ -1,3 +1,5 @@
+use std::str;
+
 use vte::Perform;
 
 use super::{
@@ -23,6 +25,73 @@ use super::{
   rgb_tuple,
   translate,
 };
+
+impl Term {
+  fn osc99(&mut self, metadata: &[u8], payload: &[u8]) {
+    const MAX_NOTIFICATION: usize = 64 * 1024;
+    let metadata = str::from_utf8(metadata).unwrap_or("");
+    let field = metadata
+      .split(':')
+      .find_map(|item| item.strip_prefix("p="))
+      .unwrap_or("title");
+    if !matches!(field, "title" | "body") {
+      return;
+    }
+    let id = metadata.split(':').find_map(|item| item.strip_prefix("i="));
+    let done = !metadata.split(':').any(|item| item == "d=0");
+    let encoded = metadata.split(':').any(|item| item == "e=1");
+    let bytes = if encoded {
+      let Some(decoded) = base64_decode(payload) else {
+        return;
+      };
+      decoded
+    } else {
+      payload.to_vec()
+    };
+    let Ok(text) = String::from_utf8(bytes) else {
+      return;
+    };
+    if let Some(id) = id {
+      let pending = self
+        .pending_notifications
+        .entry(id.to_string())
+        .or_default();
+      append_notification_field(pending, field, &text, MAX_NOTIFICATION);
+      if done && let Some(ready) = self.pending_notifications.remove(id) {
+        self.notifications.push(Notification {
+          title: (!ready.title.is_empty()).then_some(ready.title),
+          body:  ready.body,
+        });
+      }
+    } else if done {
+      let mut ready = super::PendingNotification::default();
+      append_notification_field(&mut ready, field, &text, MAX_NOTIFICATION);
+      self.notifications.push(Notification {
+        title: (!ready.title.is_empty()).then_some(ready.title),
+        body:  ready.body,
+      });
+    }
+  }
+}
+
+fn append_notification_field(
+  notification: &mut super::PendingNotification,
+  field: &str,
+  text: &str,
+  limit: usize,
+) {
+  let target = if field == "body" {
+    &mut notification.body
+  } else {
+    &mut notification.title
+  };
+  for character in text.chars() {
+    if target.len() + character.len_utf8() > limit {
+      break;
+    }
+    target.push(character);
+  }
+}
 
 #[expect(
   clippy::absolute_paths,
@@ -268,13 +337,11 @@ impl Perform for Term {
           self.notifications.push(Notification { title, body });
         }
       },
-      // OSC 99: kitty desktop-notification protocol. We honour the common
-      // single-chunk form, taking the payload as the body and ignoring the
-      // metadata key=value field.
       Some(&n) if n == b"99" => {
-        if let Some(body) = osc_text(params.get(2)).filter(|b| !b.is_empty()) {
-          self.notifications.push(Notification { title: None, body });
-        }
+        self.osc99(
+          params.get(1).copied().unwrap_or_default(),
+          params.get(2).copied().unwrap_or_default(),
+        );
       },
       // OSC 4: set/query palette entries (pairs of index;spec).
       Some(&n) if n == b"4" => self.osc_palette(params, bell),
