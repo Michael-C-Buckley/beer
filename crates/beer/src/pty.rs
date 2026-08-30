@@ -1,14 +1,16 @@
 //! Pseudo-terminal: open a master/slave pair and run the user's shell on it.
 
 use std::{
+  env,
   ffi::{OsStr, OsString},
+  fs,
   io,
   os::{
     fd::{AsFd, OwnedFd},
     unix::process::CommandExt,
   },
   path::Path,
-  process::{self, Child, Command, ExitStatus, Stdio},
+  process::{Child, Command, ExitStatus, Stdio},
 };
 
 use anyhow::Context;
@@ -22,6 +24,19 @@ use rustix::{
 pub struct Pty {
   master: OwnedFd,
   child:  Child,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct SpawnOptions<'a> {
+  pub cols:              u16,
+  pub rows:              u16,
+  pub cell:              (u16, u16),
+  pub term:              &'a str,
+  pub cwd:               Option<&'a Path>,
+  pub env:               &'a [(String, String)],
+  pub command:           &'a [String],
+  pub window_id:         u64,
+  pub shell_integration: bool,
 }
 
 #[expect(
@@ -39,14 +54,18 @@ impl Pty {
     reason = "launching the configured shell and configuring its controlling \
               terminal are PTY boundaries"
   )]
-  pub fn spawn(
-    cols: u16,
-    rows: u16,
-    cell: (u16, u16),
-    term: &str,
-    cwd: Option<&Path>,
-    env: &[(String, String)],
-  ) -> anyhow::Result<Self> {
+  pub fn spawn(options: SpawnOptions<'_>) -> anyhow::Result<Self> {
+    let SpawnOptions {
+      cols,
+      rows,
+      cell,
+      term,
+      cwd,
+      env,
+      command,
+      window_id,
+      shell_integration,
+    } = options;
     let master =
       openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC)
         .context("open pty master")?;
@@ -77,9 +96,22 @@ impl Pty {
       slave,
     );
 
-    let mut cmd = Command::new(&shell);
+    let mut cmd = command.first().map_or_else(
+      || {
+        let mut cmd = Command::new(&shell);
+        cmd.arg0(&argv0);
+        cmd
+      },
+      |program| {
+        let mut cmd = Command::new(program);
+        cmd.args(&command[1..]);
+        cmd
+      },
+    );
+    if command.is_empty() && shell_integration {
+      configure_shell_integration(&shell, &mut cmd);
+    }
     cmd
-      .arg0(&argv0)
       .stdin(Stdio::from(stdin))
       .stdout(Stdio::from(stdout))
       .stderr(Stdio::from(stderr));
@@ -96,7 +128,9 @@ impl Pty {
             // Advertise Kitty graphics protocol compatibility. Yazi (and other
             // clients) gate `kgp` vs `kgp_old` on recognising the terminal
             // brand; KITTY_WINDOW_ID is the env check they use for Kitty.
-            .env("KITTY_WINDOW_ID", process::id().to_string())
+            .env("KITTY_WINDOW_ID", window_id.to_string())
+            .env("TERM_PROGRAM", "beer")
+            .env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"))
             .env_remove("COLUMNS")
             .env_remove("LINES")
             .env_remove("TERMCAP");
@@ -150,6 +184,54 @@ impl Pty {
       .ok()
       .and_then(|pgrp| u32::try_from(pgrp.as_raw_nonzero().get()).ok())
       .is_some_and(|pgrp| pgrp != self.child.id())
+  }
+}
+
+fn configure_shell_integration(shell: &OsStr, command: &mut Command) {
+  let name = Path::new(shell)
+    .file_name()
+    .and_then(OsStr::to_str)
+    .unwrap_or("");
+  if name == "fish" {
+    command.args(["--init-command", "function __beer_prompt --on-event fish_prompt; printf '\\e]133;A\\e\\\\e]7;file://%s%s\\e\\\\' (hostname) $PWD; end"]);
+    return;
+  }
+  let Some(runtime) = env::var_os("XDG_RUNTIME_DIR") else {
+    return;
+  };
+  let dir = Path::new(&runtime).join("beer-shell-integration");
+  if fs::create_dir_all(&dir).is_err() {
+    return;
+  }
+  if name == "bash" {
+    let path = dir.join("bashrc");
+    let script = "[[ -r $HOME/.bashrc ]] && source $HOME/.bashrc\n__beer_prompt(){ printf '\\e]133;A\\e\\\\e]7;file://%s%s\\e\\\\' \"$HOSTNAME\" \"$PWD\"; }\nPROMPT_COMMAND=\"__beer_prompt${PROMPT_COMMAND:+;$PROMPT_COMMAND}\"\n";
+    if fs::write(&path, script).is_ok() {
+      command.arg("--rcfile").arg(path);
+    }
+  } else if name == "zsh" {
+    install_zsh_integration(&dir, command);
+  }
+}
+
+fn install_zsh_integration(dir: &Path, command: &mut Command) {
+  let original = env::var_os("ZDOTDIR")
+    .or_else(|| env::var_os("HOME"))
+    .unwrap_or_default();
+  for file in [".zshenv", ".zprofile", ".zlogin"] {
+    let source = format!(
+      "[[ -r $BEER_ORIGINAL_ZDOTDIR/{file} ]] && source \
+       $BEER_ORIGINAL_ZDOTDIR/{file}\n"
+    );
+    if fs::write(dir.join(file), source).is_err() {
+      return;
+    }
+  }
+  let script = "[[ -r $BEER_ORIGINAL_ZDOTDIR/.zshrc ]] && source $BEER_ORIGINAL_ZDOTDIR/.zshrc\nautoload -Uz add-zsh-hook\n__beer_prompt(){ printf '\\e]133;A\\e\\\\e]7;file://%s%s\\e\\\\' \"$HOST\" \"$PWD\"; }\nadd-zsh-hook precmd __beer_prompt\n";
+  if fs::write(dir.join(".zshrc"), script).is_ok() {
+    command
+      .env("BEER_ORIGINAL_ZDOTDIR", original)
+      .env("ZDOTDIR", dir);
   }
 }
 
