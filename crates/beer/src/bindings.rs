@@ -27,6 +27,7 @@ pub enum Action {
   PipeVisible,
   PipeScrollback,
   UrlMode,
+  UrlCopy,
   UnicodeInput,
 }
 
@@ -52,6 +53,7 @@ impl Action {
       "pipe-visible" => Self::PipeVisible,
       "pipe-scrollback" => Self::PipeScrollback,
       "url-mode" => Self::UrlMode,
+      "url-copy" => Self::UrlCopy,
       "unicode-input" => Self::UnicodeInput,
       _ => return None,
     })
@@ -309,6 +311,7 @@ const DEFAULT_BINDINGS: &[(&str, &str)] = &[
   ("Ctrl+Shift+Up", "jump-prompt-up"),
   ("Ctrl+Shift+Down", "jump-prompt-down"),
   ("Ctrl+Shift+O", "url-mode"),
+  ("Ctrl+Shift+Y", "url-copy"),
   ("Ctrl+Shift+U", "unicode-input"),
 ];
 
