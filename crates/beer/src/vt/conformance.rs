@@ -217,6 +217,15 @@ fn sgr_sets_and_resets_flags() {
 }
 
 #[test]
+fn sgr_distinguishes_normal_and_rapid_blink() {
+  let t = term(10, 1, b"\x1b[5mN\x1b[6mR\x1b[25mX");
+  assert!(t.grid().cell(0, 0).flags.contains(Flags::BLINK));
+  assert!(t.grid().cell(1, 0).flags.contains(Flags::RAPID_BLINK));
+  assert!(!t.grid().cell(2, 0).flags.contains(Flags::BLINK));
+  assert!(!t.grid().cell(2, 0).flags.contains(Flags::RAPID_BLINK));
+}
+
+#[test]
 fn sgr_reverse_strike_overline() {
   let t = term(10, 1, b"\x1b[7;9;53mZ");
   let z = t.grid().cell(0, 0);

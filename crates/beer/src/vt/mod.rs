@@ -109,9 +109,7 @@ fn sgr_report(cell: &Cell) -> String {
     Underline::Dotted => p.push("4:4".into()),
     Underline::Dashed => p.push("4:5".into()),
   }
-  if f.contains(Flags::BLINK) {
-    p.push("5".into());
-  }
+  push_blink_report(&mut p, f);
   if f.contains(Flags::REVERSE) {
     p.push("7".into());
   }
@@ -134,6 +132,15 @@ fn sgr_report(cell: &Cell) -> String {
   p.join(";")
 }
 
+fn push_blink_report(params: &mut Vec<String>, flags: Flags) {
+  if flags.contains(Flags::BLINK) {
+    params.push("5".into());
+  }
+  if flags.contains(Flags::RAPID_BLINK) {
+    params.push("6".into());
+  }
+}
+
 /// Append the SGR parameter for `color` to `p`. `base` is the 8-colour set
 /// code (30 fg / 40 bg); `ext` is the extended-colour code (38 / 48).
 fn push_color(p: &mut Vec<String>, color: Color, base: u16, ext: u16) {
@@ -146,6 +153,36 @@ fn push_color(p: &mut Vec<String>, color: Color, base: u16, ext: u16) {
     Color::Indexed(i) => p.push(format!("{ext};5;{i}")),
     Color::Rgb(r, g, b) => p.push(format!("{ext};2;{r};{g};{b}")),
   }
+}
+
+const fn set_pen_blink(pen: &mut Cell, code: u16) -> bool {
+  match code {
+    5 => {
+      pen.flags.remove(Flags::RAPID_BLINK);
+      pen.flags.insert(Flags::BLINK);
+    },
+    6 => {
+      pen.flags.remove(Flags::BLINK);
+      pen.flags.insert(Flags::RAPID_BLINK);
+    },
+    25 => pen.flags.remove(Flags::BLINK.union(Flags::RAPID_BLINK)),
+    _ => return false,
+  }
+  true
+}
+
+const fn change_rect_blink(
+  code: u16,
+  set: &mut Flags,
+  clear: &mut Flags,
+) -> bool {
+  match code {
+    5 => set.insert(Flags::BLINK),
+    6 => set.insert(Flags::RAPID_BLINK),
+    25 => clear.insert(Flags::BLINK.union(Flags::RAPID_BLINK)),
+    _ => return false,
+  }
+  true
 }
 
 /// Parse an OSC colour spec into an [`Rgb`].
@@ -695,13 +732,16 @@ impl Term {
       let code = p.first().copied().unwrap_or(0);
       let pen = self.grid.pen_mut();
       let mut step = 1;
+      if set_pen_blink(pen, code) {
+        i += step;
+        continue;
+      }
       match code {
         0 => *pen = Cell::default(),
         1 => pen.flags.insert(Flags::BOLD),
         2 => pen.flags.insert(Flags::DIM),
         3 => pen.flags.insert(Flags::ITALIC),
         4 => pen.underline = underline_from(p),
-        5 | 6 => pen.flags.insert(Flags::BLINK),
         7 => pen.flags.insert(Flags::REVERSE),
         8 => pen.flags.insert(Flags::HIDDEN),
         9 => pen.flags.insert(Flags::STRIKE),
@@ -709,7 +749,6 @@ impl Term {
         22 => pen.flags.remove(Flags::BOLD.union(Flags::DIM)),
         23 => pen.flags.remove(Flags::ITALIC),
         24 => pen.underline = Underline::None,
-        25 => pen.flags.remove(Flags::BLINK),
         27 => pen.flags.remove(Flags::REVERSE),
         28 => pen.flags.remove(Flags::HIDDEN),
         29 => pen.flags.remove(Flags::STRIKE),
@@ -894,23 +933,26 @@ impl Term {
     let (mut set, mut clear) = (Flags::empty(), Flags::empty());
     let mut underline = None;
     for item in p.iter().skip(4) {
-      match item.first().copied().unwrap_or(0) {
+      let code = item.first().copied().unwrap_or(0);
+      if change_rect_blink(code, &mut set, &mut clear) {
+        continue;
+      }
+      match code {
         0 => {
           set = Flags::empty();
           clear = Flags::BOLD
             .union(Flags::BLINK)
+            .union(Flags::RAPID_BLINK)
             .union(Flags::REVERSE)
             .union(Flags::STRIKE);
           underline = Some(Underline::None);
         },
         1 => set.insert(Flags::BOLD),
         4 => underline = Some(Underline::Single),
-        5 => set.insert(Flags::BLINK),
         7 => set.insert(Flags::REVERSE),
         9 => set.insert(Flags::STRIKE),
         22 => clear.insert(Flags::BOLD),
         24 => underline = Some(Underline::None),
-        25 => clear.insert(Flags::BLINK),
         27 => clear.insert(Flags::REVERSE),
         29 => clear.insert(Flags::STRIKE),
         _ => {},
