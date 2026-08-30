@@ -7,6 +7,7 @@
 
 use std::{
   collections::{HashMap, HashSet},
+  f64::consts::TAU,
   mem,
   num::NonZeroU16,
   sync::LazyLock,
@@ -268,6 +269,7 @@ pub struct Frame<'a> {
   pub theme:        &'a Theme,
   pub focused:      bool,
   pub blink_on:     bool,
+  pub rapid_on:     bool,
   /// Hyperlink currently under the pointer; its cells get a hover underline.
   pub hovered_link: Option<NonZeroU16>,
   /// The graphics engine, source of image pixels and placement geometry.
@@ -293,17 +295,22 @@ struct ShapePlan {
 /// Whether a cell takes part in run shaping. Cells drawn by another path
 /// (combining clusters, braille, box drawing, images, sized blocks) or hidden
 /// this blink phase are excluded so a run never crosses them.
-fn shapeable(cell: &Cell, blink_on: bool) -> bool {
+fn shapeable(cell: &Cell, blink_on: bool, rapid_on: bool) -> bool {
   if cell.flags.contains(Flags::WIDE_CONT) || cell.sized.is_some() {
     return false;
   }
   if cell.combining.is_some() || cell.c == PLACEHOLDER {
     return false;
   }
-  if cell.flags.contains(Flags::BLINK) && !blink_on {
+  if blink_hidden(cell, blink_on, rapid_on) {
     return false;
   }
-  !is_braille(cell.c) && !is_box_draw(cell.c)
+  !is_braille(cell.c) && !is_geometric(cell.c)
+}
+
+const fn blink_hidden(cell: &Cell, blink_on: bool, rapid_on: bool) -> bool {
+  (cell.flags.contains(Flags::BLINK) && !blink_on)
+    || (cell.flags.contains(Flags::RAPID_BLINK) && !rapid_on)
 }
 
 #[derive(Debug)]
@@ -391,8 +398,8 @@ impl Renderer {
     frame: &Frame,
     y: usize,
   ) {
-    let (theme, focused, blink_on) =
-      (frame.theme, frame.focused, frame.blink_on);
+    let (theme, focused, blink_on, rapid_on) =
+      (frame.theme, frame.focused, frame.blink_on, frame.rapid_on);
     // Subpixel text needs an opaque destination; a translucent window falls
     // back to grayscale (see `sub_mode`).
     let opaque_bg = theme.alpha == 0xFF;
@@ -461,7 +468,7 @@ impl Renderer {
     // Shape the row's runs up front so the draw loop can place ligature glyphs
     // and skip the cells they absorb.
     let plan = if self.fonts.ligatures() {
-      self.plan_shaping(cells, cols, blink_on)
+      self.plan_shaping(cells, cols, blink_on, rapid_on)
     } else {
       ShapePlan::default()
     };
@@ -482,7 +489,7 @@ impl Renderer {
         }
         continue;
       }
-      if cell.flags.contains(Flags::BLINK) && !blink_on {
+      if blink_hidden(cell, blink_on, rapid_on) {
         continue;
       }
       // A Unicode placeholder cell shows an image slice, drawn in its own
@@ -526,8 +533,8 @@ impl Renderer {
         // way tools like btop expect, rather than however the fallback
         // font happens to size its braille glyphs.
         draw_braille(&mut canvas, cell.c, origin_x, row_top, m, fg);
-      } else if is_box_draw(cell.c)
-        && draw_box(&mut canvas, cell.c, origin_x, row_top, m, fg)
+      } else if is_geometric(cell.c)
+        && draw_geometric(&mut canvas, cell.c, origin_x, row_top, m, fg)
       {
         // Box drawing, block elements, and sextants are drawn geometrically so
         // they fill the cell exactly and tile seamlessly - fonts leave seams.
@@ -806,12 +813,13 @@ impl Renderer {
     cells: &[Cell],
     cols: usize,
     blink_on: bool,
+    rapid_on: bool,
   ) -> ShapePlan {
     let mut plan = ShapePlan::default();
     let cols = cols.min(cells.len());
     let mut x = 0;
     while x < cols {
-      if !shapeable(&cells[x], blink_on) {
+      if !shapeable(&cells[x], blink_on, rapid_on) {
         x += 1;
         continue;
       }
@@ -819,7 +827,7 @@ impl Renderer {
       let mut text = String::new();
       let mut offsets: Vec<(usize, usize)> = Vec::new();
       while x < cols
-        && shapeable(&cells[x], blink_on)
+        && shapeable(&cells[x], blink_on, rapid_on)
         && cell_style(&cells[x]) == style
       {
         offsets.push((text.len(), x));
@@ -1482,6 +1490,114 @@ fn draw_braille(
 /// sextants (U+1FB00-1FB3B) and octants (U+1CD00-1CDE5).
 const fn is_box_draw(c: char) -> bool {
   matches!(c as u32, 0x2500..=0x259F | 0x1FB00..=0x1FB3B | 0x1CD00..=0x1CDE5)
+}
+
+const fn is_geometric(c: char) -> bool {
+  is_box_draw(c) || matches!(c as u32, 0xE0B0..=0xE0B7)
+}
+
+fn draw_geometric(
+  canvas: &mut Canvas,
+  c: char,
+  x0: i32,
+  top: i32,
+  m: CellMetrics,
+  fg: Rgb,
+) -> bool {
+  if matches!(c as u32, 0xE0B0..=0xE0B7) {
+    draw_powerline(canvas, c as u32, x0, top, m, fg);
+    true
+  } else {
+    draw_box(canvas, c, x0, top, m, fg)
+  }
+}
+
+fn draw_powerline(
+  canvas: &mut Canvas,
+  cp: u32,
+  x0: i32,
+  top: i32,
+  m: CellMetrics,
+  fg: Rgb,
+) {
+  match cp {
+    0xE0B0 => draw_triangle(canvas, x0, top, m, fg, true, true),
+    0xE0B1 => draw_triangle(canvas, x0, top, m, fg, true, false),
+    0xE0B2 => draw_triangle(canvas, x0, top, m, fg, false, true),
+    0xE0B3 => draw_triangle(canvas, x0, top, m, fg, false, false),
+    0xE0B4 => draw_semicircle(canvas, x0, top, m, fg, true, true),
+    0xE0B5 => draw_semicircle(canvas, x0, top, m, fg, true, false),
+    0xE0B6 => draw_semicircle(canvas, x0, top, m, fg, false, true),
+    0xE0B7 => draw_semicircle(canvas, x0, top, m, fg, false, false),
+    _ => {},
+  }
+}
+
+#[expect(
+  clippy::cast_possible_wrap,
+  clippy::cast_sign_loss,
+  reason = "powerline geometry is bounded by the terminal cell"
+)]
+fn draw_triangle(
+  canvas: &mut Canvas,
+  x0: i32,
+  top: i32,
+  m: CellMetrics,
+  fg: Rgb,
+  right: bool,
+  filled: bool,
+) {
+  let (w, h) = (m.width as i32, m.height as i32);
+  let center = h / 2;
+  for y in 0..h {
+    let radius = if y <= center { center } else { h - 1 - center }.max(1);
+    let edge = (w - 1) * (radius - (y - center).abs()).max(0) / radius;
+    let edge = if right { edge } else { w - 1 - edge };
+    if filled {
+      let (start, width) = if right {
+        (0, edge + 1)
+      } else {
+        (edge, w - edge)
+      };
+      canvas.hline(x0 + start, top + y, width as u32, fg);
+    } else {
+      canvas.put(x0 + edge, top + y, fg);
+    }
+  }
+}
+
+#[expect(
+  clippy::cast_possible_truncation,
+  clippy::cast_possible_wrap,
+  clippy::cast_sign_loss,
+  reason = "powerline geometry is bounded by the terminal cell"
+)]
+fn draw_semicircle(
+  canvas: &mut Canvas,
+  x0: i32,
+  top: i32,
+  m: CellMetrics,
+  fg: Rgb,
+  right: bool,
+  filled: bool,
+) {
+  let (w, h) = (m.width as i32, m.height as i32);
+  let radius = f64::from((h - 1).max(1)) / 2.0;
+  for y in 0..h {
+    let dy = (f64::from(y) - radius) / radius;
+    let extent = ((1.0 - dy * dy).max(0.0).sqrt() * f64::from(w - 1)) as i32;
+    let edge = if right { extent } else { w - 1 - extent };
+    if filled {
+      let (start, width) = if right {
+        (0, edge + 1)
+      } else {
+        (edge, w - edge)
+      };
+      canvas.hline(x0 + start, top + y, width as u32, fg);
+    } else {
+      canvas.put(x0 + edge, top + y, fg);
+    }
+  }
 }
 
 /// Draw a box-drawing, block-element, or sextant glyph directly into the cell.
@@ -2297,10 +2413,7 @@ fn draw_decorations(
       canvas.hline(x0, (uy - 2).max(top), w, uc);
     },
     Underline::Curly => {
-      for dx in 0..w as i32 {
-        let wobble = i32::from((dx / 2) % 2 != 0);
-        canvas.put(x0 + dx, uy - wobble, uc);
-      }
+      draw_undercurl(canvas, x0, top, uy, w, m.stroke, uc);
     },
     Underline::Dotted => {
       for dx in (0..w as i32).step_by(2) {
@@ -2323,6 +2436,29 @@ fn draw_decorations(
   }
 }
 
+#[expect(
+  clippy::cast_possible_truncation,
+  clippy::cast_possible_wrap,
+  reason = "underline geometry is bounded by the terminal cell"
+)]
+fn draw_undercurl(
+  canvas: &mut Canvas,
+  x0: i32,
+  top: i32,
+  baseline: i32,
+  width: u32,
+  stroke: u32,
+  color: Rgb,
+) {
+  let amplitude = f64::from(stroke.clamp(2, 4));
+  let period = f64::from(width.max(6));
+  for dx in 0..width as i32 {
+    let phase = TAU * f64::from(dx) / period;
+    let y = baseline - (amplitude * (phase.sin() + 1.0) / 2.0).round() as i32;
+    canvas.put(x0 + dx, y.max(top), color);
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::{
@@ -2332,8 +2468,9 @@ mod tests {
     Rgb,
     box_arms,
     braille_geometry,
-    draw_box,
+    draw_geometric,
     is_box_draw,
+    is_geometric,
     sextant_pattern,
   };
 
@@ -2359,7 +2496,7 @@ mod tests {
       ascent: (size * 3 / 4) as u32,
       stroke: (size / 8).max(1) as u32,
     };
-    assert!(draw_box(&mut canvas, c, 0, 0, m, Rgb(255, 255, 255)));
+    assert!(draw_geometric(&mut canvas, c, 0, 0, m, Rgb(255, 255, 255)));
     move |x: i32, y: i32| buf[((y * size + x) * 4) as usize] != 0
   }
 
@@ -2382,6 +2519,18 @@ mod tests {
     assert!(is_box_draw('\u{1FB3B}')); // last sextant
     assert!(!is_box_draw('\u{1FB3C}')); // wedge, not handled
     assert!(!is_box_draw('A'));
+    assert!(is_geometric('\u{E0B0}'));
+    assert!(is_geometric('\u{E0B7}'));
+  }
+
+  #[test]
+  fn powerline_separators_reach_cell_edges() {
+    let right = render_glyph('\u{E0B0}', 16);
+    assert!(right(0, 0));
+    assert!(right(15, 8));
+    let left = render_glyph('\u{E0B2}', 16);
+    assert!(left(15, 0));
+    assert!(left(0, 8));
   }
 
   #[test]
@@ -2492,7 +2641,7 @@ mod tests {
       ascent: 18,
       stroke: 2,
     };
-    assert!(draw_box(
+    assert!(draw_geometric(
       &mut canvas,
       '\u{2571}',
       0,
