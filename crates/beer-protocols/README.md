@@ -204,7 +204,7 @@ XTGETTCAP answers `TN` (terminal name `beer`), `Co`/`colors` (256), and `RGB`
 | `OSC 8 ; params ; URI`            | hyperlink (empty URI ends it)                    |
 | `OSC 9 ; Pt`                      | desktop notification (iTerm2 style)              |
 | `OSC 777 ; notify ; title ; body` | desktop notification (rxvt style)                |
-| `OSC 99 ; metadata ; body`        | desktop notification (kitty style, single-chunk) |
+| `OSC 99 ; metadata ; payload`     | desktop notification (kitty style, chunked)      |
 | `OSC 52 ; target ; data`          | clipboard set (base64) or query (`?`)            |
 | `OSC 133 ; A/B/C/D`               | shell-integration prompt marks                   |
 
@@ -216,9 +216,13 @@ per channel). Colour queries reply in the `rgb:rrrr/gggg/bbbb` form.
 ### Clipboard (OSC 52)
 
 `OSC 52 ; c ; <base64>` sets the clipboard, `; p ;` the primary selection;
-`; c ; ?` queries. For privacy, a query is answered from the text beer itself
-last placed there, **not** the live system clipboard - so a remote program
-cannot read what another application copied.
+`; c ; ?` queries. The `[security] osc52` policy independently controls copy
+and query access. An allowed query is answered from the text beer itself last
+placed there, **not** the live system clipboard, so a remote program cannot
+read what another application copied.
+
+Kitty `OSC 99` notifications honor title/body fields, ids, base64 payloads, and
+`d=0` continuation chunks. Pending notifications are bounded before delivery.
 
 ### Shell integration (OSC 133 / OSC 7)
 
@@ -245,8 +249,9 @@ so a plain shell stays usable.
 ## Mouse
 
 Reports are framed in the legacy byte form (`CSI M Cb Cx Cy`), the UTF-8
-coordinate form (DECSET 1005), or the SGR form (`CSI < Cb ; Cx ; Cy M/m`, DECSET
-1006). Shift/Alt/Ctrl modifier bits and the motion bit are encoded; legacy
+coordinate form (DECSET 1005), the urxvt form (DECSET 1015), or the SGR form
+(`CSI < Cb ; Cx ; Cy M/m`, DECSET 1006). DECSET 1016 makes SGR coordinates
+pixel-based. Shift/Alt/Ctrl modifier bits and the motion bit are encoded; legacy
 releases collapse to button code 3. Reporting level is chosen by the application
 via the mouse modes above; with reporting off the pointer drives local selection
 and scrollback.
@@ -254,9 +259,13 @@ and scrollback.
 ## POSIX / terminal behaviour
 
 - A real PTY pair (`rustix` `openpt`/`grantpt`/`unlockpt`), with the child's
-  `TERM` set to the configured value (default `beer`), `COLORTERM=truecolor`,
-  and the window size kept in sync via `TIOCSWINSZ` (`SIGWINCH` reaches the
+  `TERM` set to the configured value (default `xterm-256color`),
+  `COLORTERM=truecolor`, `TERM_PROGRAM=beer`, and a unique `KITTY_WINDOW_ID`.
+  The window size stays synchronized via `TIOCSWINSZ` (`SIGWINCH` reaches the
   child).
+- A login shell by default, or an explicit command with working-directory and
+  hold-after-exit controls. Bash, Zsh, and Fish login shells receive the small
+  built-in OSC 7/133 integration hook.
 - The child's exit status is propagated as beer's own exit code.
 - Alternate screen, scroll regions, autowrap and reflow on resize, and a
   scrollback buffer.
