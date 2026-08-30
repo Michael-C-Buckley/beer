@@ -24,20 +24,29 @@ use crate::config::Config;
 struct Cli {
   /// Run as a daemon hosting multiple windows.
   #[pound(long)]
-  server:    bool,
+  server:            bool,
   /// Always run a private window, never connect to a running server.
   #[pound(long)]
-  no_daemon: bool,
+  no_daemon:         bool,
   /// Path to a config file (default: $`XDG_CONFIG_HOME/beer/beer.toml`).
   /// Repeatable; later files take priority over earlier ones.
   #[pound(long)]
-  config:    Vec<PathBuf>,
+  config:            Vec<PathBuf>,
   /// Title for the window opened via a running server.
   #[pound(long)]
-  title:     Option<String>,
+  title:             Option<String>,
   /// Wayland `app_id` for the window opened via a running server.
   #[pound(long)]
-  app_id:    Option<String>,
+  app_id:            Option<String>,
+  /// Start in this directory instead of the current directory.
+  #[pound(long)]
+  working_directory: Option<PathBuf>,
+  /// Keep the window open after the command exits.
+  #[pound(long)]
+  hold:              bool,
+  /// Command and arguments to execute instead of the login shell.
+  #[pound(trailing)]
+  command:           Vec<String>,
 }
 
 fn main() -> ExitCode {
@@ -66,12 +75,16 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
   // window's exit status. `--no-daemon` and `--server` opt out.
   if !cli.server && !cli.no_daemon {
     let req = ipc::OpenRequest {
-      cwd:    env::current_dir()
-        .ok()
+      cwd:     cli
+        .working_directory
+        .clone()
+        .or_else(|| env::current_dir().ok())
         .map(|p| p.to_string_lossy().into_owned()),
-      env:    env::vars().collect(),
-      title:  cli.title.clone(),
-      app_id: cli.app_id.clone(),
+      env:     env::vars().collect(),
+      title:   cli.title.clone(),
+      app_id:  cli.app_id.clone(),
+      command: cli.command.clone(),
+      hold:    cli.hold,
     };
     match ipc::run_client(&req) {
       Ok(code) => return Ok(ExitCode::from(code)),
@@ -83,7 +96,18 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
   let paths = config_paths(cli.config);
   let config = Config::load(&paths);
   tracing::info!(server = cli.server, "starting beer");
-  let app = app::App::new(config, paths, cli.server)?;
+  let initial = ipc::OpenRequest {
+    cwd:     cli
+      .working_directory
+      .or_else(|| env::current_dir().ok())
+      .map(|p| p.to_string_lossy().into_owned()),
+    env:     env::vars().collect(),
+    title:   cli.title,
+    app_id:  cli.app_id,
+    command: cli.command,
+    hold:    cli.hold,
+  };
+  let app = app::App::new(config, paths, cli.server, initial)?;
   let code = beer_wayland::run(Box::new(app))?;
   Ok(ExitCode::from(code))
 }
