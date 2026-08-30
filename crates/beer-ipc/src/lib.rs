@@ -7,13 +7,16 @@
 //! back when that window closes.
 
 use std::{
+  env,
   fs,
   io::{self, Read, Write},
   os::unix::{
     fs::{FileTypeExt, MetadataExt, PermissionsExt},
+    io::{FromRawFd, RawFd},
     net::{UnixListener, UnixStream},
   },
   path::{Path, PathBuf},
+  process,
 };
 
 /// Upper bound on a request frame, so a bad client cannot make us allocate
@@ -24,13 +27,17 @@ const MAX_REQUEST: usize = 1 << 20;
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct OpenRequest {
   /// Directory the child shell starts in (the client's cwd); `None` inherits.
-  pub cwd:    Option<String>,
+  pub cwd:     Option<String>,
   /// Environment for the child shell (the client's environment).
-  pub env:    Vec<(String, String)>,
+  pub env:     Vec<(String, String)>,
   /// Window title override; `None` uses the server's configured title.
-  pub title:  Option<String>,
+  pub title:   Option<String>,
   /// Window `app_id` override; `None` uses the server's configured app-id.
-  pub app_id: Option<String>,
+  pub app_id:  Option<String>,
+  /// Command and arguments to execute; empty starts the login shell.
+  pub command: Vec<String>,
+  /// Keep the window open after the child exits.
+  pub hold:    bool,
 }
 
 /// The daemon socket on `$XDG_RUNTIME_DIR/beer-$WAYLAND_DISPLAY.sock`.
@@ -80,10 +87,56 @@ pub fn socket_path() -> io::Result<PathBuf> {
 ///
 /// Fails if the runtime path cannot be resolved, a live server already owns the
 /// socket, or the bind/permission calls fail.
-pub fn bind_listener() -> io::Result<(UnixListener, PathBuf)> {
+#[expect(
+  unsafe_code,
+  reason = "systemd socket activation transfers ownership of fd 3"
+)]
+pub fn bind_listener() -> io::Result<(UnixListener, Option<PathBuf>)> {
+  if let Some(fd) = activation_fd(
+    process::id(),
+    env::var("LISTEN_PID").ok().as_deref(),
+    env::var("LISTEN_FDS").ok().as_deref(),
+  )? {
+    // SAFETY: systemd's socket-activation contract transfers fd 3 to this
+    // process. We accept exactly one descriptor and take ownership once.
+    let listener = unsafe { UnixListener::from_raw_fd(fd) };
+    return Ok((listener, None));
+  }
   let path = socket_path()?;
   let listener = bind_listener_at(&path)?;
-  Ok((listener, path))
+  Ok((listener, Some(path)))
+}
+
+fn activation_fd(
+  pid: u32,
+  listen_pid: Option<&str>,
+  listen_fds: Option<&str>,
+) -> io::Result<Option<RawFd>> {
+  let Some(raw_pid) = listen_pid else {
+    return Ok(None);
+  };
+  let parsed_pid = raw_pid.parse::<u32>().map_err(|_| {
+    io::Error::new(io::ErrorKind::InvalidInput, "invalid LISTEN_PID")
+  })?;
+  if parsed_pid != pid {
+    return Ok(None);
+  }
+  match listen_fds.unwrap_or("0").parse::<u32>() {
+    Ok(0) => Ok(None),
+    Ok(1) => Ok(Some(3)),
+    Ok(_) => {
+      Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "beer accepts exactly one activated socket",
+      ))
+    },
+    Err(_) => {
+      Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "invalid LISTEN_FDS",
+      ))
+    },
+  }
 }
 
 fn socket_path_in(dir: &Path, display: &str) -> io::Result<PathBuf> {
@@ -152,6 +205,11 @@ impl OpenRequest {
     }
     put_bytes(&mut body, self.title.as_deref().unwrap_or("").as_bytes());
     put_bytes(&mut body, self.app_id.as_deref().unwrap_or("").as_bytes());
+    put_u32(&mut body, self.command.len() as u32);
+    for arg in &self.command {
+      put_bytes(&mut body, arg.as_bytes());
+    }
+    body.push(u8::from(self.hold));
     let mut frame = Vec::with_capacity(body.len() + 4);
     put_u32(&mut frame, body.len() as u32);
     frame.extend_from_slice(&body);
@@ -184,11 +242,15 @@ impl OpenRequest {
     // Older clients stop here; the title/app-id fields are optional trailers.
     let title = take_optional_str(&mut rest);
     let app_id = take_optional_str(&mut rest);
+    let command = take_optional_strings(&mut rest)?;
+    let hold = rest.first().is_some_and(|byte| *byte != 0);
     Some(Self {
       cwd,
       env,
       title,
       app_id,
+      command,
+      hold,
     })
   }
 }
@@ -314,6 +376,21 @@ fn take_optional_str(buf: &mut &[u8]) -> Option<String> {
   String::from_utf8(bytes.to_vec()).ok()
 }
 
+fn take_optional_strings(buf: &mut &[u8]) -> Option<Vec<String>> {
+  if buf.is_empty() {
+    return Some(Vec::new());
+  }
+  let count = take_u32(buf)? as usize;
+  if count > buf.len() {
+    return None;
+  }
+  let mut strings = Vec::with_capacity(count);
+  for _ in 0..count {
+    strings.push(String::from_utf8(take_bytes(buf)?.to_vec()).ok()?);
+  }
+  Some(strings)
+}
+
 /// Read a length-prefixed byte slice off the front of `buf`, advancing it.
 fn take_bytes<'a>(buf: &mut &'a [u8]) -> Option<&'a [u8]> {
   let n = take_u32(buf)? as usize;
@@ -400,10 +477,12 @@ mod tests {
   #[test]
   fn title_and_app_id_round_trip() {
     round_trip(&OpenRequest {
-      cwd:    None,
-      env:    Vec::new(),
-      title:  Some("build".into()),
-      app_id: Some("dev.notashelf.beer.build".into()),
+      cwd:     None,
+      env:     Vec::new(),
+      title:   Some("build".into()),
+      app_id:  Some("dev.notashelf.beer.build".into()),
+      command: vec!["sh".into(), "-c".into(), "exit 7".into()],
+      hold:    true,
     });
   }
 
@@ -418,6 +497,15 @@ mod tests {
     assert_eq!(decoded.cwd.as_deref(), Some("/tmp"));
     assert_eq!(decoded.title, None);
     assert_eq!(decoded.app_id, None);
+    assert!(decoded.command.is_empty());
+    assert!(!decoded.hold);
+  }
+
+  #[test]
+  fn activation_accepts_exactly_one_matching_descriptor() {
+    assert_eq!(activation_fd(42, Some("42"), Some("1")).unwrap(), Some(3));
+    assert_eq!(activation_fd(42, Some("41"), Some("1")).unwrap(), None);
+    assert!(activation_fd(42, Some("42"), Some("2")).is_err());
   }
 
   #[test]
