@@ -1,7 +1,8 @@
 # beer-window
 
-`beer-window` defines the platform-neutral seam between the terminal application
-and a window-system backend.
+`beer-window` is the small dependency-inversion seam between the terminal
+application and its Wayland backend. It avoids a circular dependency without
+pretending beer currently has a cross-platform backend framework.
 
 The `App` trait owns terminal behavior and receives neutral keyboard, pointer,
 touch, IME, timer, file-descriptor, clipboard, and rendering callbacks. The
