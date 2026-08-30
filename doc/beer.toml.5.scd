@@ -72,7 +72,8 @@ channel).
 	produces colour fringing. Colour glyphs (emoji) are unaffected.
 
 *term* = _string_
-	The _TERM_ value exported to the child shell. Default _beer_.
+	The _TERM_ value exported to the child shell. Default _xterm-256color_. The
+	bundled _beer_ terminfo entry remains available as an opt-in.
 
 *app-id* = _string_
 	Wayland _app_id_ for the toplevel, used by the compositor for grouping,
@@ -84,6 +85,10 @@ channel).
 
 *maximized* = _bool_
 	Open the window maximized. Default _false_.
+
+*decorations* = _server_ | _client_ | _none_
+	Request server-side decorations, request client-side decorations, or leave
+	the window undecorated. Default _server_.
 
 *initial-cols* = _integer_, *initial-rows* = _integer_
 	Initial window size in character cells. Default _80_ by _24_. A tiling
@@ -107,6 +112,10 @@ channel).
 	Prompt for _y_/_n_ confirmation before closing a window whose terminal has
 	a foreground job running (the foreground process group is not the shell).
 	Default _false_.
+
+*server-resident* = _bool_
+	Keep a *--server* process alive after its last window closes. When _false_,
+	the server exits with its last window. Default _true_.
 
 # [colors]
 
@@ -155,12 +164,8 @@ channel).
 *lines* = _integer_
 	Lines of history retained for the main screen. Default _10000_.
 
-# [search]
-
-*regex* = _bool_
-	Interpret the scrollback-search query as a regular expression instead of
-	literal text. Smart case still applies: a query with an uppercase letter
-	searches case-sensitively. Default _false_.
+*indicator* = _bool_
+	Show the current history position while scrolled back. Default _true_.
 
 # [bell]
 
@@ -195,7 +200,7 @@ Recognized actions: _copy_, _paste_, _paste-primary_, _scrollback-up_,
 _scrollback-down_, _scrollback-top_, _scrollback-bottom_, _search_,
 _font-increase_, _font-decrease_, _font-reset_, _fullscreen_, _new-window_,
 _jump-prompt-up_, _jump-prompt-down_, _pipe-command-output_, _pipe-visible_,
-_pipe-scrollback_, _url-mode_, _unicode-input_.
+_pipe-scrollback_, _url-mode_, _url-copy_, _unicode-input_.
 
 _pipe-visible_ and _pipe-scrollback_ feed the on-screen text or the whole
 scrollback to the *[shell-integration]* _pipe-command_, like
@@ -227,6 +232,10 @@ The only default is _"Middle" = "paste-primary"_.
 
 Behaviour driven by *OSC 7* (cwd) and *OSC 133* (prompt) marks.
 
+*enabled* = _bool_
+	Install the built-in Bash, Zsh, or Fish prompt/cwd hook for login shells.
+	Default _true_. Arbitrary commands are never modified.
+
 *pipe-command* = _[argv]_
 	Command the _pipe-command-output_ binding feeds the last command's output
 	to on stdin, e.g. _["less"]_. Empty (the default) disables the action.
@@ -242,6 +251,14 @@ Behaviour driven by *OSC 7* (cwd) and *OSC 133* (prompt) marks.
 *command* = _[argv]_
 	Notifier for desktop notifications (_OSC 9_/_777_/_99_); the title and body
 	are appended as the final two arguments. Default _["notify-send"]_.
+
+# [security]
+
+*osc52* = _disabled_ | _copy_ | _query_ | _enabled_
+	Control clipboard access requested by terminal applications. _copy_ permits
+	an application to set the system clipboard, _query_ permits it to read
+	beer's cached clipboard, _enabled_ permits both, and _disabled_ permits
+	neither. Default _copy_.
 
 # [text-bindings]
 

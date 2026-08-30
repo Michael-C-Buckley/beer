@@ -33,7 +33,8 @@
 # pad-y              = 2
 # server-resident    = true                   # a --server process outlives its last window
 # subpixel           = "none"                 # LCD antialiasing: none, rgb, or bgr
-# term               = "beer"                 # TERM exported to the child shell
+# term               = "xterm-256color"       # TERM exported to the child shell
+# decorations        = "server"               # server, client, or none
 # word-delimiters    = " ,│`|:\"'()[]{}<>\t"  # unset keeps the built-in set
 
 # [colors]
@@ -56,9 +57,7 @@
 
 # [scrollback]
 # lines = 10000 # history retained on the main screen
-
-# [search]
-# regex = false # interpret the search query as a regular expression
+# indicator = true # show position while scrolled back
 
 # [bell]
 # command = [  ]  # e.g. ["paplay", "/usr/share/sounds/bell.oga"]
@@ -70,6 +69,7 @@
 # scroll-multiplier = 1.0
 
 # [shell-integration]
+# enabled = true
 # pipe-command = [  ] # target of the pipe-command-output action, e.g. ["less"]
 
 # [url]
@@ -78,11 +78,15 @@
 # [notify]
 # command = [ "notify-send" ] # title and body appended as the last two arguments
 
+# [security]
+# osc52 = "copy" # disabled, copy, query, or enabled
+
 # Chord -> action, merged over the built-in defaults. "none" unbinds a chord.
 # Actions: copy, paste, paste-primary, scrollback-up, scrollback-down,
 # scrollback-top, scrollback-bottom, search, font-increase, font-decrease,
 # font-reset, fullscreen, new-window, jump-prompt-up, jump-prompt-down,
-# pipe-command-output, url-mode, unicode-input.
+# pipe-command-output, pipe-visible, pipe-scrollback, url-mode, url-copy,
+# unicode-input.
 # [key-bindings]
 # "Ctrl+Shift+C" = "copy"
 # "Ctrl+Shift+V" = "paste"
