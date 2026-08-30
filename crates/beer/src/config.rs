@@ -20,12 +20,12 @@ pub struct Config {
   pub colors:            Colors,
   pub cursor:            Cursor,
   pub scrollback:        Scrollback,
-  pub search:            Search,
   pub bell:              Bell,
   pub mouse:             Mouse,
   pub shell_integration: ShellIntegration,
   pub url:               Url,
   pub notify:            Notify,
+  pub security:          Security,
   /// Chord → action, e.g. `"Ctrl+Shift+C" = "copy"`. Merged over the defaults;
   /// a value of `"none"` unbinds.
   pub key_bindings:      HashMap<String, String>,
@@ -308,21 +308,47 @@ impl Default for Main {
 #[serde(default, rename_all = "kebab-case")]
 pub struct Scrollback {
   /// Lines of history retained for the main screen.
-  pub lines: usize,
+  pub lines:     usize,
+  /// Show the current history position while scrolled away from the bottom.
+  pub indicator: bool,
 }
 
 impl Default for Scrollback {
   fn default() -> Self {
-    Self { lines: 10_000 }
+    Self {
+      lines:     10_000,
+      indicator: true,
+    }
   }
 }
 
-/// `[search]`: scrollback search behaviour.
+/// Which directions of OSC 52 clipboard access are accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Osc52Policy {
+  Disabled,
+  #[default]
+  Copy,
+  Query,
+  Enabled,
+}
+
+impl Osc52Policy {
+  pub const fn allows_copy(self) -> bool {
+    matches!(self, Self::Copy | Self::Enabled)
+  }
+
+  pub const fn allows_query(self) -> bool {
+    matches!(self, Self::Query | Self::Enabled)
+  }
+}
+
+/// `[security]`: host integration exposed to terminal applications.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
-pub struct Search {
-  /// Interpret the query as a regular expression instead of literal text.
-  pub regex: bool,
+pub struct Security {
+  /// `disabled`, `copy`, `query`, or `enabled`.
+  pub osc52: Osc52Policy,
 }
 
 impl Config {
