@@ -99,12 +99,23 @@ impl Default for Mouse {
 }
 
 /// `[shell-integration]`: behaviour driven by OSC 7 / OSC 133 marks.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
 pub struct ShellIntegration {
+  /// Automatically install prompt and cwd reporting in supported shells.
+  pub enabled:      bool,
   /// Command the `pipe-command-output` binding feeds the last command's
   /// output to on stdin (argv form, e.g. `["less"]`). Empty disables it.
   pub pipe_command: Vec<String>,
+}
+
+impl Default for ShellIntegration {
+  fn default() -> Self {
+    Self {
+      enabled:      true,
+      pipe_command: Vec::new(),
+    }
+  }
 }
 
 /// `[url]`: opening OSC 8 hyperlinks and detected URLs.
@@ -195,6 +206,15 @@ pub enum Hinting {
   Normal,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Decorations {
+  #[default]
+  Server,
+  Client,
+  None,
+}
+
 /// `[main]`: fonts, window geometry, padding, and the terminal name.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
@@ -249,6 +269,8 @@ pub struct Main {
   pub title:              String,
   /// Open the window maximized.
   pub maximized:          bool,
+  /// `server`, `client`, or `none`.
+  pub decorations:        Decorations,
   /// Initial size in character cells.
   pub initial_cols:       u16,
   pub initial_rows:       u16,
@@ -287,10 +309,11 @@ impl Default for Main {
       adjust_baseline:    0,
       thicken:            false,
       subpixel:           Subpixel::None,
-      term:               "beer".to_string(),
+      term:               "xterm-256color".to_string(),
       app_id:             "dev.notashelf.beer".to_string(),
       title:              "beer".to_string(),
       maximized:          false,
+      decorations:        Decorations::Server,
       initial_cols:       80,
       initial_rows:       24,
       pad_x:              2,
@@ -479,7 +502,7 @@ mod tests {
     assert_eq!(c.main.font, "JetBrains Mono");
     assert_eq!(c.main.font_size, 14);
     // Unset keys keep defaults; unknown tables/keys are ignored.
-    assert_eq!(c.main.term, "beer");
+    assert_eq!(c.main.term, "xterm-256color");
     assert_eq!(c.scrollback.lines, 10_000);
   }
 
