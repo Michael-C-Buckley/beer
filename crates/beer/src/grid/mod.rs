@@ -7,9 +7,11 @@ mod selection;
 
 use std::{collections::VecDeque, num::NonZeroU16};
 
+use beer_protocols::graphics::{PLACEHOLDER, diacritic_value};
 pub use links::UrlHit;
 use search::SearchState;
-use unicode_width::UnicodeWidthChar;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Maximum scrollback lines retained for the main screen.
 const SCROLLBACK_CAP: usize = 10_000;
@@ -260,9 +262,6 @@ pub struct Grid {
   focus_events:    bool,
   /// Active incremental scrollback search, if any.
   search:          Option<SearchState>,
-  /// Interpret search queries as regular expressions (config `[search]
-  /// regex`).
-  search_regex:    bool,
   /// Characters that break a word for double-click selection.
   word_delimiters: String,
   /// History retention cap for the main screen.
@@ -280,31 +279,85 @@ pub struct Grid {
   kitty_stack:     Vec<u8>,
 }
 
-/// Format a row of cells as text, skipping continuation cells and trimming
-/// trailing blanks.
-fn cells_text(cells: &[Cell]) -> String {
-  cells
-    .iter()
-    .filter(|c| {
-      !c.flags.contains(Flags::WIDE_CONT)
-        && !c.flags.contains(Flags::SIZED_CONT)
-    })
-    .map(|c| c.c)
-    .collect::<String>()
-    .trim_end()
-    .to_string()
-}
-
-/// Join lines with newlines after dropping trailing empty lines.
-fn join_trimmed(mut lines: Vec<String>) -> String {
-  while lines.last().is_some_and(String::is_empty) {
-    lines.pop();
-  }
-  lines.join("\n")
-}
-
 fn default_tabs(cols: usize) -> Vec<bool> {
   (0..cols).map(|i| i % 8 == 0 && i != 0).collect()
+}
+
+fn virtual_image_ref(
+  cell: &Cell,
+  previous: &mut Option<(u32, u32, u32, Color)>,
+) -> Option<ImageRef> {
+  if cell.c != PLACEHOLDER {
+    *previous = None;
+    return None;
+  }
+  let base = match cell.fg {
+    Color::Indexed(index) => u32::from(index),
+    Color::Rgb(red, green, blue) => {
+      (u32::from(red) << 16) | (u32::from(green) << 8) | u32::from(blue)
+    },
+    Color::Default => return None,
+  };
+  let marks: Vec<char> =
+    cell.combining.as_deref().unwrap_or("").chars().collect();
+  let values =
+    [0, 1, 2].map(|index| marks.get(index).copied().and_then(diacritic_value));
+  let same = previous.is_some_and(|state| state.3 == cell.fg);
+  let (row, col, high) = placeholder_position(values, *previous, same);
+  *previous = Some((row, col, high, cell.fg));
+  Some(ImageRef {
+    image:     base | (high << 24),
+    placement: 0,
+    dx:        u16::try_from(col).unwrap_or(u16::MAX),
+    dy:        u16::try_from(row).unwrap_or(u16::MAX),
+  })
+}
+
+fn placeholder_position(
+  values: [Option<u32>; 3],
+  previous: Option<(u32, u32, u32, Color)>,
+  same: bool,
+) -> (u32, u32, u32) {
+  match (values, previous) {
+    ([None, None, None], Some(state)) if same => {
+      (state.0, state.1 + 1, state.2)
+    },
+    ([Some(row), None, None], Some(state)) if same && state.0 == row => {
+      (row, state.1 + 1, state.2)
+    },
+    ([Some(row), Some(col), None], Some(state))
+      if same && state.0 == row && state.1 + 1 == col =>
+    {
+      (row, col, state.2)
+    },
+    ([row, col, high], _) => {
+      (row.unwrap_or(0), col.unwrap_or(0), high.unwrap_or(0))
+    },
+  }
+}
+
+fn line_references_image(line: &Line, image: u32) -> bool {
+  let mut previous = None;
+  line.cells.iter().any(|cell| {
+    cell
+      .image
+      .or_else(|| virtual_image_ref(cell, &mut previous))
+      .is_some_and(|reference| reference.image == image)
+  })
+}
+
+fn line_image_origin(line: &Line, key: (u32, u32)) -> Option<usize> {
+  let mut previous = None;
+  line.cells.iter().enumerate().find_map(|(x, cell)| {
+    let reference = cell
+      .image
+      .or_else(|| virtual_image_ref(cell, &mut previous))?;
+    (reference.image == key.0
+      && reference.placement == key.1
+      && reference.dx == 0
+      && reference.dy == 0)
+      .then_some(x)
+  })
 }
 
 /// Default characters that terminate a word for double-click selection (the
@@ -326,18 +379,17 @@ fn is_word(c: char, delims: &str) -> bool {
 /// character with its trailing zero-width combining marks and display width.
 /// Leading combining marks with no base are dropped, as in normal printing.
 fn graphemes(text: &str) -> Vec<(char, String, usize)> {
-  let mut out: Vec<(char, String, usize)> = Vec::new();
-  for c in text.chars() {
-    match c.width().unwrap_or(0) {
-      0 => {
-        if let Some(last) = out.last_mut() {
-          last.1.push(c);
-        }
-      },
-      w => out.push((c, String::new(), w)),
-    }
-  }
-  out
+  text
+    .graphemes(true)
+    .filter_map(|cluster| {
+      let mut chars = cluster.chars();
+      let base = chars.find(|c| c.width().unwrap_or(0) > 0)?;
+      let mut rest = cluster.to_string();
+      let index = rest.find(base)?;
+      rest.replace_range(index..index + base.len_utf8(), "");
+      Some((base, rest, UnicodeWidthStr::width(cluster).clamp(1, 2)))
+    })
+    .collect()
 }
 
 #[expect(
@@ -383,7 +435,6 @@ impl Grid {
       mouse_encoding: MouseEncoding::X10,
       focus_events: false,
       search: None,
-      search_regex: false,
       word_delimiters: WORD_DELIMITERS.to_string(),
       scrollback_cap: SCROLLBACK_CAP,
       last_base: None,
@@ -429,11 +480,6 @@ impl Grid {
     if let Some(d) = delims {
       self.word_delimiters = d;
     }
-  }
-
-  /// Choose whether search queries are regular expressions or literal text.
-  pub const fn set_search_regex(&mut self, on: bool) {
-    self.search_regex = on;
   }
 
   /// Set the scrollback retention cap, trimming history if it shrank.
@@ -728,6 +774,10 @@ impl Grid {
 
   /// Place a printable character at the cursor, honouring width and autowrap.
   pub fn print(&mut self, c: char) {
+    if self.joins_last_grapheme(c) {
+      self.add_combining(c);
+      return;
+    }
     let width = c.width().unwrap_or(0);
     if width == 0 {
       // A zero-width combining mark attaches to the last base cell.
@@ -800,7 +850,7 @@ impl Grid {
   /// Attach a zero-width combining mark to the most recently printed base
   /// cell. Capped so a malicious stream of marks cannot grow a cell unbounded.
   fn add_combining(&mut self, mark: char) {
-    const MAX_MARKS: usize = 8;
+    const MAX_MARKS: usize = 16;
     let Some((x, y)) = self.last_base else {
       return;
     };
@@ -814,6 +864,23 @@ impl Grid {
       s.push(mark);
     }
     cell.combining = Some(s.into_boxed_str());
+  }
+
+  fn joins_last_grapheme(&self, next: char) -> bool {
+    let Some((x, y)) = self.last_base else {
+      return false;
+    };
+    let Some(cell) = self.lines.get(y).and_then(|line| line.cells.get(x))
+    else {
+      return false;
+    };
+    let mut candidate = String::new();
+    candidate.push(cell.c);
+    if let Some(rest) = &cell.combining {
+      candidate.push_str(rest);
+    }
+    candidate.push(next);
+    candidate.graphemes(true).count() == 1
   }
 
   /// Lay out a text-sizing run (`OSC 66`) as scaled multicell blocks at the
@@ -963,22 +1030,94 @@ impl Grid {
     self.wrap_pending = false;
   }
 
+  pub fn place_image_relative(
+    &mut self,
+    image: u32,
+    placement: u32,
+    cols: usize,
+    rows: usize,
+    parent: (u32, u32, i32, i32),
+  ) {
+    let origin = self.lines.iter().enumerate().find_map(|(y, line)| {
+      line_image_origin(line, (parent.0, parent.1)).map(|x| (x, y))
+    });
+    let Some((x, y)) = origin else { return };
+    let saved = (self.cursor, self.wrap_pending);
+    self.cursor.x = x
+      .saturating_add_signed(parent.2 as isize)
+      .min(self.cols - 1);
+    self.cursor.y = y
+      .saturating_add_signed(parent.3 as isize)
+      .min(self.rows - 1);
+    self.wrap_pending = false;
+    self.place_image(image, placement, cols, rows, true);
+    (self.cursor, self.wrap_pending) = saved;
+  }
+
   /// Remove image placements: every cell whose reference matches `pred` is
   /// cleared back to a blank. With `pred` always true this erases all images.
-  pub fn clear_images(&mut self, pred: impl Fn(&ImageRef) -> bool) {
+  pub fn clear_images(
+    &mut self,
+    pred: impl Fn(&ImageRef) -> bool,
+  ) -> Vec<(u32, u32)> {
     let blank = Cell::default();
-    let touch = |line: &mut Line| {
+    let mut removed = Vec::new();
+    let mut touch = |line: &mut Line| {
+      let mut previous = None;
       for cell in &mut line.cells {
-        if cell.image.is_some_and(|r| pred(&r)) {
+        let reference = cell
+          .image
+          .or_else(|| virtual_image_ref(cell, &mut previous));
+        if reference.is_some_and(|r| pred(&r)) {
+          if let Some(reference) = reference {
+            let key = (reference.image, reference.placement);
+            if !removed.contains(&key) {
+              removed.push(key);
+            }
+          }
           *cell = blank.clone();
         }
       }
     };
-    self.lines.iter_mut().for_each(touch);
-    self.scrollback.iter_mut().for_each(touch);
+    self.lines.iter_mut().for_each(&mut touch);
+    self.scrollback.iter_mut().for_each(&mut touch);
     if let Some(alt) = self.alt_saved.as_mut() {
-      alt.iter_mut().for_each(touch);
+      alt.iter_mut().for_each(&mut touch);
     }
+    removed
+  }
+
+  pub fn clear_screen_images(
+    &mut self,
+    pred: impl Fn(usize, usize, &ImageRef) -> bool,
+  ) -> Vec<(u32, u32)> {
+    let mut targets = Vec::new();
+    for (y, line) in self.lines.iter().enumerate() {
+      let mut previous = None;
+      for (x, cell) in line.cells.iter().enumerate() {
+        if let Some(reference) = cell
+          .image
+          .or_else(|| virtual_image_ref(cell, &mut previous))
+          && pred(x, y, &reference)
+          && !targets.contains(&(reference.image, reference.placement))
+        {
+          targets.push((reference.image, reference.placement));
+        }
+      }
+    }
+    self.clear_images(|reference| {
+      targets.contains(&(reference.image, reference.placement))
+    })
+  }
+
+  pub fn image_referenced(&self, image: u32) -> bool {
+    let has = |line: &Line| line_references_image(line, image);
+    self.lines.iter().any(has)
+      || self.scrollback.iter().any(has)
+      || self
+        .alt_saved
+        .as_ref()
+        .is_some_and(|lines| lines.iter().any(has))
   }
 
   /// The image placements intersecting the current cursor cell, for `d=c`
@@ -1699,6 +1838,11 @@ impl Grid {
     self.view_offset == 0
   }
 
+  /// Lines above the live bottom and the maximum available history distance.
+  pub fn scroll_position(&self) -> (usize, usize) {
+    (self.view_offset, self.scrollback.len())
+  }
+
   /// One page (a screenful) of lines, for page-scroll bindings.
   pub fn page(&self) -> usize {
     self.rows.max(1)
@@ -1888,24 +2032,47 @@ impl Grid {
   /// The visible text of one row, trailing blanks trimmed.
   #[cfg(test)]
   pub fn row_text(&self, y: usize) -> String {
-    cells_text(&self.lines[y].cells)
+    self.lines[y]
+      .cells
+      .iter()
+      .filter(|cell| {
+        !cell.flags.contains(Flags::WIDE_CONT)
+          && !cell.flags.contains(Flags::SIZED_CONT)
+      })
+      .map(|cell| cell.c)
+      .collect::<String>()
+      .trim_end()
+      .to_string()
   }
 
   /// The visible viewport as text, one line per row with trailing blank rows
   /// and blank cells trimmed. Used to pipe the on-screen contents.
   pub fn visible_text(&self) -> String {
-    join_trimmed(
-      (0..self.rows)
-        .map(|y| cells_text(self.view_row(y)))
-        .collect(),
-    )
+    let start = self.view_to_abs(0);
+    self.logical_text(start, start + self.rows)
   }
 
   /// The full scrollback plus the live screen as text. Used to pipe or dump
   /// the whole history.
   pub fn scrollback_text(&self) -> String {
-    let total = self.scrollback.len() + self.rows;
-    join_trimmed((0..total).map(|r| cells_text(self.abs_row(r))).collect())
+    self.logical_text(0, self.scrollback.len() + self.rows)
+  }
+
+  fn logical_text(&self, start: usize, end: usize) -> String {
+    let mut out = String::new();
+    for row in start..end {
+      let text = self.row_slice_text(row, 0, self.abs_row(row).len());
+      if self.line_at_abs(row).wrapped && row + 1 < end {
+        out.push_str(&text);
+      } else {
+        out.push_str(text.trim_end());
+        out.push('\n');
+      }
+    }
+    while out.ends_with('\n') {
+      out.pop();
+    }
+    out
   }
 
   pub fn cell(&self, x: usize, y: usize) -> &Cell {
@@ -1974,6 +2141,32 @@ mod tests {
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].url, "https://example.com/p?q=1");
     assert_eq!((hits[0].row, hits[0].col), (0, 4));
+  }
+
+  #[test]
+  fn detects_web_mail_and_phone_links() {
+    let mut g = Grid::new(80, 2);
+    for c in "www.example.com mailto:a@example.com tel:+15551212".chars() {
+      g.print(c);
+    }
+    let urls: Vec<String> =
+      g.visible_urls().into_iter().map(|hit| hit.url).collect();
+    assert_eq!(urls, [
+      "https://www.example.com",
+      "mailto:a@example.com",
+      "tel:+15551212",
+    ]);
+  }
+
+  #[test]
+  fn extended_graphemes_stay_in_one_cell() {
+    let mut g = Grid::new(8, 1);
+    for c in "👩‍💻X".chars() {
+      g.print(c);
+    }
+    assert_eq!(g.cell(0, 0).c, '👩');
+    assert_eq!(g.cell(0, 0).combining.as_deref(), Some("\u{200d}💻"));
+    assert_eq!(g.cell(2, 0).c, 'X');
   }
 
   #[test]
@@ -2275,25 +2468,19 @@ mod tests {
   }
 
   #[test]
-  fn regex_search_matches_patterns() {
-    let mut g = Grid::new(16, 2);
-    g.set_search_regex(true);
-    for line in ["alpha1", "beta22", "gamma3"] {
-      for c in line.chars() {
-        g.print(c);
-      }
-      g.carriage_return();
-      g.line_feed();
+  fn search_and_text_cross_soft_wraps() {
+    let mut g = Grid::new(4, 2);
+    for c in "abcdef".chars() {
+      g.print(c);
     }
-    // A digit class matches the run of digits on each line.
-    g.set_search("[0-9]+");
-    assert_eq!(g.search_count(), (3, 3));
-    // "22" on row 1 spans two columns; "alpha1" digit is a single column.
-    assert_eq!(g.search_spans_on(1), vec![(4, 5, false)]);
-    assert_eq!(g.search_spans_on(0), vec![(5, 5, false)]);
-    // An invalid pattern yields no matches rather than panicking.
-    g.set_search("[unterminated");
-    assert_eq!(g.search_count(), (0, 0));
+    g.set_search("def");
+    assert_eq!(g.search_count(), (1, 1));
+    assert_eq!(g.search_spans_on(0), vec![(3, 3, true)]);
+    assert_eq!(g.search_spans_on(1), vec![(0, 1, true)]);
+    assert_eq!(g.visible_text(), "abcdef");
+    g.start_selection(0, 2);
+    g.extend_selection(1, 1);
+    assert_eq!(g.selection_text().as_deref(), Some("cdef"));
   }
 
   #[test]
