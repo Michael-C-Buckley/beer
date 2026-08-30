@@ -142,20 +142,22 @@ impl Image {
 /// source region/offsets/stacking that decide how it is drawn.
 #[derive(Clone, Copy, Debug)]
 pub struct Placement {
-  pub image: u32,
+  pub image:  u32,
   /// Cell rectangle size.
-  pub cols:  u16,
-  pub rows:  u16,
+  pub cols:   u16,
+  pub rows:   u16,
   /// Source rectangle in image pixels (`w == 0` means to the image edge).
-  pub src_x: u32,
-  pub src_y: u32,
-  pub src_w: u32,
-  pub src_h: u32,
+  pub src_x:  u32,
+  pub src_y:  u32,
+  pub src_w:  u32,
+  pub src_h:  u32,
   /// Pixel offset within the first cell.
-  pub off_x: u32,
-  pub off_y: u32,
+  pub off_x:  u32,
+  pub off_y:  u32,
   /// Stacking order: negative draws below text, non-negative above.
-  pub z:     i32,
+  pub z:      i32,
+  /// Parent placement and cell offset for relative placement.
+  pub parent: Option<(u32, u32, i32, i32)>,
 }
 
 /// What the terminal must do to the grid after a command: stamp a placement, or
@@ -169,9 +171,11 @@ pub enum GridOp {
     cols:        usize,
     rows:        usize,
     keep_cursor: bool,
+    parent:      Option<(u32, u32, i32, i32)>,
+    replace_old: bool,
   },
   /// Clear cells whose image reference matches the spec.
-  Clear(ClearSpec),
+  Clear { spec: ClearSpec, free: bool },
 }
 
 /// Which displayed image cells a delete affects.
@@ -181,6 +185,11 @@ pub enum ClearSpec {
   Image(u32),
   Placement(u32, u32),
   AtCursor,
+  Cell { x: u32, y: u32, z: Option<i32> },
+  Column(u32),
+  Row(u32),
+  Z(i32),
+  ImageRange(u32, u32),
 }
 
 /// The result of handling one command: an optional response to write back to
@@ -322,13 +331,24 @@ impl Graphics {
           // Animation frame data for an existing image.
           return self.add_frame(&cmd, &pixels);
         }
-        let id = self.store(&cmd, pixels);
+        let (id, replaced) = self.store(&cmd, pixels);
         if cmd.action == Action::TransmitAndDisplay {
           let mut out = self.display(id, &cmd, cell_px);
+          if let Some(GridOp::Place { replace_old, .. }) = out.grid_op.as_mut()
+          {
+            *replace_old = replaced;
+          }
           out.response = respond(&cmd, "OK").response;
           out
         } else {
-          respond(&cmd, "OK")
+          let mut out = respond(&cmd, "OK");
+          if replaced {
+            out.grid_op = Some(GridOp::Clear {
+              spec: ClearSpec::Image(id),
+              free: false,
+            });
+          }
+          out
         }
       },
       Err(msg) => respond_error(&cmd, &msg),
@@ -356,7 +376,7 @@ impl Graphics {
 
   /// Store pixels as a new still image under its id (or number, or an auto id),
   /// replacing any existing image with that id. Returns the id used.
-  fn store(&mut self, cmd: &GraphicsCommand, pixels: Pixels) -> u32 {
+  fn store(&mut self, cmd: &GraphicsCommand, pixels: Pixels) -> (u32, bool) {
     let id = if cmd.id != 0 {
       cmd.id
     } else if cmd.number != 0 {
@@ -367,8 +387,10 @@ impl Graphics {
     } else {
       self.alloc_id()
     };
+    let replaced = self.images.contains_key(&id);
+    self.placements.retain(|&(image, _), _| image != id);
     self.images.insert(id, Image::from_pixels(pixels));
-    id
+    (id, replaced)
   }
 
   fn alloc_id(&mut self) -> u32 {
@@ -546,6 +568,24 @@ impl Graphics {
     if cols == 0 || rows == 0 {
       return respond_error(cmd, "EINVAL: zero-sized placement");
     }
+    let parent = if cmd.parent_id == 0 {
+      None
+    } else {
+      let key = (cmd.parent_id, cmd.parent_placement);
+      if cmd.virtual_placement {
+        return respond_error(
+          cmd,
+          "EINVAL: relative placement cannot be virtual",
+        );
+      }
+      if !self.placements.contains_key(&key) {
+        return respond_error(cmd, "ENOENT: no such parent placement");
+      }
+      if self.relative_cycle((id, cmd.placement), key) {
+        return respond_error(cmd, "EINVAL: relative placement cycle");
+      }
+      Some((key.0, key.1, cmd.rel_h, cmd.rel_v))
+    };
 
     let placement_id = cmd.placement;
     self.placements.insert((id, placement_id), Placement {
@@ -559,6 +599,7 @@ impl Graphics {
       off_x: cmd.cap_x,
       off_y: cmd.cap_y,
       z: cmd.z,
+      parent,
     });
     // A virtual placement (`U=1`) reserves geometry for Unicode-placeholder
     // cells the application prints itself; it stamps no cells of its own.
@@ -568,11 +609,30 @@ impl Graphics {
       cols,
       rows,
       keep_cursor: cmd.cursor_policy == 1,
+      parent,
+      replace_old: false,
     });
     Outcome {
       response: None,
       grid_op,
     }
+  }
+
+  fn relative_cycle(&self, child: (u32, u32), mut parent: (u32, u32)) -> bool {
+    for _ in 0..64 {
+      if parent == child {
+        return true;
+      }
+      let Some(next) = self
+        .placements
+        .get(&parent)
+        .and_then(|placement| placement.parent)
+      else {
+        return false;
+      };
+      parent = (next.0, next.1);
+    }
+    true
   }
 
   /// Resolve the image an action refers to: by id, else by number.
@@ -590,6 +650,7 @@ impl Graphics {
   fn delete(&mut self, cmd: GraphicsCommand) -> Outcome {
     let free = cmd.delete_frees_data();
     let spec = match cmd.delete.to_ascii_lowercase() {
+      b'a' | 0 => ClearSpec::All,
       b'i' => {
         let id = cmd.id;
         if cmd.placement != 0 {
@@ -605,36 +666,118 @@ impl Graphics {
         }
       },
       b'c' => ClearSpec::AtCursor,
-      // Other targets (by column/row/z-index, frames) are not yet
-      // distinguished; treat them as a visible-placement clear.
-      _ => ClearSpec::All,
+      b'f' => return self.delete_frames(&cmd),
+      target => {
+        let Some(spec) = spatial_delete_spec(target, &cmd) else {
+          return Outcome::default();
+        };
+        spec
+      },
     };
-    if free {
-      self.free_for(&spec);
-    }
     Outcome {
       response: None,
-      grid_op:  Some(GridOp::Clear(spec)),
+      grid_op:  Some(GridOp::Clear { spec, free }),
     }
   }
 
-  /// Drop stored image data for an uppercase delete, when not pinned elsewhere.
-  fn free_for(&mut self, spec: &ClearSpec) {
-    match *spec {
-      ClearSpec::All => {
-        self.images.clear();
-        self.placements.clear();
-        self.by_number.clear();
-      },
-      ClearSpec::Image(id) => {
-        self.images.remove(&id);
-        self.placements.retain(|&(img, _), _| img != id);
-      },
-      ClearSpec::Placement(id, p) => {
-        self.placements.remove(&(id, p));
-      },
-      ClearSpec::AtCursor => {},
+  fn delete_frames(&mut self, cmd: &GraphicsCommand) -> Outcome {
+    let Some(id) = self.resolve_id(cmd) else {
+      return Outcome::default();
+    };
+    let Some(image) = self.images.get_mut(&id) else {
+      return Outcome::default();
+    };
+    if cmd.r == 0 {
+      image.frames.truncate(1);
+    } else if let Some(index) =
+      usize::try_from(cmd.r).ok().and_then(|n| n.checked_sub(1))
+      && index > 0
+      && index < image.frames.len()
+    {
+      image.frames.remove(index);
     }
+    image.current = image.current.min(image.frames.len() - 1);
+    Outcome::default()
+  }
+
+  pub fn finish_delete(
+    &mut self,
+    removed: &[(u32, u32)],
+    free: bool,
+    referenced: impl Fn(u32) -> bool,
+  ) {
+    self.placements.retain(|key, _| !removed.contains(key));
+    if free {
+      self.images.retain(|id, _| referenced(*id));
+      self.by_number.retain(|_, id| self.images.contains_key(id));
+    }
+  }
+
+  pub fn delete_targets(
+    &self,
+    spec: ClearSpec,
+    direct: &[(u32, u32)],
+  ) -> Vec<(u32, u32)> {
+    let mut targets = direct.to_vec();
+    for (&key, placement) in &self.placements {
+      if placement_matches(key, placement, spec) && !targets.contains(&key) {
+        targets.push(key);
+      }
+    }
+    loop {
+      let before = targets.len();
+      for (&key, placement) in &self.placements {
+        if placement
+          .parent
+          .is_some_and(|parent| targets.contains(&(parent.0, parent.1)))
+          && !targets.contains(&key)
+        {
+          targets.push(key);
+        }
+      }
+      if targets.len() == before {
+        return targets;
+      }
+    }
+  }
+}
+
+fn spatial_delete_spec(target: u8, cmd: &GraphicsCommand) -> Option<ClearSpec> {
+  match target {
+    b'p' => {
+      Some(ClearSpec::Cell {
+        x: cmd.x,
+        y: cmd.y,
+        z: None,
+      })
+    },
+    b'q' => {
+      Some(ClearSpec::Cell {
+        x: cmd.x,
+        y: cmd.y,
+        z: Some(cmd.z),
+      })
+    },
+    b'x' => Some(ClearSpec::Column(cmd.x)),
+    b'y' => Some(ClearSpec::Row(cmd.y)),
+    b'z' => Some(ClearSpec::Z(cmd.z)),
+    b'r' => Some(ClearSpec::ImageRange(cmd.x.min(cmd.y), cmd.x.max(cmd.y))),
+    _ => None,
+  }
+}
+
+fn placement_matches(
+  key: (u32, u32),
+  placement: &Placement,
+  spec: ClearSpec,
+) -> bool {
+  match spec {
+    ClearSpec::All => true,
+    ClearSpec::Image(id) => key.0 == id,
+    ClearSpec::Placement(id, p) => key == (id, p),
+    ClearSpec::Z(z) => placement.z == z,
+    ClearSpec::ImageRange(lo, hi) => key.0 >= lo && key.0 <= hi,
+    _ => false,
   }
 }
 
@@ -1167,8 +1310,56 @@ mod tests {
       ..Default::default()
     };
     let out = g.handle(cmd, &[], (8, 16));
-    assert!(matches!(out.grid_op, Some(GridOp::Clear(ClearSpec::All))));
+    assert!(matches!(
+      out.grid_op,
+      Some(GridOp::Clear {
+        spec: ClearSpec::All,
+        free: true,
+      })
+    ));
+    g.finish_delete(&[(1, 0)], true, |_| false);
     assert!(g.image(1).is_none(), "uppercase delete frees data");
+  }
+
+  #[test]
+  fn delete_targets_remain_precise() {
+    let mut graphics = Graphics::new();
+    let cmd = GraphicsCommand {
+      action: Action::Delete,
+      delete: b'y',
+      y: 3,
+      ..Default::default()
+    };
+    assert!(matches!(
+      graphics.handle(cmd, &[], (8, 16)).grid_op,
+      Some(GridOp::Clear {
+        spec: ClearSpec::Row(3),
+        free: false,
+      })
+    ));
+  }
+
+  #[test]
+  fn relative_placement_keeps_parent_and_offsets() {
+    let mut graphics = Graphics::new();
+    let pixels = b64(&[0; 16]);
+    let mut parent = rgba_cmd(2, 2, 1, Action::TransmitAndDisplay);
+    parent.placement = 7;
+    graphics.handle(parent, &pixels, (8, 16));
+    let mut child = rgba_cmd(2, 2, 2, Action::TransmitAndDisplay);
+    child.placement = 8;
+    child.parent_id = 1;
+    child.parent_placement = 7;
+    child.rel_h = 2;
+    child.rel_v = -1;
+    let outcome = graphics.handle(child, &pixels, (8, 16));
+    assert!(matches!(
+      outcome.grid_op,
+      Some(GridOp::Place {
+        parent: Some((1, 7, 2, -1)),
+        ..
+      })
+    ));
   }
 
   #[test]
