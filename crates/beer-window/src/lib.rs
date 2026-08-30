@@ -1,4 +1,4 @@
-//! Platform-neutral windowing contract for the beer terminal.
+//! Window/backend contract for the beer terminal.
 //!
 //! A backend (e.g. `beer-wayland`) owns the platform connection, event loop,
 //! surfaces, and shm buffers. It drives an [`App`] by translating native input
@@ -6,17 +6,17 @@
 //! app uses to act on windows (present a frame, set the title, own the
 //! clipboard, open/close toplevels, watch file descriptors and arm timers).
 //!
-//! The app never names a platform (Wayland) type: input is delivered as neutral
+//! The app never names a concrete Wayland object: input is delivered as compact
 //! [`PointerEvent`]/[`TouchEvent`]/[`ImeEvent`] values, and keyboard input
 //! reuses the xkb keysym vocabulary (`KeyEvent`/`Modifiers`) that the
 //! `beer-protocols` encoders already consume - that vocabulary is an input
-//! abstraction, not a Wayland protocol object, so a future x11/macOS backend
-//! maps its native keys onto the same keysyms.
+//! vocabulary already used by the Wayland backend.
 //!
 //! Backend selection is a `beer`-level concern: it calls the chosen backend's
 //! `run(app, ...)` entry directly (cfg-selected once a second backend exists),
-//! so no `Backend` trait is needed here - the portable seam is `App` +
-//! `WindowCtx` + the event vocabulary below.
+//! so no generic backend framework is needed here. This crate is dependency
+//! inversion for the existing Wayland implementation, not a cross-platform
+//! promise.
 
 use std::os::fd::RawFd;
 
@@ -31,11 +31,20 @@ pub struct WindowId(pub u64);
 #[derive(Clone, Debug)]
 pub struct WindowOptions {
   /// Wayland `app_id`.
-  pub app_id:    String,
+  pub app_id:      String,
   /// Initial title, before any title escape overrides it.
-  pub title:     String,
+  pub title:       String,
   /// Whether to open maximized.
-  pub maximized: bool,
+  pub maximized:   bool,
+  /// Preferred compositor decoration mode.
+  pub decorations: DecorationMode,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DecorationMode {
+  Server,
+  Client,
+  None,
 }
 
 /// A pointer button, normalized across platforms. `Other` carries a raw code

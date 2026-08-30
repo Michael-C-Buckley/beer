@@ -256,7 +256,11 @@ impl WindowCtx for Platform {
     let surface = self.compositor.create_surface(&self.qh);
     let window = self.xdg_shell.create_window(
       surface,
-      WindowDecorations::RequestServer,
+      match opts.decorations {
+        beer_window::DecorationMode::Server => WindowDecorations::RequestServer,
+        beer_window::DecorationMode::Client => WindowDecorations::RequestClient,
+        beer_window::DecorationMode::None => WindowDecorations::None,
+      },
       &self.qh,
     );
     window.set_title(&opts.title);
