@@ -105,6 +105,19 @@ impl Canvas<'_> {
     self.fill_rect_a(x0, y0, w, h, c, 0xFF);
   }
 
+  /// Composite a premultiplied BGRA source over the pixel at `i`.
+  fn over_at(&mut self, i: usize, src: [u8; 4]) {
+    let inverse = u32::from(255 - src[3]);
+    let over = |source: u8, destination: u8| {
+      (u32::from(source) + u32::from(destination) * inverse / 255).min(255)
+        as u8
+    };
+    self.pixels[i] = over(src[0], self.pixels[i]);
+    self.pixels[i + 1] = over(src[1], self.pixels[i + 1]);
+    self.pixels[i + 2] = over(src[2], self.pixels[i + 2]);
+    self.pixels[i + 3] = over(src[3], self.pixels[i + 3]);
+  }
+
   /// Fill a rectangle with colour `c` at opacity `alpha`. The shm buffer is
   /// premultiplied ARGB, so a translucent fill stores `rgb * alpha`.
   fn fill_rect_a(
@@ -144,14 +157,14 @@ impl Canvas<'_> {
     };
     match self.blend {
       AlphaBlending::Native => {
-        let (coverage, inverse) =
-          (u32::from(coverage), u32::from(255 - coverage));
-        let mix = |src: u8, dst: u8| {
-          ((u32::from(src) * coverage + u32::from(dst) * inverse) / 255) as u8
-        };
-        self.pixels[pixel_index] = mix(fg.2, self.pixels[pixel_index]);
-        self.pixels[pixel_index + 1] = mix(fg.1, self.pixels[pixel_index + 1]);
-        self.pixels[pixel_index + 2] = mix(fg.0, self.pixels[pixel_index + 2]);
+        let a = u32::from(coverage);
+        let premultiply = |channel: u8| (u32::from(channel) * a / 255) as u8;
+        self.over_at(pixel_index, [
+          premultiply(fg.2),
+          premultiply(fg.1),
+          premultiply(fg.0),
+          coverage,
+        ]);
       },
       AlphaBlending::Linear | AlphaBlending::LinearCorrected => {
         let lut = &*SRGB_TO_LINEAR;
@@ -193,7 +206,9 @@ impl Canvas<'_> {
         self.pixels[pixel_index + 2] = out(foreground[0], destination[0]);
       },
     }
-    self.pixels[pixel_index + 3] = 0xFF;
+    if self.blend != AlphaBlending::Native {
+      self.pixels[pixel_index + 3] = 0xFF;
+    }
   }
 
   /// Alpha-blend `fg` over the destination with independent per-subpixel
@@ -233,32 +248,21 @@ impl Canvas<'_> {
 
   /// Composite one straight-alpha RGBA source pixel over the destination.
   fn blend_rgba(&mut self, x: i32, y: i32, rgba: [u8; 4]) {
-    let a = u32::from(rgba[3]);
-    if a == 0 {
-      return;
-    }
     let Some(i) = self.index(x, y) else { return };
-    let inv = 255 - a;
-    let mix = |src: u8, dst: u8| {
-      ((u32::from(src) * a + u32::from(dst) * inv) / 255) as u8
-    };
-    self.pixels[i] = mix(rgba[2], self.pixels[i]);
-    self.pixels[i + 1] = mix(rgba[1], self.pixels[i + 1]);
-    self.pixels[i + 2] = mix(rgba[0], self.pixels[i + 2]);
-    self.pixels[i + 3] = 0xFF;
+    let a = u32::from(rgba[3]);
+    let premultiply = |channel: u8| (u32::from(channel) * a / 255) as u8;
+    self.over_at(i, [
+      premultiply(rgba[2]),
+      premultiply(rgba[1]),
+      premultiply(rgba[0]),
+      rgba[3],
+    ]);
   }
 
   /// Composite one pre-multiplied BGRA source pixel over the destination.
   fn over(&mut self, x: i32, y: i32, src: &[u8]) {
     let Some(i) = self.index(x, y) else { return };
-    let inv = u32::from(255 - src[3]);
-    let comp = |s: u8, dst: u8| {
-      (u32::from(s) + u32::from(dst) * inv / 255).min(255) as u8
-    };
-    self.pixels[i] = comp(src[0], self.pixels[i]);
-    self.pixels[i + 1] = comp(src[1], self.pixels[i + 1]);
-    self.pixels[i + 2] = comp(src[2], self.pixels[i + 2]);
-    self.pixels[i + 3] = 0xFF;
+    self.over_at(i, [src[0], src[1], src[2], src[3]]);
   }
 }
 
@@ -2620,6 +2624,35 @@ mod tests {
         "{mode:?}: full coverage paints the foreground"
       );
     }
+  }
+
+  #[test]
+  fn native_blend_preserves_translucent_destination_alpha() {
+    // The buffer stores premultiplied BGRA. Half-covered white over a
+    // half-transparent background must remain translucent; forcing alpha to
+    // 255 creates the dark fringe seen around antialiased text.
+    let mut buf = vec![30, 40, 50, 128];
+    let mut canvas = Canvas {
+      pixels: &mut buf,
+      width:  1,
+      height: 1,
+      blend:  AlphaBlending::Native,
+    };
+    canvas.blend(0, 0, Rgb(255, 255, 255), 128);
+    assert_eq!(buf, [142, 147, 152, 191]);
+  }
+
+  #[test]
+  fn rgba_blend_uses_premultiplied_source_over() {
+    let mut buf = vec![10, 20, 30, 64];
+    let mut canvas = Canvas {
+      pixels: &mut buf,
+      width:  1,
+      height: 1,
+      blend:  AlphaBlending::Native,
+    };
+    canvas.blend_rgba(0, 0, [200, 100, 50, 128]);
+    assert_eq!(buf, [29, 59, 114, 159]);
   }
 
   #[test]
