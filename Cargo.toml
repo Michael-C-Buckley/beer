@@ -25,7 +25,7 @@ beer-wayland   = { path = "crates/beer-wayland", version = "0.11.1" }
 anyhow = "1.0.104"
 calloop = { version = "0.14.4", features = [ "signals" ] }
 calloop-wayland-source = "0.4.1"
-flate2 = "1.1.9"
+flate2 = "1.1.10"
 fontconfig = "0.11.0"
 freetype-rs = "0.38.0"
 harfbuzz_rs_now = "2.3.2"
@@ -37,7 +37,7 @@ image = { version = "0.25.10", default-features = false, features = [
   "webp",
 ] }
 libc = "0.2.189"
-lru = "0.18.1"
+lru = "0.18.4"
 pound = "0.1.6"
 rustix = { version = "1.1.4", features = [
   "pty",
@@ -50,12 +50,12 @@ rustix = { version = "1.1.4", features = [
 ] }
 serde = { version = "1.0.229", features = [ "derive" ] }
 serde_ignored = "0.1.14"
-thiserror = "2.0.19"
-toml = "1.1.3"
+thiserror = "2.0.20"
+toml = "1.1.5"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = [ "env-filter" ] }
 unicode-width = "0.2.2"
-unicode-segmentation = "1.12.0"
+unicode-segmentation = "1.13.3"
 vte = "0.15.0"
 
 smithay-client-toolkit = "0.21.1"
