@@ -64,7 +64,7 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "beer"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "anyhow",
  "beer-ipc",
@@ -98,14 +98,14 @@ dependencies = [
 
 [[package]]
 name = "beer-ipc"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "rustix",
 ]
 
 [[package]]
 name = "beer-protocols"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "criterion",
  "smithay-client-toolkit",
@@ -113,7 +113,7 @@ dependencies = [
 
 [[package]]
 name = "beer-wayland"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "anyhow",
  "beer-protocols",
@@ -129,7 +129,7 @@ dependencies = [
 
 [[package]]
 name = "beer-window"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "beer-protocols",
  "smithay-client-toolkit",
