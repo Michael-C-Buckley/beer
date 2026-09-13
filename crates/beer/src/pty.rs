@@ -213,7 +213,7 @@ fn configure_shell_integration(shell: &OsStr, command: &mut Command) {
     .and_then(OsStr::to_str)
     .unwrap_or("");
   if name == "fish" {
-    command.args(["--init-command", "function __beer_prompt --on-event fish_prompt; printf '\\e]133;A\\e\\\\e]7;file://%s%s\\e\\\\' (hostname) $PWD; end"]);
+    command.args(["--init-command", "function __beer_prompt --on-event fish_prompt; printf '\\e]133;A\\e\\\\'; printf '\\e]7;file://%s%s\\e\\\\' (hostname) $PWD; end"]);
     return;
   }
   let Some(runtime) = env::var_os("XDG_RUNTIME_DIR") else {
@@ -225,7 +225,7 @@ fn configure_shell_integration(shell: &OsStr, command: &mut Command) {
   }
   if name == "bash" {
     let path = dir.join("bashrc");
-    let script = "[[ -r $HOME/.bashrc ]] && source $HOME/.bashrc\n__beer_prompt(){ printf '\\e]133;A\\e\\\\e]7;file://%s%s\\e\\\\' \"$HOSTNAME\" \"$PWD\"; }\nPROMPT_COMMAND=\"__beer_prompt${PROMPT_COMMAND:+;$PROMPT_COMMAND}\"\n";
+    let script = "[[ -r $HOME/.bashrc ]] && source $HOME/.bashrc\n__beer_prompt(){ printf '\\e]133;A\\e\\\\'; printf '\\e]7;file://%s%s\\e\\\\' \"$HOSTNAME\" \"$PWD\"; }\nPROMPT_COMMAND=\"__beer_prompt${PROMPT_COMMAND:+;$PROMPT_COMMAND}\"\n";
     if fs::write(&path, script).is_ok() {
       command.arg("--rcfile").arg(path);
     }
@@ -247,7 +247,7 @@ fn install_zsh_integration(dir: &Path, command: &mut Command) {
       return;
     }
   }
-  let script = "[[ -r $BEER_ORIGINAL_ZDOTDIR/.zshrc ]] && source $BEER_ORIGINAL_ZDOTDIR/.zshrc\nautoload -Uz add-zsh-hook\n__beer_prompt(){ printf '\\e]133;A\\e\\\\e]7;file://%s%s\\e\\\\' \"$HOST\" \"$PWD\"; }\nadd-zsh-hook precmd __beer_prompt\n";
+  let script = "[[ -r $BEER_ORIGINAL_ZDOTDIR/.zshrc ]] && source $BEER_ORIGINAL_ZDOTDIR/.zshrc\nautoload -Uz add-zsh-hook\n__beer_prompt(){ printf '\\e]133;A\\e\\\\'; printf '\\e]7;file://%s%s\\e\\\\' \"$HOST\" \"$PWD\"; }\nadd-zsh-hook precmd __beer_prompt\n";
   if fs::write(dir.join(".zshrc"), script).is_ok() {
     command
       .env("BEER_ORIGINAL_ZDOTDIR", original)
