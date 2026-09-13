@@ -369,7 +369,7 @@ impl App {
       &config.mouse_bindings,
     );
     let font_size = config.main.font_size;
-    let resident = config.main.server_resident;
+    let resident = server && config.main.server_resident;
     Ok(Self {
       renderers,
       config,
