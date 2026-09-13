@@ -26,6 +26,26 @@ pub struct Pty {
   child:  Child,
 }
 
+#[expect(
+  unsafe_code,
+  reason = "killing the owned child process group during PTY teardown"
+)]
+impl Drop for Pty {
+  fn drop(&mut self) {
+    // Dropping `Child` does not stop it. The child is a session leader, so its
+    // pid is also the process-group id we need to stop on window close.
+    if matches!(self.child.try_wait(), Ok(None)) {
+      let pid = self.child.id().cast_signed();
+      // SAFETY: `pid` identifies the running child process group created by us.
+      // The wait below reaps the child after the group is stopped.
+      unsafe {
+        libc::kill(-pid, libc::SIGKILL);
+      }
+    }
+    let _ = self.child.wait();
+  }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct SpawnOptions<'a> {
   pub cols:              u16,
