@@ -122,6 +122,7 @@ const fn functional(keysym: Keysym) -> Option<Func> {
     Keysym::End => Func::Letter(b'F'),
     Keysym::F1 => Func::Letter(b'P'),
     Keysym::F2 => Func::Letter(b'Q'),
+    // Kitty reserves CSI R for cursor-position reports.
     Keysym::F3 => Func::Tilde(13),
     Keysym::F4 => Func::Letter(b'S'),
     Keysym::F5 => Func::Tilde(15),
@@ -726,6 +727,24 @@ mod tests {
       ),
       Some(b"\x1b[13u".to_vec())
     );
+  }
+
+  #[test]
+  fn kitty_f3_does_not_collide_with_cursor_reports() {
+    let event = key(Keysym::F3, None);
+    assert_eq!(
+      kitty_encode(&event, NONE, 1, KeyKind::Press, false),
+      Some(b"\x1b[13~".to_vec())
+    );
+    assert_eq!(
+      kitty_encode(&event, mods(true, false, false), 1, KeyKind::Press, false),
+      Some(b"\x1b[13;5~".to_vec())
+    );
+    assert_eq!(
+      kitty_encode(&event, NONE, 3, KeyKind::Release, false),
+      Some(b"\x1b[13;1:3~".to_vec())
+    );
+    assert_eq!(encode(&event, NONE, false, false), Some(b"\x1bOR".to_vec()));
   }
 
   #[test]
