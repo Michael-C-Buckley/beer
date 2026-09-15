@@ -121,7 +121,11 @@ pub(super) const fn is_box_draw(c: char) -> bool {
 }
 
 pub(super) const fn is_geometric(c: char) -> bool {
-  is_box_draw(c) || matches!(c as u32, 0xE0B0..=0xE0B7)
+  is_box_draw(c)
+    || matches!(
+      c as u32,
+      0xE0B0..=0xE0B7 | 0xE0B8 | 0xE0BA | 0xE0BC | 0xE0BE
+    )
 }
 
 pub(super) fn draw_geometric(
@@ -132,7 +136,10 @@ pub(super) fn draw_geometric(
   m: CellMetrics,
   fg: Rgb,
 ) -> bool {
-  if matches!(c as u32, 0xE0B0..=0xE0B7) {
+  if matches!(
+    c as u32,
+    0xE0B0..=0xE0B7 | 0xE0B8 | 0xE0BA | 0xE0BC | 0xE0BE
+  ) {
     draw_powerline(canvas, c as u32, x0, top, m, fg);
     true
   } else {

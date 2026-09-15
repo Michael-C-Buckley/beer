@@ -71,6 +71,55 @@ fn powerline_separators_reach_cell_edges() {
 }
 
 #[test]
+fn powerline_slants_tile_and_antialias() {
+  for (width, height) in [(9, 21), (10, 20), (1, 1)] {
+    let mut buffers = Vec::new();
+    for c in ['\u{e0b8}', '\u{e0ba}', '\u{e0bc}', '\u{e0be}'] {
+      assert!(is_geometric(c));
+      let mut pixels = vec![0; width * height * 4];
+      let mut canvas = Canvas {
+        pixels: &mut pixels,
+        width,
+        height,
+        blend: AlphaBlending::Native,
+      };
+      let metrics = CellMetrics {
+        width:  u32::try_from(width).unwrap(),
+        height: u32::try_from(height).unwrap(),
+        ascent: 0,
+        stroke: 1,
+      };
+      assert!(draw_geometric(
+        &mut canvas,
+        c,
+        0,
+        0,
+        metrics,
+        Rgb(255, 255, 255)
+      ));
+      assert!(pixels.chunks_exact(4).any(|p| p[3] > 0 && p[3] < 255));
+      // White over transparent must retain coverage in every channel.
+      assert!(pixels.chunks_exact(4).all(|p| p == [p[3]; 4]));
+      buffers.push(pixels);
+    }
+    // Opposite triangles cover the entire cell without gaps or overlaps.
+    for (a, b) in [(0, 3), (1, 2)] {
+      for (left, right) in buffers[a].iter().zip(&buffers[b]) {
+        assert!((254..=256).contains(&(u16::from(*left) + u16::from(*right))));
+      }
+    }
+    assert_eq!(
+      buffers[0],
+      buffers[3].iter().rev().copied().collect::<Vec<_>>()
+    );
+    // The upper-left slant joins a solid segment along its top edge;
+    // only the corner pixel intersects the diagonal.
+    assert!(buffers[2][..(width - 1) * 4].iter().all(|&v| v == 255));
+    assert!(buffers[0][4..width * 4].iter().all(|&v| v == 0));
+  }
+}
+
+#[test]
 fn box_arms_weights() {
   // Light cross: every arm light. Heavy cross: every arm heavy.
   assert_eq!(box_arms(0x253C), Some([1, 1, 1, 1]));
