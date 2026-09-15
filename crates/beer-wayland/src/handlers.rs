@@ -657,13 +657,6 @@ impl ProvidesRegistryState for WaylandState {
   registry_handlers![OutputState, SeatState];
 }
 
-/// Serve held clipboard text when a paste target requests it.
-fn serve(text: &str, fd: WritePipe) {
-  use std::{fs::File, io::Write as _, os::fd::OwnedFd};
-  let mut file = File::from(OwnedFd::from(fd));
-  let _ = file.write_all(text.as_bytes());
-}
-
 impl DataDeviceHandler for WaylandState {
   fn enter(
     &mut self,
@@ -745,8 +738,10 @@ impl DataSourceHandler for WaylandState {
       .as_ref()
       .is_some_and(|s| s.inner() == source)
     {
-      let text = self.app.clipboard_text(false).unwrap_or_default();
-      serve(&text, fd);
+      self.plat.serve_selection(
+        self.app.clipboard_text(false).unwrap_or_default(),
+        fd,
+      );
     }
   }
 
@@ -815,8 +810,9 @@ impl PrimarySelectionSourceHandler for WaylandState {
       .as_ref()
       .is_some_and(|s| s.inner() == source)
     {
-      let text = self.app.clipboard_text(true).unwrap_or_default();
-      serve(&text, fd);
+      self
+        .plat
+        .serve_selection(self.app.clipboard_text(true).unwrap_or_default(), fd);
     }
   }
 

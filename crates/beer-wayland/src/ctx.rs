@@ -4,8 +4,7 @@
 //! timers) whose callbacks re-enter the app.
 
 use std::{
-  fs::File,
-  io::{ErrorKind, Read as _},
+  io::{self, Error, ErrorKind, Read as _, Write},
   os::fd::{BorrowedFd, RawFd},
   time::Duration,
 };
@@ -18,9 +17,10 @@ use calloop::{
   generic::Generic,
   timer::{TimeoutAction, Timer},
 };
+use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
 use smithay_client_toolkit::{
   activation::RequestData,
-  data_device_manager::ReadPipe,
+  data_device_manager::{ReadPipe, WritePipe},
   reexports::protocols::wp::cursor_shape::v1::client::wp_cursor_shape_device_v1::Shape,
   shell::{
     WaylandSurface,
@@ -52,6 +52,49 @@ fn pick_mime(mimes: &[String]) -> Option<String> {
 
 /// Initial shm pool size; buffers grow as the surface is configured.
 const DEFAULT_POOL_BYTES: usize = 640 * 480 * 4;
+
+/// Refuse selection transfers larger than this to keep an untrusted owner from
+/// exhausting the terminal process.
+const MAX_SELECTION_BYTES: usize = 16 * 1024 * 1024;
+
+fn append_selection(data: &mut Vec<u8>, chunk: &[u8]) -> bool {
+  if data.len().saturating_add(chunk.len()) > MAX_SELECTION_BYTES {
+    return false;
+  }
+  data.extend_from_slice(chunk);
+  true
+}
+
+fn write_selection(
+  writer: &mut impl Write,
+  text: &[u8],
+  offset: &mut usize,
+) -> io::Result<PostAction> {
+  if text.is_empty() {
+    return Ok(PostAction::Remove);
+  }
+  let written = match writer.write(&text[*offset..]) {
+    Ok(written) => written,
+    Err(err)
+      if matches!(
+        err.kind(),
+        ErrorKind::Interrupted | ErrorKind::WouldBlock
+      ) =>
+    {
+      return Ok(PostAction::Continue);
+    },
+    Err(err) => return Err(err),
+  };
+  if written == 0 {
+    return Err(Error::from(ErrorKind::WriteZero));
+  }
+  *offset += written;
+  Ok(if *offset == text.len() {
+    PostAction::Remove
+  } else {
+    PostAction::Continue
+  })
+}
 
 use crate::state::Platform;
 
@@ -405,28 +448,32 @@ impl WindowCtx for Platform {
 
 impl Platform {
   /// Drain a clipboard read-pipe on the loop; hand the bytes to the app at EOF.
-  #[expect(
-    unsafe_code,
-    reason = "calloop's NoIoDrop wrapper exposes the owned pipe via get_mut"
-  )]
   fn read_paste(&self, id: WindowId, pipe: ReadPipe, primary: bool) {
     let mut data: Vec<u8> = Vec::new();
     let reg = self
       .loop_handle
       .insert_source(pipe, move |(), file, state| {
         let mut tmp = [0u8; 4096];
-        // SAFETY: the event source owns this file for the callback's duration.
-        let file: &mut File = unsafe { file.get_mut() };
+        let mut file = file.as_ref();
         match file.read(&mut tmp) {
           Ok(0) => {
             state.app.on_paste(&mut state.plat, id, &data, primary);
             PostAction::Remove
           },
           Ok(n) => {
-            data.extend_from_slice(&tmp[..n]);
-            PostAction::Continue
+            if append_selection(&mut data, &tmp[..n]) {
+              PostAction::Continue
+            } else {
+              tracing::warn!("selection exceeds {MAX_SELECTION_BYTES} bytes");
+              PostAction::Remove
+            }
           },
-          Err(e) if matches!(e.kind(), ErrorKind::Interrupted) => {
+          Err(e)
+            if matches!(
+              e.kind(),
+              ErrorKind::Interrupted | ErrorKind::WouldBlock
+            ) =>
+          {
             PostAction::Continue
           },
           Err(e) => {
@@ -438,5 +485,146 @@ impl Platform {
     if let Err(err) = reg {
       tracing::warn!("register paste pipe: {err}");
     }
+  }
+
+  /// Queue clipboard text for a receiver without blocking the event loop.
+  pub fn serve_selection(&self, text: String, pipe: WritePipe) {
+    let flags = match fcntl_getfl(&pipe) {
+      Ok(flags) => flags | OFlags::NONBLOCK,
+      Err(err) => {
+        tracing::warn!("get selection pipe flags: {err}");
+        return;
+      },
+    };
+    if let Err(err) = fcntl_setfl(&pipe, flags) {
+      tracing::warn!("make selection pipe nonblocking: {err}");
+      return;
+    }
+    let mut offset = 0;
+    let reg = self.loop_handle.insert_source(pipe, move |(), file, _| {
+      let mut file = file.as_ref();
+      match write_selection(&mut file, text.as_bytes(), &mut offset) {
+        Ok(action) => action,
+        Err(err) => {
+          tracing::warn!("write selection pipe: {err}");
+          PostAction::Remove
+        },
+      }
+    });
+    if let Err(err) = reg {
+      tracing::warn!("register selection pipe: {err}");
+    }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use std::io::{self, ErrorKind, Write};
+
+  use calloop::PostAction;
+
+  use super::{MAX_SELECTION_BYTES, append_selection, write_selection};
+
+  #[derive(Default)]
+  struct PartialWriter {
+    bytes: Vec<u8>,
+    error: Option<ErrorKind>,
+  }
+
+  impl Write for PartialWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+      if let Some(error) = self.error.take() {
+        return Err(error.into());
+      }
+      let len = bytes.len().min(2);
+      self.bytes.extend_from_slice(&bytes[..len]);
+      Ok(len)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+      Ok(())
+    }
+  }
+
+  #[test]
+  fn selection_limit_rejects_the_overflowing_chunk() {
+    let mut data = vec![0; MAX_SELECTION_BYTES - 1];
+    assert!(!append_selection(&mut data, &[1, 2]));
+    assert_eq!(data.len(), MAX_SELECTION_BYTES - 1);
+  }
+
+  #[test]
+  fn selection_limit_accepts_exactly_the_limit() {
+    let mut data = Vec::new();
+    assert!(append_selection(&mut data, &vec![0; MAX_SELECTION_BYTES]));
+    assert_eq!(data.len(), MAX_SELECTION_BYTES);
+  }
+
+  #[test]
+  fn selection_writer_retries_partial_writes() {
+    let mut writer = PartialWriter::default();
+    let mut offset = 0;
+    assert_eq!(
+      write_selection(&mut writer, b"hello", &mut offset).unwrap(),
+      PostAction::Continue
+    );
+    assert_eq!(
+      write_selection(&mut writer, b"hello", &mut offset).unwrap(),
+      PostAction::Continue
+    );
+    assert_eq!(
+      write_selection(&mut writer, b"hello", &mut offset).unwrap(),
+      PostAction::Remove
+    );
+    assert_eq!(writer.bytes, b"hello");
+  }
+
+  #[test]
+  fn selection_writer_resumes_after_transient_errors() {
+    let mut writer = PartialWriter::default();
+    let mut offset = 0;
+    write_selection(&mut writer, b"hello", &mut offset).unwrap();
+    for error in [ErrorKind::WouldBlock, ErrorKind::Interrupted] {
+      writer.error = Some(error);
+      assert_eq!(
+        write_selection(&mut writer, b"hello", &mut offset).unwrap(),
+        PostAction::Continue
+      );
+      assert_eq!(offset, 2);
+      assert_eq!(writer.bytes, b"he");
+    }
+    write_selection(&mut writer, b"hello", &mut offset).unwrap();
+    assert_eq!(
+      write_selection(&mut writer, b"hello", &mut offset).unwrap(),
+      PostAction::Remove
+    );
+    assert_eq!(writer.bytes, b"hello");
+  }
+
+  #[test]
+  fn selection_writer_handles_empty_and_failed_transfers() {
+    let mut buffer = &mut [][..];
+    let mut offset = 0;
+    assert_eq!(
+      write_selection(&mut buffer, b"", &mut offset).unwrap(),
+      PostAction::Remove
+    );
+    assert_eq!(
+      write_selection(&mut buffer, b"text", &mut offset)
+        .unwrap_err()
+        .kind(),
+      ErrorKind::WriteZero
+    );
+    let mut writer = PartialWriter {
+      error: Some(ErrorKind::BrokenPipe),
+      ..Default::default()
+    };
+    assert_eq!(
+      write_selection(&mut writer, b"text", &mut offset)
+        .unwrap_err()
+        .kind(),
+      ErrorKind::BrokenPipe
+    );
+    assert_eq!(offset, 0);
   }
 }
