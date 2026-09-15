@@ -856,14 +856,11 @@ impl Dispatch<WpFractionalScaleV1, WindowId> for WaylandState {
 impl ActivationHandler for WaylandState {
   type RequestUdata = ();
 
-  fn new_token(&mut self, token: String, _: &RequestData<()>) {
-    if let (Some(activation), true) = (
-      self.plat.activation.as_ref(),
-      self.plat.focused_window < self.plat.windows.len(),
-    ) {
-      let surface = self.plat.windows[self.plat.focused_window]
-        .window
-        .wl_surface();
+  fn new_token(&mut self, token: String, data: &RequestData<()>) {
+    if let (Some(activation), Some(surface)) =
+      (self.plat.activation.as_ref(), data.surface.as_ref())
+      && self.plat.window_index_for_surface(surface).is_some()
+    {
       activation.activate::<Self>(surface, token);
     }
   }
